@@ -1,11 +1,11 @@
 {
   "name": "@layers/mcp-server",
   "version": "0.1.0",
-  "description": "",
+  "description": "MCP server exposing the Layers Partner API as tools",
   "author": "Layers AI, Inc.",
   "license": "Apache-2.0",
   "type": "module",
-  "bin": { "mcp-server": "dist/index.js" },
+  "bin": { "layers-mcp-server": "dist/index.js" },
   "files": ["dist"],
   "scripts": {
     "build": "tsc",

@@ -3,3 +3,5 @@ dist/
 .tmp/
 .DS_Store
 .env*
+CLAUDE.md
+docs/

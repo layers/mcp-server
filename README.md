@@ -1,0 +1,130 @@
+# Layers MCP Server
+
+An MCP (Model Context Protocol) server that exposes the
+[Layers Partner API](https://api.layers.com) as tools, so AI agents can manage
+projects, generate short-form social content, and publish it — straight from
+any MCP client.
+
+> **Status:** pre-release. Endpoint coverage tracks the published Partner API
+> reference; not yet published to npm.
+
+## Install
+
+```sh
+claude mcp add layers -- npx -y @layers/mcp-server@latest --api-key lp_YOUR_KEY
+```
+
+Or in any MCP client's JSON config:
+
+```json
+{
+  "mcpServers": {
+    "layers": {
+      "command": "npx",
+      "args": ["-y", "@layers/mcp-server@latest", "--api-key", "lp_YOUR_KEY"]
+    }
+  }
+}
+```
+
+> Pin a version (`@layers/mcp-server@0.1.0`) in production setups instead of
+> `@latest` if you want releases to be deliberate on your side.
+
+## Configuration
+
+Flags take precedence; environment variables are the fallback.
+
+| Flag | Env var | Default | Description |
+|---|---|---|---|
+| `--api-key` | `LAYERS_API_KEY` | — (required) | Layers Partner API key (`lp_...`). The server exits with an error if missing. |
+| `--base-url` | `LAYERS_BASE_URL` | `https://api.layers.com` | API host. Paths are versioned under `/v1`. |
+| `--read-only` | `LAYERS_READ_ONLY=1` | off | Register only read tools (25 of 48). Mutating tools are not exposed at all. |
+
+**Security note:** flags end up in your client's config file and in the process
+argv (visible via `ps`). Prefer the env var for the key where your client
+supports it:
+
+```json
+{
+  "mcpServers": {
+    "layers": {
+      "command": "npx",
+      "args": ["-y", "@layers/mcp-server@latest"],
+      "env": { "LAYERS_API_KEY": "lp_YOUR_KEY" }
+    }
+  }
+}
+```
+
+Sandbox keys (`lp_test_...`) skip real platform calls during development —
+content, OAuth, and publish return fixture-backed results.
+
+## Tools
+
+48 tools, one per Partner API route. Write tools (marked W) are hidden by
+`--read-only`.
+
+### Core
+`whoami` · `list_projects` · `get_project` · `get_credits` ·
+`list_credit_events` · `create_project` (W) · `update_project` (W) ·
+`archive_project` (W)
+
+### Creative
+`list_influencers` · `get_influencer` · `get_keywords` · `list_content` ·
+`get_content` · `get_content_progress` · `get_content_asset` · `get_hooks` ·
+`get_source_recommendations` · `get_content_review_policy` ·
+`create_influencer` (W) · `clone_influencer` (W) · `update_influencer` (W) ·
+`delete_influencer` (W) · `refresh_keywords` (W) · `generate_slideshow` (W) ·
+`generate_ugc_remix` (W) · `generate_video_remix` (W) ·
+`generate_slideshow_remix` (W) · `approve_content` (W) · `reject_content` (W) ·
+`update_content_review_policy` (W)
+
+### Distribution
+`list_social_accounts` · `get_scheduled_post` · `list_scheduled_posts` ·
+`list_tiktok_music` · `get_engagement_config` · `publish_content` (W) ·
+`schedule_content` (W) · `reschedule_post` (W) · `cancel_scheduled_post` (W) ·
+`notify_device` (W) · `update_engagement_config` (W)
+
+### Measurement
+`get_metrics` · `get_top_performers` · `list_ads_content` ·
+`list_recommendations` · `update_ads_content` (W) · `update_recommendation` (W)
+
+### Framework
+`list_audit_log`
+
+### Conventions
+
+- **Async jobs.** Generation, influencer creation/cloning, and keyword refresh
+  return a `202` job envelope (`jobId`, `containerIds`/`influencerId`). Poll the
+  matching read tool (`get_content_progress`, `get_influencer`, `get_keywords`)
+  until the resource is terminal.
+- **Pagination.** List tools accept `cursor` + `limit` and return
+  `{ items, nextCursor }`; pass `nextCursor` back verbatim.
+- **Idempotency.** The server stamps a fresh UUID `Idempotency-Key` on every
+  mutating POST/PATCH automatically.
+- **Errors** surface the Layers envelope as tool errors:
+  `Layers API <status> <code>: <message>` plus `requestId` and `details` —
+  include the `requestId` in support tickets.
+- **Timestamps** are ISO 8601 UTC with a `Z` suffix everywhere (offset forms
+  are rejected by the API). `scheduledFor` is a literal UTC instant — convert
+  from local time before calling.
+
+## Development
+
+```sh
+npm install
+npm run build                 # tsc -> dist/
+
+# smoke test with the MCP inspector:
+npx @modelcontextprotocol/inspector node dist/index.js --api-key lp_test_dummy
+
+# wire the local build into Claude Code:
+claude mcp add layers -- node $(pwd)/dist/index.js --api-key lp_YOUR_KEY
+```
+
+stdout is the JSON-RPC channel — all logging goes to stderr.
+
+## License
+
+Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
+Copyright 2026 Layers AI, Inc.
