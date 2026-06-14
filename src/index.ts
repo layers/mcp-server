@@ -17,6 +17,7 @@ const flagValue = (name: string): string | undefined => {
 
 const apiKey = flagValue("api-key") ?? process.env.LAYERS_API_KEY;
 const baseUrl = flagValue("base-url") ?? process.env.LAYERS_BASE_URL ?? "https://api.layers.com";
+const organization = flagValue("organization") ?? process.env.LAYERS_ORGANIZATION;
 const readOnly =
   argv.includes("--read-only") || ["1", "true"].includes(process.env.LAYERS_READ_ONLY ?? "");
 
@@ -27,7 +28,7 @@ if (!apiKey) {
 }
 
 const server = new McpServer({ name: "layers", version: "0.1.0" });
-const client = new LayersClient(apiKey, baseUrl);
+const client = new LayersClient(apiKey, baseUrl, organization);
 
 registerCoreTools(server, client, readOnly);
 registerCreativeTools(server, client, readOnly);
@@ -38,5 +39,5 @@ registerFrameworkTools(server, client, readOnly);
 const transport = new StdioServerTransport();
 await server.connect(transport);
 console.error(
-  `layers mcp server running on stdio (base: ${baseUrl}${readOnly ? ", read-only" : ""})`,
+  `layers mcp server running on stdio (base: ${baseUrl}${organization ? `, org: ${organization}` : ""}${readOnly ? ", read-only" : ""})`,
 );

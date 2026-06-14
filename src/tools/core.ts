@@ -69,10 +69,13 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     {
       title: "List credit events",
       description:
-        "Per-event credit ledger (charges, refunds, grants, purchases, adjustments), newest first. credits is signed: debits negative. Org-level events have projectId null and are excluded when filtering by projectId.",
+        "Per-event credit ledger (charges, refunds, grants, purchases, adjustments, sub-org allocations), newest first. credits is signed: debits negative. Org-level events (grants, purchases, adjustments, allocations) have projectId null and are excluded when filtering by projectId.",
       inputSchema: {
         projectId: z.string().optional().describe("Filter to events attributed to one project"),
-        eventType: z.enum(["usage", "refund", "grant", "purchase", "adjustment"]).optional(),
+        eventType: z
+          .enum(["usage", "refund", "grant", "purchase", "adjustment", "allocation"])
+          .optional()
+          .describe("allocation = a credit transfer between you and a child org"),
         since: z.string().optional().describe("ISO 8601 UTC with Z suffix (offset forms rejected)"),
         until: z.string().optional().describe("ISO 8601 UTC with Z suffix"),
         cursor,
