@@ -31,6 +31,9 @@ export class LayersClient {
   constructor(
     private readonly apiKey: string,
     private readonly baseUrl: string,
+    /** Optional child org to act on behalf of, sent as X-Layers-Organization
+     *  on every request. Requires an org:admin parent key. */
+    private readonly organization?: string,
   ) {}
 
   /**
@@ -51,6 +54,9 @@ export class LayersClient {
     const headers: Record<string, string> = {
       Authorization: `Bearer ${this.apiKey}`,
     };
+    if (this.organization) {
+      headers["X-Layers-Organization"] = this.organization;
+    }
     if (method === "POST" || method === "PATCH") {
       headers["Idempotency-Key"] = randomUUID();
     }

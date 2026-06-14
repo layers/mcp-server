@@ -67,11 +67,15 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     {
       title: "List content",
       description:
-        "List a project's content containers, newest first. Filter by generation status, format, or time window. Each row carries a preview object renderable directly. Returns { items, nextCursor }.",
+        "List a project's content containers, newest first. Filter by generation status, format, creativeType, or time window. Each row carries a preview object renderable directly. Returns { items, nextCursor }.",
       inputSchema: {
         projectId: z.string().describe("Project ID"),
         status: z.array(contentStatus).optional().describe("Filter on generation status (repeatable)"),
         format: z.array(contentFormat).optional().describe("Filter on format (repeatable)"),
+        creativeType: z
+          .enum(["generated", "uploaded"])
+          .optional()
+          .describe("Filter by how the content was created (single value, not repeatable)"),
         since: utcTimestamp("Only containers created at or after"),
         until: utcTimestamp("Only containers created at or before"),
         cursor,
@@ -345,6 +349,103 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     },
     async ({ projectId, ...body }) =>
       client.run("POST", `/v1/projects/${projectId}/content/slideshow-remix`, { body: clean(body) }),
+  );
+
+  // ---- Asset upload (uploaded content — creativeType "uploaded") ----
+  // caption is required everywhere it appears here, but may be the empty string —
+  // so z.string() (NOT .optional(), NOT .min(1)).
+  const uploadCaption = z
+    .string()
+    .max(2200)
+    .describe("Caption, published verbatim. Required, but may be the empty string. Max 2200 chars.");
+
+  server.registerTool(
+    "create_content_upload",
+    {
+      title: "Create content upload (direct transport)",
+      description:
+        "Step 1 of the direct-upload transport for large/private files (bytes go client → storage, never through the API). Declares the files and returns a containerId plus a presigned PUT URL per file (expire in ~15 min, no re-presign). You then PUT each file's bytes to its uploadUrl sending exactly the declared Content-Type — this PUT happens OUTSIDE this server — then call finalize_content_upload once per returned containerId. Caps: 100MB video / 30MB image. For already-hosted media, use upload_content_from_url instead.",
+      inputSchema: {
+        projectId: z.string().describe("Project ID"),
+        files: z
+          .array(
+            z.object({
+              filename: z.string().max(512).describe("Used for the storage key extension"),
+              contentType: z
+                .enum(["video/mp4", "video/quicktime", "image/jpeg", "image/png", "image/webp"])
+                .describe("Signed into the PUT URL — your PUT must send exactly this Content-Type"),
+              sizeBytes: z
+                .number()
+                .int()
+                .describe("Declared size; checked vs the cap here and re-checked against actual bytes at finalize"),
+            }),
+          )
+          .min(1)
+          .max(10)
+          .describe("One entry per file you will PUT"),
+        grouping: z
+          .enum(["per-file", "slideshow"])
+          .describe(
+            "per-file = one content item per file (videos are single-file). slideshow = one image-slideshow item (any video in a slideshow grouping is rejected).",
+          ),
+      },
+    },
+    async ({ projectId, ...body }) =>
+      client.run("POST", `/v1/projects/${projectId}/content/uploads`, { body }),
+  );
+
+  server.registerTool(
+    "upload_content_from_url",
+    {
+      title: "Upload content from URL",
+      description:
+        'Upload already-hosted media by URL (URL-fetch transport). Layers fetches each media[].url server-side, validates and probes it, and returns a completed content item (creativeType "uploaded", adsEnrollment opted_out) — synchronous, no job to poll. One video, one image, or 2-10 images (a slideshow). URLs must be public https; sign private URLs for >= 15 min. Atomic: one bad URL means no item is created. Check platformFit on the response before scheduling.',
+      inputSchema: {
+        projectId: z.string().describe("Project ID"),
+        media: z
+          .array(
+            z.object({
+              url: z.string().describe("Fetchable https URL resolving to a public IP; sign for >= 15 min"),
+            }),
+          )
+          .min(1)
+          .max(10)
+          .describe("One entry per file: one video, one image, or 2-10 images (slideshow)"),
+        caption: uploadCaption,
+      },
+    },
+    async ({ projectId, ...body }) =>
+      client.run("POST", `/v1/projects/${projectId}/content/upload`, { body }),
+  );
+
+  server.registerTool(
+    "finalize_content_upload",
+    {
+      title: "Finalize content upload",
+      description:
+        "Step 3 of the direct-upload transport. Call once per containerId from create_content_upload, after every PUT for that item has succeeded. Verifies the bytes landed, probes the media, and completes the item (returns the full content item). Idempotent by state — safe to blind-retry. 409 UPLOAD_INCOMPLETE if a PUT hasn't landed yet. The caption set here publishes verbatim; the retry body is ignored (first caption wins) — use update_content_caption to fix it later.",
+      inputSchema: {
+        containerId: z.string().describe("Container ID returned by create_content_upload"),
+        caption: uploadCaption,
+      },
+    },
+    async ({ containerId, caption }) =>
+      client.run("POST", `/v1/content/${containerId}/finalize-upload`, { body: { caption } }),
+  );
+
+  server.registerTool(
+    "update_content_caption",
+    {
+      title: "Update content caption",
+      description:
+        "Update the caption on an UPLOADED content item (PATCH /v1/content/:containerId). Uploads only — generated content returns 422 VALIDATION (regenerate to change it). Returns the full updated item. The caption publishes byte-for-byte; already-published posts keep the caption they went out with. Media is immutable — upload a new item to change the file.",
+      inputSchema: {
+        containerId: z.string().describe("Uploaded content item ID (cnt_<uuid> or bare UUID)"),
+        caption: uploadCaption,
+      },
+    },
+    async ({ containerId, caption }) =>
+      client.run("PATCH", `/v1/content/${containerId}`, { body: { caption } }),
   );
 
   // ---- Approval writes ----
