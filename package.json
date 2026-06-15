@@ -5,10 +5,15 @@
   "author": "Layers AI, Inc.",
   "license": "Apache-2.0",
   "type": "module",
+  "engines": { "node": ">=20" },
   "bin": { "layers-mcp-server": "dist/index.js" },
-  "files": ["dist"],
+  "files": ["dist", "NOTICE"],
   "scripts": {
+    "prebuild": "rm -rf dist",
     "build": "tsc",
+    "pretest": "npm run build",
+    "test": "node --test test/*.test.mjs",
+    "smoke": "node scripts/smoke.mjs",
     "prepublishOnly": "npm run build"
   },
   "dependencies": {
