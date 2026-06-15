@@ -121,18 +121,34 @@ content, OAuth, and publish return fixture-backed results.
 
 ## Development
 
+Requires Node 20+.
+
 ```sh
 npm install
 npm run build                 # tsc -> dist/
 
-# smoke test with the MCP inspector:
-npx @modelcontextprotocol/inspector node dist/index.js --api-key lp_test_dummy
-
 # wire the local build into Claude Code:
 claude mcp add layers -- node $(pwd)/dist/index.js --api-key lp_YOUR_KEY
+
+# or explore interactively with the MCP inspector:
+npx @modelcontextprotocol/inspector node dist/index.js --api-key lp_test_dummy
 ```
 
 stdout is the JSON-RPC channel — all logging goes to stderr.
+
+## Testing
+
+```sh
+npm test            # hermetic suite — no API key, no network
+npm run smoke       # opt-in live smoke; needs LAYERS_TEST_KEY=lp_test_...
+```
+
+`npm test` builds, then runs the contract suite with Node's built-in test runner
+against a localhost mock — it verifies tool registration, `--read-only` gating,
+stdout protocol discipline, and the request contract (auth, idempotency, query
+encoding, per-tool routing, error rendering). No credentials or outbound network
+required; this is what CI runs. See [`test/README.md`](test/README.md) for the
+full breakdown and the sandbox smoke script.
 
 ## License
 
