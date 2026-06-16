@@ -17,7 +17,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
       title: "Who am I",
       annotations: READ_ONLY,
       description:
-        "Resolve the API key to its Layers organization: organizationId, organizationName, scopes, rateLimitTier, and creditBalance. Cheap liveness/auth sanity check.",
+        "Resolve the API key to its Layers organization: organizationId, organizationName, scopes, rateLimitTier, and creditBalance. Cheap liveness/auth check.",
       inputSchema: {},
     },
     async () => client.run("GET", "/v1/whoami"),
@@ -29,7 +29,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
       title: "List projects",
       annotations: READ_ONLY,
       description:
-        "List the organization's projects (one project per end-customer), newest first. Cursor-paginated: returns { items, nextCursor }.",
+        "List the organization's projects, newest first. Cursor-paginated: returns { items, nextCursor }.",
       inputSchema: {
         cursor,
         limit: z.number().int().min(1).max(200).optional().describe("Page size, 1-200 (default 25)"),
@@ -38,7 +38,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
         customerExternalId: z
           .string()
           .optional()
-          .describe("Return the single project bound to this partner-supplied customer ID"),
+          .describe("Return the projects for this customer ID"),
       },
     },
     async (args) => client.run("GET", "/v1/projects", { query: args }),
@@ -74,7 +74,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
       title: "List credit events",
       annotations: READ_ONLY,
       description:
-        "Per-event credit ledger (charges, refunds, grants, purchases, adjustments, sub-org allocations), newest first. credits is signed: debits negative. Org-level events (grants, purchases, adjustments, allocations) have projectId null and are excluded when filtering by projectId.",
+        "Per-event credit ledger (charges, refunds, grants, purchases, adjustments, sub-org allocations), newest first. Org-level events (grants, purchases, adjustments, allocations) have projectId null and are excluded when filtering by projectId.",
       inputSchema: {
         projectId: z.string().optional().describe("Filter to events attributed to one project"),
         eventType: z
@@ -98,7 +98,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
       title: "Create project",
       annotations: WRITE,
       description:
-        "Create a project to hold one end-customer's brand context, influencers, social accounts, and content. Synchronous. Supplying appDescription auto-kicks two background workflows: keyword research (~4-5 min, observe via get_keywords) and a first influencer (observe via list_influencers).",
+        "Create a project to hold brand context, influencers, social accounts, and content. Synchronous. Supplying appDescription auto-kicks two background workflows: keyword research (~4-5 min, observe via get_keywords) and a first influencer (observe via list_influencers).",
       inputSchema: {
         name: z.string().min(3).max(30).describe("Internal display name"),
         timezone: z.string().describe('IANA timezone (use "UTC" if no preference)'),

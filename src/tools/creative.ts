@@ -258,7 +258,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
       title: "Delete influencer",
       annotations: DESTRUCTIVE,
       description:
-        "Soft-delete (archive) an influencer. It disappears from reads and future selection; existing content that references it keeps working. There is no undelete via the partner API.",
+        "Soft-delete (archive) an influencer. It disappears from reads and future selection; existing content that references it keeps working. There is no undelete via the API.",
       inputSchema: {
         influencerId: z.string(),
         reason: z.string().max(1024).optional().describe("Audit note persisted for compliance"),
@@ -293,7 +293,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
       title: "Generate slideshow",
       annotations: WRITE,
       description:
-        "Generate a hook-driven multi-image vertical slideshow (slideshow-builder). Async: returns 202 with jobId + containerIds[0]; poll get_content_progress. Requires the project to have appDescription. The only format that allows a fully layerless run (no socialAccountId/influencerId — falls back to project voice). Costs credits (~50; check get_credits).",
+        "Generate a hook-driven multi-image vertical slideshow (slideshow-builder). Async: returns 202 with jobId + containerIds[0]; poll get_content_progress. Requires the project to have appDescription. Costs credits (~50; check get_credits).",
       inputSchema: {
         projectId: z.string(),
         hook: z
@@ -327,7 +327,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
         mediaId: z
           .string()
           .optional()
-          .describe("Partner-uploaded app-demo clip (med_<id>); defaults to the project's first app-demo asset"),
+          .describe("Uploaded app-demo clip (med_<id>); defaults to the project's first app-demo asset"),
       },
     },
     async ({ projectId, ...body }) =>

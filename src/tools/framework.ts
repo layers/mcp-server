@@ -9,7 +9,7 @@ export function registerFrameworkTools(server: McpServer, client: LayersClient, 
       title: "List audit log",
       annotations: READ_ONLY,
       description:
-        "Partner-visible audit trail for the org: one event per material action (api.request, auth.key_rejected, content.approved, scheduled_post.cancelled, ...). Newest first, cursor-paginated. Useful for compliance review, leaked-key forensics (filter apiKeyId), and incident response.",
+        "Adit trail for the org: one event per material action (api.request, auth.key_rejected, content.approved, scheduled_post.cancelled, ...). Newest first, cursor-paginated. Useful for compliance review, leaked-key forensics (filter apiKeyId), and incident response.",
       inputSchema: {
         eventType: z
           .string()
