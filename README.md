@@ -5,7 +5,7 @@ An MCP (Model Context Protocol) server that exposes the
 projects, generate short-form social content, and publish it — straight from
 any MCP client.
 
-> Tool coverage tracks the Layers Partner API reference.
+> Tool coverage tracks the Layers API reference.
 
 ## Install
 
