@@ -5,8 +5,7 @@ An MCP (Model Context Protocol) server that exposes the
 projects, generate short-form social content, and publish it — straight from
 any MCP client.
 
-> **Status:** pre-release. Endpoint coverage tracks the published API
-> reference; not yet published to npm.
+> Tool coverage tracks the Layers Partner API reference.
 
 ## Install
 
