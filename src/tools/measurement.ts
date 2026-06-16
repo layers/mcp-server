@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { LayersClient, clean } from "../api.js";
+import { LayersClient, clean, READ_ONLY, WRITE_IDEMPOTENT } from "../api.js";
 
 const cursor = z
   .string()
@@ -12,6 +12,7 @@ export function registerMeasurementTools(server: McpServer, client: LayersClient
     "get_metrics",
     {
       title: "Get metrics",
+      annotations: READ_ONLY,
       description:
         "Organic metrics for a post, social account, project layer, project, or organization. Returns both a bucketed time series and window totals. Engagement rate is weighted-cumulative (sum engagements / sum views). Paid metrics (spend/CPA/ROAS) are NOT here. Windows and buckets are UTC.",
       inputSchema: {
@@ -54,10 +55,11 @@ export function registerMeasurementTools(server: McpServer, client: LayersClient
     "get_top_performers",
     {
       title: "Get top performers",
+      annotations: READ_ONLY,
       description:
         "Top-N creatives in a project ranked by one metric over a 7d/30d/90d window, with organic and paid signals attached. Pre-sorted; one item per creative across platforms. Paid metrics (conversions, roas) only rank promoted creatives. By default only eligibility-gated creatives are included.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         metric: z.enum(["views", "engagement_rate", "conversions", "roas", "watch_time_ms"]),
         window: z.enum(["7d", "30d", "90d"]).optional().describe("Default 30d; no all-time"),
         sourceType: z.array(z.enum(["content_container", "platform_post", "manual"])).optional(),
@@ -79,10 +81,11 @@ export function registerMeasurementTools(server: McpServer, client: LayersClient
     "list_ads_content",
     {
       title: "List ads content",
+      annotations: READ_ONLY,
       description:
         "Scored creatives for a project: organicScore (0-10; >= 4.0 is ad-eligible), scoringPool (generated/ugc/manual), eligibility, and override state. Returns { items, nextCursor }. adsContentId is a raw UUID — pass it back unprefixed to update_ads_content.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         scoringPool: z.array(z.enum(["generated", "ugc", "manual"])).optional(),
         minScore: z.number().min(0).max(10).optional().describe("Keep rows with organicScore >= minScore"),
         override: z.enum(["include", "exclude", "none"]).optional(),
@@ -100,10 +103,11 @@ export function registerMeasurementTools(server: McpServer, client: LayersClient
     "list_recommendations",
     {
       title: "List recommendations",
+      annotations: READ_ONLY,
       description:
         "Ranked Layers-generated suggestions for a project (kinds today: value_propositions, refresh_fatigued). Each item carries a rationale, evidence, confidence (>= 0.7 = act; < 0.5 = show a human), and a machine-executable suggestedAction (relative endpoint + body). Reading changes nothing.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         kind: z.array(z.enum(["value_propositions", "refresh_fatigued"])).optional(),
         status: z.array(z.enum(["open", "acknowledged", "dismissed", "acted_on"])).optional(),
         minConfidence: z.number().min(0).max(1).optional(),
@@ -122,10 +126,11 @@ export function registerMeasurementTools(server: McpServer, client: LayersClient
     "update_ads_content",
     {
       title: "Update ads content override",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Pin a creative in (include) or out (exclude) of ad eligibility, bypassing the organicScore gate; null clears the override and returns to score-based gating. Does not pause already-running ads. Idempotent.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         adsContentId: z.string().describe("Raw UUID from list_ads_content (no prefix)"),
         override: z
           .enum(["include", "exclude"])
@@ -144,10 +149,11 @@ export function registerMeasurementTools(server: McpServer, client: LayersClient
     "update_recommendation",
     {
       title: "Update recommendation status",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Flip a recommendation's status: acknowledged (seen), dismissed (hide from open view), acted_on (handled), or back to open. Idempotent; the optimizer never overwrites a partner-flipped status.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         recommendationId: z.string().describe("rec_<uuid> from list_recommendations"),
         status: z.enum(["open", "acknowledged", "dismissed", "acted_on"]),
         note: z.string().max(1024).optional().describe("Free-text reason, persisted for audit"),

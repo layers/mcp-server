@@ -1,12 +1,13 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { LayersClient } from "../api.js";
+import { LayersClient, READ_ONLY } from "../api.js";
 
 export function registerFrameworkTools(server: McpServer, client: LayersClient, _readOnly: boolean) {
   server.registerTool(
     "list_audit_log",
     {
       title: "List audit log",
+      annotations: READ_ONLY,
       description:
         "Partner-visible audit trail for the org: one event per material action (api.request, auth.key_rejected, content.approved, scheduled_post.cancelled, ...). Newest first, cursor-paginated. Useful for compliance review, leaked-key forensics (filter apiKeyId), and incident response.",
       inputSchema: {

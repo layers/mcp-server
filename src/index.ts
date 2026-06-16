@@ -29,7 +29,7 @@ if (!apiKey) {
 
 // Loaded once into the client's context at initialize — tells the agent what to
 // remember between calls (this server is stateless) and the shape of the workflow.
-const INSTRUCTIONS = `Wraps the Layers Partner API. The server is STATELESS — it remembers nothing between calls, so YOU must track the IDs and cursors it returns.
+const INSTRUCTIONS = `Wraps the Layers API. The server is STATELESS — it remembers nothing between calls, so YOU must track the IDs and cursors it returns.
 
 IDs: every resource returns a prefixed id (prj_, cnt_, inf_, sp_, sa_, adc_, rec_). Store the exact string and pass it back verbatim — never invent, normalize, or strip it. Responses are the source of truth for ids.
 

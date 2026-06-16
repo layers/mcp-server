@@ -145,8 +145,8 @@ npm run smoke       # opt-in live smoke; needs LAYERS_TEST_KEY=lp_test_...
 
 `npm test` builds, then runs the contract suite with Node's built-in test runner
 against a localhost mock — it verifies tool registration, `--read-only` gating,
-stdout protocol discipline, and the request contract (auth, idempotency, query
-encoding, per-tool routing, error rendering). No credentials or outbound network
+annotation hints, stdout protocol discipline, and the request contract (auth,
+idempotency, query encoding, per-tool routing, error rendering). No credentials or outbound network
 required; this is what CI runs. See [`test/README.md`](test/README.md) for the
 full breakdown and the sandbox smoke script.
 

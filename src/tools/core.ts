@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { LayersClient, clean } from "../api.js";
+import { LayersClient, clean, READ_ONLY, WRITE, WRITE_IDEMPOTENT, DESTRUCTIVE } from "../api.js";
 
 const cursor = z
   .string()
@@ -15,6 +15,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "whoami",
     {
       title: "Who am I",
+      annotations: READ_ONLY,
       description:
         "Resolve the API key to its Layers organization: organizationId, organizationName, scopes, rateLimitTier, and creditBalance. Cheap liveness/auth sanity check.",
       inputSchema: {},
@@ -26,6 +27,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "list_projects",
     {
       title: "List projects",
+      annotations: READ_ONLY,
       description:
         "List the organization's projects (one project per end-customer), newest first. Cursor-paginated: returns { items, nextCursor }.",
       inputSchema: {
@@ -46,6 +48,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "get_project",
     {
       title: "Get project",
+      annotations: READ_ONLY,
       description:
         "Fetch the full project record: brand context, ingest state, platform bundle IDs, metadata.",
       inputSchema: { projectId: z.string().describe("Project ID (prj_<uuid> or bare UUID)") },
@@ -57,6 +60,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "get_credits",
     {
       title: "Get credits",
+      annotations: READ_ONLY,
       description:
         "Org wallet snapshot: balance, included vs prepaid, billing-period usage, and estimated credits per content format. Call before generating to gate on budget.",
       inputSchema: {},
@@ -68,6 +72,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "list_credit_events",
     {
       title: "List credit events",
+      annotations: READ_ONLY,
       description:
         "Per-event credit ledger (charges, refunds, grants, purchases, adjustments, sub-org allocations), newest first. credits is signed: debits negative. Org-level events (grants, purchases, adjustments, allocations) have projectId null and are excluded when filtering by projectId.",
       inputSchema: {
@@ -91,6 +96,7 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "create_project",
     {
       title: "Create project",
+      annotations: WRITE,
       description:
         "Create a project to hold one end-customer's brand context, influencers, social accounts, and content. Synchronous. Supplying appDescription auto-kicks two background workflows: keyword research (~4-5 min, observe via get_keywords) and a first influencer (observe via list_influencers).",
       inputSchema: {
@@ -127,10 +133,11 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "update_project",
     {
       title: "Update project",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Patch user-editable project fields; omitted fields stay unchanged. Changing appDescription to a new value re-kicks background keyword research. metadata is replaced in full, not deep-merged. Returns the full updated record.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         name: z.string().min(3).max(30).optional(),
         status: z
           .enum(["active", "archived"])
@@ -156,9 +163,10 @@ export function registerCoreTools(server: McpServer, client: LayersClient, readO
     "archive_project",
     {
       title: "Archive project",
+      annotations: DESTRUCTIVE,
       description:
         "Soft-archive a project (DELETE /v1/projects/:id): flips status to archived, cancels pending scheduled posts, pauses generation. Data is retained and the archive is reversible via update_project with status=active.",
-      inputSchema: { projectId: z.string().describe("Project ID") },
+      inputSchema: { projectId: z.string() },
     },
     async ({ projectId }) => client.run("DELETE", `/v1/projects/${projectId}`),
   );

@@ -10,7 +10,7 @@ Run with Node's built-in test runner (no test-framework dependency):
 npm test
 ```
 
-`pretest` builds first, then `node --test test/*.test.mjs` runs three suites.
+`pretest` builds first, then `node --test test/*.test.mjs` runs four suites.
 Each spawns the built server as a child process and drives it over stdio; the
 contract suite also points it at a throwaway `127.0.0.1` mock, so **no API key
 and no outbound network are needed**. This is what CI runs.
@@ -27,6 +27,9 @@ and no outbound network are needed**. This is what CI runs.
   scalars serialize once; each tool routes to the correct method + path; a
   required-but-empty caption is transmitted; an API error envelope renders as a
   tool error without echoing the key.
+- **[`annotations.test.mjs`](annotations.test.mjs)** — every tool carries the
+  right MCP annotation hints: `readOnlyHint` on the 25 reads, `destructiveHint`
+  on delete/archive/cancel, `idempotentHint` on PATCH/set-style writes.
 
 The tests assert literal counts (52 / 25 / 27) on purpose — adding or removing a
 tool fails the suite until the count is updated deliberately.

@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { LayersClient, clean } from "../api.js";
+import { LayersClient, clean, READ_ONLY, WRITE, WRITE_IDEMPOTENT, DESTRUCTIVE } from "../api.js";
 
 const cursor = z
   .string()
@@ -23,10 +23,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "list_influencers",
     {
       title: "List influencers",
+      annotations: READ_ONLY,
       description:
         "List a project's influencers (AI personas used as on-camera actors), newest first. Soft-deleted influencers are excluded. Returns { items, nextCursor }.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         cursor,
         limit: z.number().int().min(1).max(100).optional().describe("Page size, 1-100 (default 25)"),
         status: z.enum(["pending", "training", "ready", "failed"]).optional(),
@@ -40,6 +41,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_influencer",
     {
       title: "Get influencer",
+      annotations: READ_ONLY,
       description:
         "Fetch a full influencer record. Only status=ready influencers are usable for content generation without waiting; imageUrl is null until ready.",
       inputSchema: { influencerId: z.string().describe("Influencer ID (inf_<uuid> or bare UUID)") },
@@ -53,9 +55,10 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_keywords",
     {
       title: "Get keywords",
+      annotations: READ_ONLY,
       description:
         "Read the project's curated TikTok hashtag bank, sorted by score. Empty with refreshedAt=null when never generated — call refresh_keywords. Hashtags can be passed as keyword to get_source_recommendations.",
-      inputSchema: { projectId: z.string().describe("Project ID") },
+      inputSchema: { projectId: z.string() },
     },
     async ({ projectId }) => client.run("GET", `/v1/projects/${projectId}/keywords`),
   );
@@ -66,10 +69,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "list_content",
     {
       title: "List content",
+      annotations: READ_ONLY,
       description:
         "List a project's content containers, newest first. Filter by generation status, format, creativeType, or time window. Each row carries a preview object renderable directly. Returns { items, nextCursor }.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         status: z.array(contentStatus).optional().describe("Filter on generation status (repeatable)"),
         format: z.array(contentFormat).optional().describe("Filter on format (repeatable)"),
         creativeType: z
@@ -90,6 +94,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_content",
     {
       title: "Get content container",
+      annotations: READ_ONLY,
       description:
         "Full container record: generation status, approvalStatus, hook, caption, preview, and rendered media assets. Safe to call while generation is in-flight (unpopulated fields are null). For live progress prefer get_content_progress.",
       inputSchema: { containerId: z.string().describe("Container ID (cnt_<uuid> or bare UUID)") },
@@ -101,9 +106,10 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_content_progress",
     {
       title: "Get content progress",
+      annotations: READ_ONLY,
       description:
         "Fine-grained generation progress for a container: status, stage, stageProgress (0-1, resets per stage), etaSeconds. Poll until status is completed, failed, or canceled.",
-      inputSchema: { containerId: z.string().describe("Container ID") },
+      inputSchema: { containerId: z.string() },
     },
     async ({ containerId }) => client.run("GET", `/v1/content/${containerId}/progress`),
   );
@@ -112,10 +118,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_content_asset",
     {
       title: "Get content asset",
+      annotations: READ_ONLY,
       description:
         "Asset descriptor for one media file on a container: durable public CDN URL, kind, and metadata (mimeType, sizeBytes, durationMs, width/height) when available. assetId comes from the container's assets[] or primaryAsset.",
       inputSchema: {
-        containerId: z.string().describe("Container ID"),
+        containerId: z.string(),
         assetId: z.string().describe("Asset ID from container.assets[].assetId (opaque)"),
       },
     },
@@ -127,9 +134,10 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_hooks",
     {
       title: "Get hooks bank",
+      annotations: READ_ONLY,
       description:
         "Generate a fresh bank of ~20 short hook strings adapted to the project's brand voice and language; pass a chosen one verbatim as hook to generate_slideshow / generate_ugc_remix. Line breaks are encoded as the literal two-character sequence \\n. Requires appName and appDescription on the project. Free (no credits); not persisted — save the chosen hook yourself.",
-      inputSchema: { projectId: z.string().describe("Project ID") },
+      inputSchema: { projectId: z.string() },
     },
     async ({ projectId }) => client.run("GET", `/v1/projects/${projectId}/content/hooks`),
   );
@@ -138,10 +146,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_source_recommendations",
     {
       title: "Get source recommendations",
+      annotations: READ_ONLY,
       description:
         "TikTok source candidates for video-remix / slideshow-remix. Without keyword: the project's pre-discovered portfolio. With keyword: live TikTok search. Items carry tiktokId, kind, stats; pass tiktokId as tiktokVideoId to the remix generators.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         keyword: z
           .string()
           .min(1)
@@ -163,9 +172,10 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "get_content_review_policy",
     {
       title: "Get content review policy",
+      annotations: READ_ONLY,
       description:
         "Read the project's approval policy (auto_approve | review_first_n | review_all), firstN when applicable, and the live pendingCount.",
-      inputSchema: { projectId: z.string().describe("Project ID") },
+      inputSchema: { projectId: z.string() },
     },
     async ({ projectId }) => client.run("GET", `/v1/projects/${projectId}/content-review-policy`),
   );
@@ -178,10 +188,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "create_influencer",
     {
       title: "Create influencer",
+      annotations: WRITE,
       description:
         "Start an influencer_create job (async, ~1 min). Layers generates the name, portrait, and persona from the project's brand context plus optional hints — there is no name field; read it back with get_influencer once ready. The returned influencerId is safe to reference in generation calls immediately. Note: supplying appDescription at project creation already auto-creates a first influencer.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         gender: gender.optional().describe("Defaults to the project's targetGender, else female"),
         ageRange: ageRange.optional().describe("Defaults to young_adult"),
         prompt: z
@@ -200,6 +211,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "clone_influencer",
     {
       title: "Clone influencer",
+      annotations: WRITE,
       description:
         "Clone an influencer within its project, preserving identity (the clone looks like the source) with optional per-field overrides — designed for fan-out like Maria-EN / Maria-ES. Async: returns a job envelope; poll get_influencer on the new influencerId.",
       inputSchema: {
@@ -224,10 +236,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "update_influencer",
     {
       title: "Update influencer",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Patch influencer identity fields (at least one). For multi-language characters, clone instead of patching language per content. Returns the full updated record.",
       inputSchema: {
-        influencerId: z.string().describe("Influencer ID"),
+        influencerId: z.string(),
         name: z.string().min(1).max(128).optional(),
         gender: gender.optional().describe("Cannot be cleared"),
         ageRange: ageRange.nullable().optional().describe("Pass null to clear"),
@@ -243,10 +256,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "delete_influencer",
     {
       title: "Delete influencer",
+      annotations: DESTRUCTIVE,
       description:
         "Soft-delete (archive) an influencer. It disappears from reads and future selection; existing content that references it keeps working. There is no undelete via the partner API.",
       inputSchema: {
-        influencerId: z.string().describe("Influencer ID"),
+        influencerId: z.string(),
         reason: z.string().max(1024).optional().describe("Audit note persisted for compliance"),
       },
     },
@@ -262,9 +276,10 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "refresh_keywords",
     {
       title: "Refresh keywords",
+      annotations: WRITE,
       description:
         "Re-run Layers' keyword research agent against the project's appDescription (required — 422 without it). Async, ~4-5 min end-to-end; poll get_keywords until refreshedAt advances. Auto-triggered by project create/update when appDescription is set, so usually only needed for a forced re-run.",
-      inputSchema: { projectId: z.string().describe("Project ID") },
+      inputSchema: { projectId: z.string() },
     },
     async ({ projectId }) =>
       client.run("POST", `/v1/projects/${projectId}/keywords/refresh`, { body: {} }),
@@ -276,10 +291,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "generate_slideshow",
     {
       title: "Generate slideshow",
+      annotations: WRITE,
       description:
         "Generate a hook-driven multi-image vertical slideshow (slideshow-builder). Async: returns 202 with jobId + containerIds[0]; poll get_content_progress. Requires the project to have appDescription. The only format that allows a fully layerless run (no socialAccountId/influencerId — falls back to project voice). Costs credits (~50; check get_credits).",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         hook: z
           .string()
           .min(1)
@@ -300,10 +316,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "generate_ugc_remix",
     {
       title: "Generate UGC remix",
+      annotations: WRITE,
       description:
         "Generate a UGC-style influencer reaction video (ugc-remix). Async job. One of socialAccountId (with wired influencer) or influencerId is REQUIRED (the on-camera actor). Needs an app-demo media asset on the project (or pass mediaId) — fails with details.code MISSING_APP_DEMO otherwise. Reaction template and music auto-selected. Costs credits (~120).",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         socialAccountId: z.string().optional().describe("Connected account with a wired influencer"),
         influencerId: z.string().optional().describe("Explicit influencer (one of the two is required)"),
         hook: z.string().min(1).max(2000).optional().describe("Optional opening overlay text"),
@@ -321,10 +338,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "generate_video_remix",
     {
       title: "Generate video remix",
+      annotations: WRITE,
       description:
         "Remix a discovered TikTok video (video-remix): the influencer is face-swapped onto the source and overlays are brand-adapted. Async job. tiktokVideoId comes from get_source_recommendations. One of socialAccountId or influencerId is REQUIRED. No hook — pick a different source for different opening text. Costs credits (~120).",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         tiktokVideoId: z.string().describe("Source TikTok video id from get_source_recommendations"),
         socialAccountId: z.string().optional(),
         influencerId: z.string().optional().describe("One of socialAccountId/influencerId is required"),
@@ -338,10 +356,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "generate_slideshow_remix",
     {
       title: "Generate slideshow remix",
+      annotations: WRITE,
       description:
         "Remix a discovered TikTok slideshow (slideshow-remix): slides are regenerated with the influencer's face and brand-adapted text. Async job. tiktokVideoId is the slideshow post id (use get_source_recommendations with kind=slideshow; NOT_A_SLIDESHOW if it's a video). One of socialAccountId or influencerId is REQUIRED. Costs credits (~50).",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         tiktokVideoId: z.string().describe("Source TikTok slideshow id"),
         socialAccountId: z.string().optional(),
         influencerId: z.string().optional().describe("One of socialAccountId/influencerId is required"),
@@ -363,10 +382,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "create_content_upload",
     {
       title: "Create content upload (direct transport)",
+      annotations: WRITE,
       description:
         "Step 1 of the direct-upload transport for large/private files (bytes go client → storage, never through the API). Declares the files and returns a containerId plus a presigned PUT URL per file (expire in ~15 min, no re-presign). You then PUT each file's bytes to its uploadUrl sending exactly the declared Content-Type — this PUT happens OUTSIDE this server — then call finalize_content_upload once per returned containerId. Caps: 100MB video / 30MB image. For already-hosted media, use upload_content_from_url instead.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         files: z
           .array(
             z.object({
@@ -398,10 +418,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "upload_content_from_url",
     {
       title: "Upload content from URL",
+      annotations: WRITE,
       description:
         'Upload already-hosted media by URL (URL-fetch transport). Layers fetches each media[].url server-side, validates and probes it, and returns a completed content item (creativeType "uploaded", adsEnrollment opted_out) — synchronous, no job to poll. One video, one image, or 2-10 images (a slideshow). URLs must be public https; sign private URLs for >= 15 min. Atomic: one bad URL means no item is created. Check platformFit on the response before scheduling.',
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         media: z
           .array(
             z.object({
@@ -422,6 +443,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "finalize_content_upload",
     {
       title: "Finalize content upload",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Step 3 of the direct-upload transport. Call once per containerId from create_content_upload, after every PUT for that item has succeeded. Verifies the bytes landed, probes the media, and completes the item (returns the full content item). Idempotent by state — safe to blind-retry. 409 UPLOAD_INCOMPLETE if a PUT hasn't landed yet. The caption set here publishes verbatim; the retry body is ignored (first caption wins) — use update_content_caption to fix it later.",
       inputSchema: {
@@ -437,6 +459,7 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "update_content_caption",
     {
       title: "Update content caption",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Update the caption on an UPLOADED content item (PATCH /v1/content/:containerId). Uploads only — generated content returns 422 VALIDATION (regenerate to change it). Returns the full updated item. The caption publishes byte-for-byte; already-published posts keep the caption they went out with. Media is immutable — upload a new item to change the file.",
       inputSchema: {
@@ -454,10 +477,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "approve_content",
     {
       title: "Approve content",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Flip a container's approvalStatus from pending to approved, unblocking scheduling/publishing. If a schedule was stashed while blocked on approval, it is promoted atomically (see pendingSchedulePromotion in the response). 409 CONFLICT if already approved/rejected or approval is not required.",
       inputSchema: {
-        containerId: z.string().describe("Container ID"),
+        containerId: z.string(),
         note: z.string().max(1024).optional().describe("Audit note"),
       },
     },
@@ -469,10 +493,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "reject_content",
     {
       title: "Reject content",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Flip a container's approvalStatus to rejected — a one-way gate (rejected containers can't be scheduled; approved ones can't be rejected). To get a new take, generate again with a fresh hook. Container must be completed.",
       inputSchema: {
-        containerId: z.string().describe("Container ID"),
+        containerId: z.string(),
         reason: z.string().min(1).max(1024).describe("Rejection note, stored for audit"),
       },
     },
@@ -484,10 +509,11 @@ export function registerCreativeTools(server: McpServer, client: LayersClient, r
     "update_content_review_policy",
     {
       title: "Update content review policy",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Change the project's approval policy. firstN (1-50) is required when policy is review_first_n and forbidden otherwise. With review_first_n, the gate self-disables once firstN containers have been approved or rejected.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         policy: z.enum(["auto_approve", "review_first_n", "review_all"]),
         firstN: z.number().int().min(1).max(50).optional().describe("Required iff policy=review_first_n"),
       },

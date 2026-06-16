@@ -1,6 +1,6 @@
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
-import { LayersClient, clean } from "../api.js";
+import { LayersClient, clean, READ_ONLY, WRITE, WRITE_IDEMPOTENT, DESTRUCTIVE } from "../api.js";
 
 const cursor = z
   .string()
@@ -58,10 +58,11 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "list_social_accounts",
     {
       title: "List social accounts",
+      annotations: READ_ONLY,
       description:
         "List every social account attached to a project — OAuth-connected and Layers-leased (leased boolean tells them apart). Use the socialAccountId values as targets for publish_content / schedule_content. status reauth_required means the user must re-consent (handled in the Layers UI).",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         platform: z.enum(["tiktok", "instagram"]).optional(),
         status: z.enum(["connected", "reauth_required", "disconnected"]).optional(),
         leased: z.boolean().optional().describe("true: only leased accounts; false: exclude them"),
@@ -77,6 +78,7 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "get_scheduled_post",
     {
       title: "Get scheduled post",
+      annotations: READ_ONLY,
       description:
         "Read a scheduled post's state: queued, publishing, draft, published (with externalId/externalUrl), failed (with lastError), or canceled. Poll until terminal. Note: Instagram externalUrl can rarely be null even when live.",
       inputSchema: { scheduledPostId: z.string().describe("Scheduled post ID (sp_<uuid>)") },
@@ -88,10 +90,11 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "list_scheduled_posts",
     {
       title: "List scheduled posts",
+      annotations: READ_ONLY,
       description:
         "Enumerate a project's scheduled posts, sorted by scheduledFor descending. Filter by status (repeatable), account, or a scheduledFor window. Returns { items, nextCursor }.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         status: z
           .array(z.enum(["queued", "publishing", "draft", "published", "failed", "canceled"]))
           .optional()
@@ -111,6 +114,7 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "list_tiktok_music",
     {
       title: "List TikTok music",
+      annotations: READ_ONLY,
       description:
         "Trending TikTok music catalog (refreshed every 12h). Pass a track's id as tiktokMusic.trackId on publish/schedule targets. Note: manual selection only takes effect on managed mode; direct publish degrades to auto.",
       inputSchema: {},
@@ -122,9 +126,10 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "get_engagement_config",
     {
       title: "Get engagement config",
+      annotations: READ_ONLY,
       description:
         "Read the project's Social Engagement layer config: master enabled switch, first-comment policy, and reply-to-comments policy (auto-reply delay, tone, caps, escalation). 404 if the project has no Social Engagement layer.",
-      inputSchema: { projectId: z.string().describe("Project ID") },
+      inputSchema: { projectId: z.string() },
     },
     async ({ projectId }) => client.run("GET", `/v1/projects/${projectId}/engagement`),
   );
@@ -135,6 +140,7 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "publish_content",
     {
       title: "Publish content",
+      annotations: WRITE,
       description:
         "Publish a completed container immediately to up to 50 targets (all-or-nothing). Returns scheduledPostIds — poll get_scheduled_post for terminal state. 403 APPROVAL_REQUIRED if the container is pending approval (publish does NOT stash intent — approve first, then re-issue); 409 CONTENT_REJECTED if rejected. The ~30s lead is your cancel window via cancel_scheduled_post.",
       inputSchema: {
@@ -150,6 +156,7 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "schedule_content",
     {
       title: "Schedule content",
+      annotations: WRITE,
       description:
         "Schedule a completed container to publish to up to 50 targets at scheduledFor (a literal UTC instant — convert from local time yourself; the project timezone does NOT shift it). If the container is pending approval, returns 202 with gateStatus=blocked_on_approval and the intent is promoted automatically on approve_content. Each target gets its own scheduledPostId.",
       inputSchema: {
@@ -170,10 +177,11 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "reschedule_post",
     {
       title: "Reschedule post",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Move a queued scheduled post to a different future time. Only status=queued posts are reschedulable (409 otherwise). Captions/targets are immutable — cancel and re-schedule from the container to change those.",
       inputSchema: {
-        scheduledPostId: z.string().describe("Scheduled post ID"),
+        scheduledPostId: z.string(),
         scheduledFor: z.string().describe("New publish time — ISO 8601 UTC with Z suffix, in the future"),
       },
     },
@@ -187,10 +195,11 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "cancel_scheduled_post",
     {
       title: "Cancel scheduled post",
+      annotations: DESTRUCTIVE,
       description:
         "Cancel a post that hasn't started publishing (it stays visible with status=canceled for audit). Best-effort once publishing has begun (409 if the upload already went out). Already-published posts can't be pulled back via the API.",
       inputSchema: {
-        scheduledPostId: z.string().describe("Scheduled post ID"),
+        scheduledPostId: z.string(),
         reason: z.string().max(1024).optional().describe("Audit-log note"),
       },
     },
@@ -204,6 +213,7 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "notify_device",
     {
       title: "Notify device (text the post)",
+      annotations: WRITE,
       description:
         'The "Text me this post" handoff: sends the container\'s media, caption, and AI-written posting instructions to a phone over iMessage/SMS, for manual posting in the native app. Immediate — not a scheduling path. phoneNumber falls back to the API key owner\'s verified phone when omitted; pass it explicitly for creator handoffs.',
       inputSchema: {
@@ -224,10 +234,11 @@ export function registerDistributionTools(server: McpServer, client: LayersClien
     "update_engagement_config",
     {
       title: "Update engagement config",
+      annotations: WRITE_IDEMPOTENT,
       description:
         "Partially update the project's engagement automation — pass only what changes; sub-objects merge partially. autoReplyDelay is an ISO-8601 duration between PT30S and PT1H. Safety filters are fixed and always applied. 409 if the project has multiple engagement layers and projectLayerId is omitted.",
       inputSchema: {
-        projectId: z.string().describe("Project ID"),
+        projectId: z.string(),
         projectLayerId: z
           .string()
           .optional()
