@@ -1,6 +1,6 @@
 {
   "name": "@layers/mcp-server",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "MCP server exposing the Layers Partner API as tools",
   "author": "Layers AI, Inc.",
   "license": "Apache-2.0",
@@ -16,6 +16,7 @@
     "smoke": "node scripts/smoke.mjs",
     "prepublishOnly": "npm run build"
   },
+  "publishConfig": { "access": "public" },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.4.3"

@@ -1,7 +1,7 @@
 // Tool registration & read-only gating — hermetic, no key/network.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { listTools } from "./helpers.mjs";
+import { listTools, startClient } from "./helpers.mjs";
 
 // The complete set of mutating tools. Read-only mode must hide exactly these.
 const WRITE_TOOLS = [
@@ -39,6 +39,16 @@ test("--read-only exposes exactly the 25 read tools and hides every write tool",
     assert.ok(full.includes(w), `${w} should exist in the full tool set`);
     assert.ok(!readOnly.includes(w), `${w} must be hidden in --read-only`);
   }
+});
+
+test("advertises substantive usage instructions for context/state guidance", async () => {
+  const client = await startClient();
+  const instructions = client.getInstructions();
+  await client.close();
+  assert.ok(instructions && instructions.length > 200, "server should return substantive instructions");
+  // the instructions exist to tell the agent what to hold between calls
+  assert.match(instructions, /stateless/i);
+  assert.match(instructions, /nextCursor/);
 });
 
 test("every tool is snake_case with a real description and an input schema", async () => {
