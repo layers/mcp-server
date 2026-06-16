@@ -1,11 +1,11 @@
 # Layers MCP Server
 
 An MCP (Model Context Protocol) server that exposes the
-[Layers Partner API](https://api.layers.com) as tools, so AI agents can manage
+[Layers API](https://api.layers.com) as tools, so AI agents can manage
 projects, generate short-form social content, and publish it — straight from
 any MCP client.
 
-> **Status:** pre-release. Endpoint coverage tracks the published Partner API
+> **Status:** pre-release. Endpoint coverage tracks the published API
 > reference; not yet published to npm.
 
 ## Install
@@ -36,7 +36,7 @@ Flags take precedence; environment variables are the fallback.
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
-| `--api-key` | `LAYERS_API_KEY` | — (required) | Layers Partner API key (`lp_...`). The server exits with an error if missing. |
+| `--api-key` | `LAYERS_API_KEY` | — (required) | Layers API key (`lp_...`). The server exits with an error if missing. |
 | `--base-url` | `LAYERS_BASE_URL` | `https://api.layers.com` | API host. Paths are versioned under `/v1`. |
 | `--read-only` | `LAYERS_READ_ONLY=1` | off | Register only read tools (25 of 52). Mutating tools are not exposed at all. |
 | `--organization` | `LAYERS_ORGANIZATION` | unset | Act on behalf of a child org (`org_...`), sent as the `X-Layers-Organization` header on every request. Requires an `org:admin` parent key. |
@@ -62,7 +62,7 @@ content, OAuth, and publish return fixture-backed results.
 
 ## Tools
 
-52 tools, one per Partner API route. Write tools (marked W) are hidden by
+52 tools, one per API route. Write tools (marked W) are hidden by
 `--read-only`.
 
 ### Core
@@ -145,8 +145,8 @@ npm run smoke       # opt-in live smoke; needs LAYERS_TEST_KEY=lp_test_...
 
 `npm test` builds, then runs the contract suite with Node's built-in test runner
 against a localhost mock — it verifies tool registration, `--read-only` gating,
-stdout protocol discipline, and the request contract (auth, idempotency, query
-encoding, per-tool routing, error rendering). No credentials or outbound network
+annotation hints, stdout protocol discipline, and the request contract (auth,
+idempotency, query encoding, per-tool routing, error rendering). No credentials or outbound network
 required; this is what CI runs. See [`test/README.md`](test/README.md) for the
 full breakdown and the sandbox smoke script.
 

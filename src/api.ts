@@ -27,6 +27,22 @@ export const err = (text: string): ToolResult => ({
 export const clean = (obj: Record<string, unknown>): Record<string, unknown> =>
   Object.fromEntries(Object.entries(obj).filter(([, v]) => v !== undefined));
 
+/**
+ * MCP tool annotations — untrusted hints clients use to auto-approve safe reads
+ * and warn before destructive writes, cutting confirmation round-trips.
+ *   READ_ONLY        — a GET; doesn't modify state.
+ *   WRITE            — an additive write (create/generate/publish); repeating it
+ *                      does more (e.g. a duplicate), so not idempotent.
+ *   WRITE_IDEMPOTENT — a PATCH/set or state-stable write; repeating with the same
+ *                      args lands the same state.
+ *   DESTRUCTIVE      — removes/cancels (delete/archive/cancel); end state is stable.
+ * (openWorldHint is left at its default true — every tool calls a remote API.)
+ */
+export const READ_ONLY = { readOnlyHint: true };
+export const WRITE = { readOnlyHint: false, destructiveHint: false };
+export const WRITE_IDEMPOTENT = { readOnlyHint: false, destructiveHint: false, idempotentHint: true };
+export const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true };
+
 export class LayersClient {
   constructor(
     private readonly apiKey: string,
