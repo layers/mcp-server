@@ -27,7 +27,25 @@ if (!apiKey) {
   process.exit(1);
 }
 
-const server = new McpServer({ name: "layers", version: "0.1.0" });
+// Loaded once into the client's context at initialize — tells the agent what to
+// remember between calls (this server is stateless) and the shape of the workflow.
+const INSTRUCTIONS = `Wraps the Layers Partner API. The server is STATELESS — it remembers nothing between calls, so YOU must track the IDs and cursors it returns.
+
+IDs: every resource returns a prefixed id (prj_, cnt_, inf_, sp_, sa_, adc_, rec_). Store the exact string and pass it back verbatim — never invent, normalize, or strip it. Responses are the source of truth for ids.
+
+Async work: generate_* , create_influencer, clone_influencer, and refresh_keywords return a 202 job envelope (a jobId, plus containerIds or influencerId depending on the call). The work is NOT done when the call returns — capture the id and poll the matching read until status is terminal (completed/failed/canceled): get_content_progress for content, get_influencer for an influencer, get_keywords for a keyword refresh.
+
+Typical flow: create_project -> get_hooks -> generate_* -> poll get_content_progress -> approve_content (if the project requires review) -> schedule_content or publish_content -> poll get_scheduled_post.
+
+Pagination: list_* return { items, nextCursor }. To get the next page pass nextCursor back as cursor — don't restart. A null/absent nextCursor means you've reached the end.
+
+Idempotency is automatic per call, so calling a create twice creates two resources. Don't blindly retry a create — read first to check whether the prior call already succeeded.
+
+Errors come back as isError text "Layers API <status> <code>". Branch on the code, not the message: NOT_FOUND (wrong or foreign id), VALIDATION (fix the body), APPROVAL_REQUIRED (approve the container first), BILLING_EXHAUSTED (out of credits), RATE_LIMITED (back off and retry). Quote the requestId in support tickets.
+
+Timestamps are UTC with a Z suffix; scheduledFor is a literal UTC instant — convert from local time yourself.`;
+
+const server = new McpServer({ name: "layers", version: "1.0.0" }, { instructions: INSTRUCTIONS });
 const client = new LayersClient(apiKey, baseUrl, organization);
 
 registerCoreTools(server, client, readOnly);
