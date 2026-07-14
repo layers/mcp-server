@@ -8,7 +8,7 @@
 
 ## 1. Mode selection (must not regress existing installs)
 
-The server today resolves the key from **either** `--api-key` **or** the `LAYERS_API_KEY` env var (`src/index.ts:19` — `flagValue("api-key") ?? process.env.LAYERS_API_KEY`).
+The server today resolves the key from **either** `--api-key` **or** the `LAYERS_API_KEY` env var (`src/index.ts:18` — `flagValue("api-key") ?? process.env.LAYERS_API_KEY`).
 
 - **Legacy mode (unchanged, byte-identical):** entered whenever a key resolves from **either** source. All 52 tools register exactly as today.
 - **Keyless onboarding mode:** entered **only** when **neither** a `--api-key` flag nor `LAYERS_API_KEY` is present — or via the explicit `onboard` subcommand (§4).
@@ -16,7 +16,7 @@ The server today resolves the key from **either** `--api-key` **or** the `LAYERS
 
 ## 2. Tools in onboarding mode
 
-**Native** (implemented here, REST → `apps/api` public onboarding routes; base URL `--base-url`/`LAYERS_BASE_URL`, default `https://api.layers.com`):
+**Native** (to be implemented here — REST → `apps/api` public onboarding routes; base URL `--base-url`/`LAYERS_BASE_URL`, default `https://api.layers.com`):
 
 | Tool | Kind | REST | Returns |
 |---|---|---|---|
@@ -60,4 +60,4 @@ Keyless-mode registration; **both** credential forms (`--api-key` and `LAYERS_AP
 
 ---
 
-*Full cross-repo context, the apps/api + apps/elle counterparts, and the P0–P5 sequencing live in the monorepo plan. This repo implements §5.3 (keyless mode) and §5.5 (publish hardening) of that plan.*
+*This is a spec, not shipped code — nothing here is implemented yet. Full cross-repo context, the apps/api + apps/elle counterparts, and the P0–P5 sequencing live in the monorepo plan. This repo **will implement** §5.3 (keyless mode) and §5.5 (publish hardening) of that plan.*
