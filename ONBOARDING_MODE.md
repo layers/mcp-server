@@ -60,4 +60,8 @@ Keyless-mode registration; **both** credential forms (`--api-key` and `LAYERS_AP
 
 ---
 
-*This is a spec, not shipped code — nothing here is implemented yet. Full cross-repo context, the apps/api + apps/elle counterparts, and the P0–P5 sequencing live in the monorepo plan. This repo **will implement** §5.3 (keyless mode) and §5.5 (publish hardening) of that plan.*
+*Status: §1–§4 (mode selection, the four native tools, session memory + redaction, the `onboard`
+CLI subcommand) are **implemented** (`src/onboarding/`, adversarially co-reviewed, 33 hermetic
+tests). Still pending: §2's bridged `ask_elle`/`get_marketing_plan` (needs the remote Elle
+onboarding MCP server), §5 `llms.txt`, and §6 publish hardening (launch-blocking). Full
+cross-repo context and sequencing live in the monorepo plan.*
