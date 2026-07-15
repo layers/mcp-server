@@ -3,11 +3,15 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnServer } from "./helpers.mjs";
 
-test("exits non-zero with a stderr-only message when the API key is missing", async () => {
-  const { code, stdout, stderr } = await spawnServer([], { scrub: ["LAYERS_API_KEY"] });
-  assert.notEqual(code, 0, "should fail closed without a key");
-  assert.equal(stdout, "", "must not write anything to stdout");
-  assert.match(stderr, /api key/i, "should explain the missing key on stderr");
+test("keyless startup runs the onboarding server until it is killed", async () => {
+  const { code, signal, stdout, stderr } = await spawnServer([], {
+    scrub: ["LAYERS_API_KEY"],
+    until: (_out, err) => /keyless onboarding/.test(err),
+  });
+  assert.equal(code, null, "keyless onboarding server must not exit on its own");
+  assert.equal(signal, "SIGTERM", "the test helper should be what stops the live server");
+  assert.equal(stdout, "", "an idle MCP server must not write non-protocol output to stdout");
+  assert.match(stderr, /keyless onboarding/, "startup banner must identify keyless onboarding");
 });
 
 test("writes only JSON-RPC frames to stdout; diagnostics go to stderr", async () => {

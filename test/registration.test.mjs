@@ -1,7 +1,46 @@
 // Tool registration & read-only gating — hermetic, no key/network.
+import { createHash } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { listTools, startClient } from "./helpers.mjs";
+import { listTools, spawnServer, startClient } from "./helpers.mjs";
+
+const LEGACY_FIXTURE = JSON.parse(
+  readFileSync(new URL("./fixtures/legacy-tools.json", import.meta.url), "utf8"),
+);
+
+async function legacySnapshot({ apiKey, extraEnv = {} }) {
+  const client = await startClient([], { apiKey, extraEnv });
+  let tools;
+  let instructions;
+  try {
+    tools = (await client.listTools()).tools;
+    instructions = client.getInstructions();
+  } finally {
+    await client.close();
+  }
+
+  const args = apiKey === null ? [] : ["--api-key", apiKey];
+  const scrub = ["LAYERS_BASE_URL", "LAYERS_ORGANIZATION", "LAYERS_READ_ONLY"];
+  if (apiKey !== null) scrub.push("LAYERS_API_KEY");
+  const processResult = await spawnServer(args, {
+    extraEnv,
+    scrub,
+    until: (_stdout, stderr) => /layers mcp server running on stdio/.test(stderr),
+  });
+  assert.equal(processResult.code, null, "legacy server must remain alive after startup");
+  assert.equal(processResult.signal, "SIGTERM");
+  const startupLogLine = processResult.stderr
+    .split(/\r?\n/)
+    .find((line) => line.includes("layers mcp server running on stdio"));
+  assert.ok(startupLogLine, "legacy startup log line must be present");
+
+  return {
+    sortedToolNames: tools.map((tool) => tool.name).sort(),
+    instructionsSha256: createHash("sha256").update(instructions ?? "").digest("hex"),
+    startupLogLine,
+  };
+}
 
 // The complete set of mutating tools. Read-only mode must hide exactly these.
 const WRITE_TOOLS = [
@@ -23,6 +62,17 @@ const WRITE_TOOLS = [
 test("registers all 52 tools by default", async () => {
   const tools = await listTools();
   assert.equal(tools.length, 52);
+});
+
+test("both API-key forms match the checked-in legacy registration fixture", async () => {
+  const fromFlag = await legacySnapshot({ apiKey: "lp_x" });
+  const fromEnvironment = await legacySnapshot({
+    apiKey: null,
+    extraEnv: { LAYERS_API_KEY: "lp_x" },
+  });
+
+  assert.deepEqual(fromFlag, LEGACY_FIXTURE);
+  assert.deepEqual(fromEnvironment, LEGACY_FIXTURE);
 });
 
 test("--read-only exposes exactly the 25 read tools and hides every write tool", async () => {

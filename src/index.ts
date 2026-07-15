@@ -7,6 +7,12 @@ import { registerCreativeTools } from "./tools/creative.js";
 import { registerDistributionTools } from "./tools/distribution.js";
 import { registerMeasurementTools } from "./tools/measurement.js";
 import { registerFrameworkTools } from "./tools/framework.js";
+import {
+  getOnboardingStatus,
+  registerOnboardingTools,
+  startOnboarding,
+} from "./onboarding/tools.js";
+import { redact } from "./onboarding/session.js";
 
 // Flag-first, env-fallback config, mirroring the Supabase server's install style.
 const argv = process.argv.slice(2);
@@ -20,12 +26,6 @@ const baseUrl = flagValue("base-url") ?? process.env.LAYERS_BASE_URL ?? "https:/
 const organization = flagValue("organization") ?? process.env.LAYERS_ORGANIZATION;
 const readOnly =
   argv.includes("--read-only") || ["1", "true"].includes(process.env.LAYERS_READ_ONLY ?? "");
-
-if (!apiKey) {
-  // stderr only — stdout is the JSON-RPC channel
-  console.error("Missing API key. Pass --api-key lp_... or set LAYERS_API_KEY.");
-  process.exit(1);
-}
 
 // Loaded once into the client's context at initialize — tells the agent what to
 // remember between calls (this server is stateless) and the shape of the workflow.
@@ -45,17 +45,95 @@ Errors come back as isError text "Layers API <status> <code>". Branch on the cod
 
 Timestamps are UTC with a Z suffix; scheduledFor is a literal UTC instant — convert from local time yourself.`;
 
-const server = new McpServer({ name: "layers", version: "1.0.0" }, { instructions: INSTRUCTIONS });
-const client = new LayersClient(apiKey, baseUrl, organization);
+const ONBOARDING_INSTRUCTIONS = `Runs keyless Layers onboarding. The server is STATELESS across restarts; during this process it keeps only the short-lived onboarding session needed to continue the flow.
 
-registerCoreTools(server, client, readOnly);
-registerCreativeTools(server, client, readOnly);
-registerDistributionTools(server, client, readOnly);
-registerMeasurementTools(server, client, readOnly);
-registerFrameworkTools(server, client, readOnly);
+Flow: call onboard_start with the human's website or Apple App Store URL, then poll get_onboarding_status. Give the human both previewUrl and claimUrl. When they are ready to claim, call onboard_claim_begin with their email. The human must read the six-digit code from that inbox; pass that code and the same email to onboard_claim_verify.
 
-const transport = new StdioServerTransport();
-await server.connect(transport);
-console.error(
-  `layers mcp server running on stdio (base: ${baseUrl}${organization ? `, org: ${organization}` : ""}${readOnly ? ", read-only" : ""})`,
-);
+The marketing plan is reveal-gated: only a teaser is available before claim, and full plan content is available after claim. Responses are the source of truth for every handle and ID. NEVER invent, normalize, or guess IDs.`;
+
+const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+async function runOnboardCli(): Promise<void> {
+  const url = argv[1];
+  if (!url || url.startsWith("--")) {
+    throw new Error("Usage: layers-mcp-server onboard <url>");
+  }
+
+  console.log(redact("Starting keyless Layers onboarding..."));
+  const started = await startOnboarding(baseUrl, url);
+  console.log(redact("Onboarding started; waiting for the preview..."));
+
+  const deadline = Date.now() + 180_000;
+  let lastProgress = "";
+  while (Date.now() < deadline) {
+    const status = await getOnboardingStatus(baseUrl, started.trialHandle);
+    if (!status || typeof status !== "object") {
+      throw new Error("Onboarding status returned an invalid response");
+    }
+
+    const record = status as Record<string, unknown>;
+    const buildState = typeof record.buildState === "string" ? record.buildState : "unknown";
+    const planState = typeof record.planState === "string" ? record.planState : "unknown";
+    const progress = `build: ${buildState}; plan: ${planState}`;
+    if (progress !== lastProgress) {
+      console.log(redact(progress));
+      lastProgress = progress;
+    }
+
+    if (buildState === "preview_ready") break;
+    if (buildState === "failed" || buildState === "expired") {
+      throw new Error(`Onboarding ${buildState} (${progress})`);
+    }
+    await sleep(5_000);
+  }
+
+  console.log(redact(`previewUrl: ${started.previewUrl}`));
+  console.log(redact(`claimUrl: ${started.claimUrl}`));
+  console.log(
+    redact("to claim: reconnect with onboard_claim_begin/verify or open the claim URL"),
+  );
+}
+
+async function runLegacyServer(key: string): Promise<void> {
+  const server = new McpServer({ name: "layers", version: "1.0.0" }, { instructions: INSTRUCTIONS });
+  const client = new LayersClient(key, baseUrl, organization);
+
+  registerCoreTools(server, client, readOnly);
+  registerCreativeTools(server, client, readOnly);
+  registerDistributionTools(server, client, readOnly);
+  registerMeasurementTools(server, client, readOnly);
+  registerFrameworkTools(server, client, readOnly);
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(
+    `layers mcp server running on stdio (base: ${baseUrl}${organization ? `, org: ${organization}` : ""}${readOnly ? ", read-only" : ""})`,
+  );
+}
+
+async function runOnboardingServer(): Promise<void> {
+  const server = new McpServer(
+    { name: "layers", version: "1.0.0" },
+    { instructions: ONBOARDING_INSTRUCTIONS },
+  );
+  registerOnboardingTools(server, baseUrl);
+
+  const transport = new StdioServerTransport();
+  await server.connect(transport);
+  console.error(
+    `layers mcp server running on stdio (base: ${baseUrl}, keyless onboarding; no API key)`,
+  );
+}
+
+if (argv[0] === "onboard") {
+  try {
+    await runOnboardCli();
+  } catch (error) {
+    console.error(redact(error instanceof Error ? error.message : String(error)));
+    process.exitCode = 1;
+  }
+} else if (apiKey) {
+  await runLegacyServer(apiKey);
+} else {
+  await runOnboardingServer();
+}
