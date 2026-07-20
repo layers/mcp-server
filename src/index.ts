@@ -12,6 +12,7 @@ import {
   registerOnboardingTools,
   startOnboarding,
 } from "./onboarding/tools.js";
+import { registerBridgedOnboardingTools } from "./onboarding/bridged-tools.js";
 import { redact } from "./onboarding/session.js";
 
 // Flag-first, env-fallback config, mirroring the Supabase server's install style.
@@ -23,6 +24,7 @@ const flagValue = (name: string): string | undefined => {
 
 const apiKey = flagValue("api-key") ?? process.env.LAYERS_API_KEY;
 const baseUrl = flagValue("base-url") ?? process.env.LAYERS_BASE_URL ?? "https://api.layers.com";
+const elleMcpBaseUrl = process.env.LAYERS_ELLE_MCP_URL ?? "https://elle.layers.com";
 const organization = flagValue("organization") ?? process.env.LAYERS_ORGANIZATION;
 const readOnly =
   argv.includes("--read-only") || ["1", "true"].includes(process.env.LAYERS_READ_ONLY ?? "");
@@ -117,6 +119,7 @@ async function runOnboardingServer(): Promise<void> {
     { instructions: ONBOARDING_INSTRUCTIONS },
   );
   registerOnboardingTools(server, baseUrl);
+  registerBridgedOnboardingTools(server, baseUrl, elleMcpBaseUrl);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);

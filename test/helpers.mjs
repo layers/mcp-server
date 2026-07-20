@@ -29,6 +29,7 @@ export async function startClient(
   for (const key of [
     "LAYERS_API_KEY",
     "LAYERS_BASE_URL",
+    "LAYERS_ELLE_MCP_URL",
     "LAYERS_ORGANIZATION",
     "LAYERS_READ_ONLY",
   ]) {

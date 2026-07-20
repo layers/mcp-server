@@ -69,7 +69,7 @@ function onboardingHandler(overrides = {}) {
   };
 }
 
-test("keyless mode registers only the four native onboarding tools", async () => {
+test("keyless mode registers the four native and two bridged onboarding tools", async () => {
   const client = await startClient(["--read-only", "--organization", "ignored_org"], {
     apiKey: null,
   });
@@ -82,11 +82,32 @@ test("keyless mode registers only the four native onboarding tools", async () =>
         "get_onboarding_status",
         "onboard_claim_begin",
         "onboard_claim_verify",
+        "ask_elle",
+        "get_marketing_plan",
       ],
     );
     assert.match(client.getInstructions(), /stateless/i);
     assert.match(client.getInstructions(), /six-digit code/i);
     assert.match(client.getInstructions(), /never invent/i);
+  } finally {
+    await client.close();
+  }
+});
+
+test("bridged tools fail clearly before onboard_start without crashing the server", async () => {
+  const client = await startClient([], { apiKey: null });
+  try {
+    for (const [name, args] of [
+      ["ask_elle", { message: "Help me get started" }],
+      ["get_marketing_plan", {}],
+    ]) {
+      const result = await callTool(client, name, args);
+      assert.equal(result.isError, true);
+      assert.match(result.text, /run onboard_start first/i);
+    }
+
+    const tools = (await client.listTools()).tools;
+    assert.equal(tools.length, 6, "the MCP server must remain live after bridge errors");
   } finally {
     await client.close();
   }

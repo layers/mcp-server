@@ -30,6 +30,11 @@ The server today resolves the key from **either** `--api-key` **or** the `LAYERS
 - `ask_elle` — backed by the remote onboarding guide agent (whatever its internal Mastra key; the alias decouples us from it).
 - `get_marketing_plan` — teaser pre-claim, full content post-claim (server enforces the reveal gate).
 
+The remote Elle host is configured only for keyless onboarding through
+`LAYERS_ELLE_MCP_URL` (default `https://elle.layers.com`). The bridge appends
+`/api/mcp/onboarding/mcp?trial=<trialHandle>`; the native REST routes continue to use
+`--base-url`/`LAYERS_BASE_URL`.
+
 ## 3. Session handling (security-critical)
 
 - `onboard_start` returns, to this process only, a short-lived **access token** + an opaque **`sessionHandle`**. **No refresh token ever reaches the client** — the refresh chain is owned server-side; renew via `POST /api/onboard/agent/refresh { sessionHandle }`.
@@ -60,8 +65,7 @@ Keyless-mode registration; **both** credential forms (`--api-key` and `LAYERS_AP
 
 ---
 
-*Status: §1–§4 (mode selection, the four native tools, session memory + redaction, the `onboard`
-CLI subcommand) are **implemented** (`src/onboarding/`, adversarially co-reviewed, 33 hermetic
-tests). Still pending: §2's bridged `ask_elle`/`get_marketing_plan` (needs the remote Elle
-onboarding MCP server), §5 `llms.txt`, and §6 publish hardening (launch-blocking). Full
+*Status: §1–§4 (mode selection, the four native tools, bridged `ask_elle`/
+`get_marketing_plan`, session memory + redaction, and the `onboard` CLI subcommand) are
+**implemented**. Still pending: §5 `llms.txt` and §6 publish hardening (launch-blocking). Full
 cross-repo context and sequencing live in the monorepo plan.*
