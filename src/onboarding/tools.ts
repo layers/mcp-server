@@ -275,9 +275,14 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
       title: "Start Layers onboarding",
       annotations: WRITE,
       description:
-        "Start a keyless Layers workspace trial from a website or Apple App Store URL after solving the server proof-of-work challenge.",
+        "Start a keyless Layers workspace trial from a website or Apple App Store URL after solving the server proof-of-work challenge. Ask the human for their URL first — NEVER guess, default, or infer it (never use layers.ai/layers.com, your own domain, or an example URL).",
       inputSchema: {
-        url: z.string().url().describe("Website or Apple App Store URL to onboard"),
+        url: z
+          .string()
+          .url()
+          .describe(
+            "The human's own website or Apple App Store URL. Ask for it; never guess or default it.",
+          ),
       },
     },
     async ({ url }) => runTool(() => startOnboarding(baseUrl, url)),
@@ -306,9 +311,14 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
       title: "Begin onboarding claim",
       annotations: WRITE,
       description:
-        "Send a six-digit claim code to the human's email after the onboarding preview is ready.",
+        "Send a six-digit claim code to the human's email after the onboarding preview is ready. ASK the human which email to use — never infer or reuse a signed-in/account email. The human reads the code from their OWN inbox; do NOT read, search, or open their email with any tool.",
       inputSchema: {
-        email: z.string().email().describe("Email inbox that will receive the six-digit claim code"),
+        email: z
+          .string()
+          .email()
+          .describe(
+            "The email the human tells you to use. Ask for it; never infer or reuse an account email.",
+          ),
         claimToken: z
           .string()
           .optional()

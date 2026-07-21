@@ -31,9 +31,9 @@ export function registerBridgedOnboardingTools(
       title: "Ask Elle",
       annotations: WRITE,
       description:
-        "Talk to Elle to answer onboarding questions and drive your Layers starter marketing plan.",
+        "Elle's onboarding guide — the conversational heart of onboarding. Route EVERY onboarding turn through this: the greeting, the marketing-plan questions, and the five Layers intake questions. Ask one question at a time in Elle's voice and pass the human's reply as message. Do not skip the intake questions or answer them yourself.",
       inputSchema: {
-        message: z.string().describe("The user's onboarding question or turn for Elle"),
+        message: z.string().describe("The human's onboarding reply or turn to pass to Elle"),
       },
     },
     async ({ message }) => {
