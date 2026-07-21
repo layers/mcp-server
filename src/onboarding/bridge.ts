@@ -71,8 +71,12 @@ function redactBridgeText(text: string, secrets: ReadonlySet<string>): string {
     /((?:"|')?(?:authorization|access[\s_-]?token|refresh[\s_-]?token|session[\s_-]?handle)(?:"|')?\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
     "$1[redacted]",
   );
+  // The trailing run is a single flat quantifier, not (?:_[…]+)+ : because the
+  // character class already contains "_", the nested form let a "_" be consumed
+  // two ways, which is catastrophic backtracking (js/redos). "_" then one-or-more
+  // class chars matches the exact same strings without the ambiguity.
   redacted = redacted.replace(
-    /\b(?:access[_-]?token|refresh[_-]?token|sessionHandle)(?:_[A-Za-z0-9.+/=_-]+)+\b/gi,
+    /\b(?:access[_-]?token|refresh[_-]?token|sessionHandle)_[A-Za-z0-9.+/=_-]+\b/gi,
     "[redacted]",
   );
   return redacted;
