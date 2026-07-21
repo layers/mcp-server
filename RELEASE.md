@@ -47,6 +47,11 @@ verifies it directly. Consequences:
 2. **GitHub → repo Settings → Environments → New environment `npm-publish`:**
    add the release approvers under *Required reviewers*.
 
-That's it — no `NPM_TOKEN` secret. (Fallback if OIDC is ever unavailable: a
-granular npm automation token in a secret + `NODE_AUTH_TOKEN`, but that
-reintroduces the long-lived-secret risk and is not recommended.)
+That's it — no `NPM_TOKEN` secret.
+
+> **Do not fall back to a long-lived publish token.** Per the 2026-07-08 npm
+> changelog, tokens that bypass 2FA lose account/package-management rights in
+> early Aug 2026 and **direct publish rights in Jan 2027**. OIDC trusted
+> publishing (used here) plus the human-approval environment are npm's own
+> recommended replacements — this workflow is already on the right side of that
+> deprecation.
