@@ -1,0 +1,79 @@
+name: Release
+
+# Publishes @layers/mcp-server to npm when a version tag is pushed.
+#
+#   git tag v1.1.0 && git push origin v1.1.0
+#
+# SECURITY MODEL — no npm token is stored anywhere.
+# This uses npm Trusted Publishing (OIDC): GitHub Actions mints a short-lived,
+# cryptographically-scoped credential (this repo + this workflow only) and
+# exchanges it with npm at publish time. There is no long-lived automation
+# token to leak, and the OIDC exchange is a strong credential that satisfies
+# npm's 2FA-required-for-publish setting — so keep 2FA ON for human publishes.
+# Every publish also carries a signed provenance attestation linking the tarball
+# to this commit + workflow run.
+#
+# Two one-time setup steps on npmjs.com (see RELEASE.md):
+#   1. Package → Settings → Trusted Publishers → add this repo + workflow
+#      (.github/workflows/release.yml), environment "npm-publish".
+#   2. Repo → Settings → Environments → create "npm-publish" and add required
+#      reviewers. That turns each publish into a human-approved gate — the key
+#      defense if a malicious tag is ever pushed.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+# Never let two tag pushes publish concurrently.
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    # Human-approval gate + the environment claim npm's trusted publisher pins.
+    environment: npm-publish
+    permissions:
+      contents: read
+      id-token: write # REQUIRED for npm Trusted Publishing (OIDC). Nothing else needs it.
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: 'https://registry.npmjs.org'
+
+      # Trusted Publishing (OIDC) requires npm >= 11.5.1; Node 22 ships an older
+      # npm, so upgrade the CLI before publishing.
+      - name: Upgrade npm for OIDC publishing
+        run: npm install -g npm@latest
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Refuse to publish if the tag and package.json version disagree, so a
+      # mistyped tag can never ship the wrong version (v1.1.0 <-> "1.1.0").
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} (${TAG_VERSION}) does not match package.json version (${PKG_VERSION})"
+            exit 1
+          fi
+          echo "Publishing @layers/mcp-server@${PKG_VERSION}"
+
+      - name: Test
+        run: npm test
+
+      # No NODE_AUTH_TOKEN: with npm >= 11.5.1 and id-token:write, npm detects
+      # the GitHub OIDC environment and authenticates without a stored secret.
+      # --provenance emits the signed build attestation.
+      - name: Publish to npm
+        run: npm publish --provenance --access public
