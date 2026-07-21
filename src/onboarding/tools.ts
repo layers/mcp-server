@@ -275,7 +275,7 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
       title: "Start Layers onboarding",
       annotations: WRITE,
       description:
-        "Start a keyless Layers workspace trial from a website or Apple App Store URL after solving the server proof-of-work challenge. Ask the human for their URL first — NEVER guess, default, or infer it (never use layers.ai/layers.com, your own domain, or an example URL).",
+        "Start a keyless Layers workspace trial from a website or Apple App Store URL after solving the server proof-of-work challenge. Only those two link types are supported. Ask the human for their URL first, warmly and with examples (a website like yourbrand.com, or an Apple App Store link) — NEVER guess, default, or infer it (never use layers.ai/layers.com, your own domain, or an example URL).",
       inputSchema: {
         url: z
           .string()
