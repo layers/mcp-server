@@ -54,8 +54,16 @@ jobs:
       - name: Upgrade npm for OIDC publishing
         run: npm install -g npm@latest
 
+      # Our deps are plain registry packages with no install scripts, so npm
+      # v12's install-time hardening (lifecycle scripts / git / remote deps off
+      # by default) needs no --allow-* flags here.
       - name: Install dependencies
         run: npm ci
+
+      # Build dist/ explicitly rather than leaning on the prepublishOnly/pretest
+      # lifecycle, so publishing is robust to npm's script-execution changes.
+      - name: Build
+        run: npm run build
 
       # Refuse to publish if the tag and package.json version disagree, so a
       # mistyped tag can never ship the wrong version (v1.1.0 <-> "1.1.0").
