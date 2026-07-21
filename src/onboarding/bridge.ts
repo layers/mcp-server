@@ -233,7 +233,15 @@ export class OnboardingBridge {
 
     const transport = this.dependencies.createTransport(this.endpoint(session), {
       requestInit: {
-        headers: { Authorization: `Bearer ${session.accessToken}` },
+        headers: {
+          Authorization: `Bearer ${session.accessToken}`,
+          // Elle's hosted onboarding-guide tools run in an MCP request context
+          // detached from the server middleware, so the ?trial= query the gate
+          // reads never reaches them — only request headers do. Sending the
+          // handle here lets those tools recover the gate-authorized binding.
+          // Must match ONBOARD_TRIAL_HEADER in apps/elle.
+          "x-layers-onboard-trial": session.trialHandle,
+        },
       },
     });
 
