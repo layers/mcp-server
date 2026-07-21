@@ -164,6 +164,20 @@ function isConnectionDrop(error: unknown): boolean {
   });
 }
 
+/**
+ * The remote MCP server forgets its Streamable-HTTP transport sessions when it
+ * restarts or redeploys, so an established bridge connection starts getting
+ * JSON-RPC -32000 "Session not found". Treat that exactly like a dropped
+ * connection: close and reconnect, which re-initializes a fresh MCP session.
+ * Without this an Elle deploy would surface the raw error mid-onboarding.
+ */
+function isStaleSession(error: unknown): boolean {
+  return errorChain(error).some((item) => {
+    const { code, message } = errorDetails(item);
+    return String(code) === "-32000" || /session not found/i.test(message);
+  });
+}
+
 function sameSession(connection: BridgeConnection, session: OnboardingSession): boolean {
   return (
     !connection.closed &&
@@ -320,7 +334,7 @@ export class OnboardingBridge {
           await this.dependencies.refreshSession(this.apiBaseUrl);
           this.rememberSecrets(secrets);
           await this.closeConnection();
-        } else if (isConnectionDrop(firstError)) {
+        } else if (isConnectionDrop(firstError) || isStaleSession(firstError)) {
           await this.closeConnection();
         } else {
           throw firstError;

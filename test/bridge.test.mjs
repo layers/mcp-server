@@ -177,6 +177,43 @@ test("a connection-drop error reconnects and retries exactly once", async () => 
   assert.equal(refreshes, 0, "a dropped connection must not refresh a valid token");
 });
 
+test("a stale MCP session (Elle restarted) reconnects and retries exactly once", async () => {
+  let toolCalls = 0;
+  let refreshes = 0;
+  let transports = 0;
+  const bridge = new OnboardingBridge("https://api.layers.test", "https://elle.layers.test", {
+    getSession: () => session(),
+    refreshSession: async () => {
+      refreshes += 1;
+    },
+    createTransport: () => {
+      transports += 1;
+      return {};
+    },
+    createClient: () =>
+      fakeClient({
+        callTool: async () => {
+          toolCalls += 1;
+          if (toolCalls === 1) {
+            // Shape the remote server returns after it forgets the transport.
+            const error = new Error(
+              'Error POSTing to endpoint: {"jsonrpc":"2.0","error":{"code":-32000,"message":"Session not found"},"id":null}',
+            );
+            error.code = -32000;
+            throw error;
+          }
+          return { content: [{ type: "text", text: "resumed" }] };
+        },
+      }),
+  });
+
+  const result = await bridge.callBridged("ask_onboardingGuide", { message: "hi" });
+  assert.equal(result.content[0].text, "resumed");
+  assert.equal(toolCalls, 2);
+  assert.equal(transports, 2);
+  assert.equal(refreshes, 0, "a stale session must not refresh a valid token");
+});
+
 test("a transport-reported close reconnects before the next bridged call", async () => {
   const clients = [];
   let transports = 0;
