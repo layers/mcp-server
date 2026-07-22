@@ -87,6 +87,25 @@ export function absolutizeAppLinks(
   });
 }
 
+/**
+ * Unwrap markdown links so the URL is visible text.
+ *
+ * The founder's terminal click-through (2026-07-22) showed why: the client
+ * rendered `[Connect your accounts](https://…)` as colored-but-dead text — MCP
+ * clients are plain-text surfaces with no guarantee of clickable links, so a
+ * URL hidden behind link text is a button that cannot be pressed. Like
+ * absolutizing above, this is enforced deterministically rather than by
+ * prompt: `[text](https://url)` becomes `text: https://url`, and a link whose
+ * text already IS the URL collapses to the bare URL. Only http(s) targets are
+ * unwrapped — anchors/mailto pass through untouched.
+ */
+export function exposeLinkTargets(reply: string): string {
+  return reply.replace(
+    /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
+    (_match, text: string, url: string) => (text.trim() === url ? url : `${text.trim()}: ${url}`),
+  );
+}
+
 function projectBaseFromWorkspaceUrl(workspaceUrl: string | undefined): string | null {
   if (!workspaceUrl) return null;
   try {
@@ -181,7 +200,9 @@ export function registerBridgedOnboardingTools(
         // Relay ONLY Elle's reply — never the raw generate() envelope.
         const reply = extractElleReply(result);
         const usable =
-          reply === null ? ASK_ELLE_FALLBACK : absolutizeAppLinks(reply, getSession());
+          reply === null
+            ? ASK_ELLE_FALLBACK
+            : exposeLinkTargets(absolutizeAppLinks(reply, getSession()));
         return { content: [{ type: "text", text: redact(usable) }] };
       } catch (error) {
         return resultError(errorMessage(error));

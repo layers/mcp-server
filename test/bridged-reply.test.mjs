@@ -2,7 +2,11 @@
 // envelope (which is tens of KB and carries the system prompt).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { absolutizeAppLinks, extractElleReply } from "../dist/onboarding/bridged-tools.js";
+import {
+  absolutizeAppLinks,
+  exposeLinkTargets,
+  extractElleReply,
+} from "../dist/onboarding/bridged-tools.js";
 
 const ELLE_REPLY =
   "I'm Elle, your Layers marketing expert. Do you have social profiles on TikTok or Instagram?";
@@ -152,4 +156,25 @@ test("absolutizeAppLinks leaves anchors, mailto, and protocol-relative links unt
   const session = { workspaceUrl: "https://app.layers.com/project/p1/chats" };
   const reply = "Use [anchor](#next), [email](mailto:hi@layers.com), and [cdn](//cdn.layers.com/x).";
   assert.equal(absolutizeAppLinks(reply, session), reply);
+});
+
+test("exposeLinkTargets unwraps markdown links into visible URLs", () => {
+  // Founder click-through 2026-07-22: the terminal rendered [Connect your
+  // accounts](url) as colored-but-dead text. URLs must be copyable plain text.
+  const reply =
+    "👉 [Connect your accounts](https://app.layers.com/project/p1/social/accounts?kind=connected) and [Upload your demo video](https://app.layers.com/project/p1/library).";
+  assert.equal(
+    exposeLinkTargets(reply),
+    "👉 Connect your accounts: https://app.layers.com/project/p1/social/accounts?kind=connected and Upload your demo video: https://app.layers.com/project/p1/library.",
+  );
+});
+
+test("exposeLinkTargets collapses a link whose text is already the URL", () => {
+  const reply = "See [https://app.layers.com/p/x](https://app.layers.com/p/x) now.";
+  assert.equal(exposeLinkTargets(reply), "See https://app.layers.com/p/x now.");
+});
+
+test("exposeLinkTargets leaves non-http links and plain text untouched", () => {
+  const reply = "Email [us](mailto:hi@layers.com), see [notes](#below), plain https://layers.com text.";
+  assert.equal(exposeLinkTargets(reply), reply);
 });
