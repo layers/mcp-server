@@ -55,6 +55,33 @@ export function extractElleReply(result: CallToolResult): string | null {
   return null;
 }
 
+/**
+ * Absolutize root-relative Layers app links in Elle's reply.
+ *
+ * Over MCP the reply renders in an external chat client with no site to
+ * resolve `/project/...` against — a relative link is dead. Elle is prompted
+ * to emit absolute URLs, but thread-memory mimicry of her earlier web-surface
+ * replies keeps re-introducing the relative form (observed live 2026-07-22),
+ * so the bridge enforces it deterministically. The origin comes from the
+ * session's own server-issued URLs (workspace/claim/preview), so dev links
+ * stay dev and prod links stay prod. Only markdown links whose target starts
+ * with `/` are rewritten — absolute URLs and plain text pass through.
+ */
+export function absolutizeAppLinks(
+  reply: string,
+  session: { workspaceUrl?: string; claimUrl?: string; previewUrl?: string } | undefined,
+): string {
+  const base = session?.workspaceUrl ?? session?.claimUrl ?? session?.previewUrl;
+  if (!base) return reply;
+  let origin: string;
+  try {
+    origin = new URL(base).origin;
+  } catch {
+    return reply;
+  }
+  return reply.replace(/\]\((\/[^)\s]*)\)/g, (_match, path: string) => `](${origin}${path})`);
+}
+
 function readEnvelopeText(envelope: unknown): string | null {
   if (!envelope || typeof envelope !== "object") return null;
   const record = envelope as { text?: unknown; content?: unknown };
@@ -111,7 +138,9 @@ export function registerBridgedOnboardingTools(
         const result = await callBridge(remoteToolName, { message });
         // Relay ONLY Elle's reply — never the raw generate() envelope.
         const reply = extractElleReply(result);
-        return { content: [{ type: "text", text: redact(reply ?? ASK_ELLE_FALLBACK) }] };
+        const usable =
+          reply === null ? ASK_ELLE_FALLBACK : absolutizeAppLinks(reply, getSession());
+        return { content: [{ type: "text", text: redact(usable) }] };
       } catch (error) {
         return resultError(errorMessage(error));
       }

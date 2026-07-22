@@ -2,7 +2,7 @@
 // envelope (which is tens of KB and carries the system prompt).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { extractElleReply } from "../dist/onboarding/bridged-tools.js";
+import { absolutizeAppLinks, extractElleReply } from "../dist/onboarding/bridged-tools.js";
 
 const ELLE_REPLY =
   "I'm Elle, your Layers marketing expert. Do you have social profiles on TikTok or Instagram?";
@@ -96,4 +96,24 @@ test("extractElleReply returns null (not the raw JSON) when no reply text exists
 
 test("extractElleReply returns null on empty content", () => {
   assert.equal(extractElleReply({ content: [] }), null);
+});
+
+test("absolutizeAppLinks rewrites root-relative markdown links against the session origin", () => {
+  const session = { workspaceUrl: "https://app.layers.localhost/project/p1/chats" };
+  const reply =
+    "Connect via [Instagram](/project/p1/social/accounts?kind=connected) and watch in [Generations](/project/p1/social/generations).";
+  const out = absolutizeAppLinks(reply, session);
+  assert.match(out, /\(https:\/\/app\.layers\.localhost\/project\/p1\/social\/accounts\?kind=connected\)/);
+  assert.match(out, /\(https:\/\/app\.layers\.localhost\/project\/p1\/social\/generations\)/);
+});
+
+test("absolutizeAppLinks leaves absolute links and plain text untouched", () => {
+  const session = { workspaceUrl: "https://app.layers.com/project/p1/chats" };
+  const reply = "See [docs](https://docs.layers.com/x) and plain /project/p1 text.";
+  assert.equal(absolutizeAppLinks(reply, session), reply);
+});
+
+test("absolutizeAppLinks is a no-op without a session origin", () => {
+  const reply = "[a](/project/p1/chats)";
+  assert.equal(absolutizeAppLinks(reply, undefined), reply);
 });
