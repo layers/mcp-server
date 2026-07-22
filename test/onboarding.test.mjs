@@ -69,7 +69,7 @@ function onboardingHandler(overrides = {}) {
   };
 }
 
-test("keyless mode registers the four native and two bridged onboarding tools", async () => {
+test("keyless mode registers the four native and one bridged onboarding tools", async () => {
   const client = await startClient(["--read-only", "--organization", "ignored_org"], {
     apiKey: null,
   });
@@ -83,7 +83,6 @@ test("keyless mode registers the four native and two bridged onboarding tools", 
         "onboard_claim_begin",
         "onboard_claim_verify",
         "ask_elle",
-        "get_marketing_plan",
       ],
     );
     assert.match(client.getInstructions(), /stateless/i);
@@ -97,17 +96,12 @@ test("keyless mode registers the four native and two bridged onboarding tools", 
 test("bridged tools fail clearly before onboard_start without crashing the server", async () => {
   const client = await startClient([], { apiKey: null });
   try {
-    for (const [name, args] of [
-      ["ask_elle", { message: "Help me get started" }],
-      ["get_marketing_plan", {}],
-    ]) {
-      const result = await callTool(client, name, args);
-      assert.equal(result.isError, true);
-      assert.match(result.text, /run onboard_start first/i);
-    }
+    const result = await callTool(client, "ask_elle", { message: "Help me get started" });
+    assert.equal(result.isError, true);
+    assert.match(result.text, /run onboard_start first/i);
 
     const tools = (await client.listTools()).tools;
-    assert.equal(tools.length, 6, "the MCP server must remain live after bridge errors");
+    assert.equal(tools.length, 5, "the MCP server must remain live after bridge errors");
   } finally {
     await client.close();
   }
@@ -206,6 +200,13 @@ test("claim begin and verify mirror public tokenless contracts", async () => {
     status: "claimed",
     organizationId: "org_test_123",
     continuity: "browser",
+    postclaimAssets: {
+      generationStatus: "generating",
+      postclaimState: "running",
+      estimatedDuration: "a few minutes",
+      message:
+        "Your influencer, first video, and keyword research are generating. They can take a few minutes and will appear on your preview page when ready.",
+    },
   };
 
   await withMockApi(

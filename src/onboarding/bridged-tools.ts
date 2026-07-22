@@ -2,7 +2,7 @@ import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import type { ToolResult } from "../api.js";
-import { READ_ONLY, WRITE } from "../api.js";
+import { WRITE } from "../api.js";
 import { getOnboardingBridge, type OnboardingBridge } from "./bridge.js";
 import { getSession, redact } from "./session.js";
 
@@ -56,16 +56,15 @@ export function extractElleReply(result: CallToolResult): string | null {
 }
 
 /**
- * Absolutize root-relative Layers app links in Elle's reply.
+ * Absolutize Layers app links in Elle's reply.
  *
  * Over MCP the reply renders in an external chat client with no site to
- * resolve `/project/...` against — a relative link is dead. Elle is prompted
+ * resolve relative paths against — a relative link is dead. Elle is prompted
  * to emit absolute URLs, but thread-memory mimicry of her earlier web-surface
- * replies keeps re-introducing the relative form (observed live 2026-07-22),
- * so the bridge enforces it deterministically. The origin comes from the
- * session's own server-issued URLs (workspace/claim/preview), so dev links
- * stay dev and prod links stay prod. Only markdown links whose target starts
- * with `/` are rewritten — absolute URLs and plain text pass through.
+ * replies keeps re-introducing root-relative and project-relative forms
+ * (observed live 2026-07-22), so the bridge enforces them deterministically.
+ * Root-relative links resolve against the session origin. Project-relative
+ * links resolve only when the workspace URL exposes `/project/<id>`.
  */
 export function absolutizeAppLinks(
   reply: string,
@@ -79,7 +78,50 @@ export function absolutizeAppLinks(
   } catch {
     return reply;
   }
-  return reply.replace(/\]\((\/[^)\s]*)\)/g, (_match, path: string) => `](${origin}${path})`);
+  const projectBase = projectBaseFromWorkspaceUrl(session?.workspaceUrl);
+  return reply.replace(/\]\(([^)\s]*)\)/g, (match, target: string) => {
+    if (shouldLeaveLinkTarget(target)) return match;
+    if (target.startsWith("/")) return `](${origin}${target})`;
+    if (!projectBase || !isProjectRelativeTarget(target)) return match;
+    return `](${projectBase}/${target})`;
+  });
+}
+
+function projectBaseFromWorkspaceUrl(workspaceUrl: string | undefined): string | null {
+  if (!workspaceUrl) return null;
+  try {
+    const url = new URL(workspaceUrl);
+    const match = url.pathname.match(/^(.*?\/project\/[^/]+)(?:\/|$)/);
+    return match ? `${url.origin}${match[1]}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function shouldLeaveLinkTarget(target: string): boolean {
+  return (
+    target.length === 0 ||
+    target.startsWith("#") ||
+    target.startsWith("//") ||
+    /^[a-z][a-z0-9+.-]*:/i.test(target)
+  );
+}
+
+/**
+ * A project-relative app path — `social/accounts?kind=connected`,
+ * `library/demo-videos` — as the first-experiment playbook emits them.
+ *
+ * The first segment must NOT look like a hostname. A scheme-less brand link
+ * (`](sonos.com)`, which Elle can plausibly write for the brand she is
+ * onboarding) starts with an alphanumeric just like an app path does, and
+ * rewriting it would produce `…/project/<id>/sonos.com` — a dead link, the
+ * exact failure this rewriting exists to prevent. App paths have no dot in
+ * their first segment; hostnames do.
+ */
+function isProjectRelativeTarget(target: string): boolean {
+  if (!/^[A-Za-z0-9_]/.test(target)) return false;
+  const firstSegment = target.split(/[/?#]/, 1)[0] ?? "";
+  return !firstSegment.includes(".");
 }
 
 function readEnvelopeText(envelope: unknown): string | null {
@@ -122,7 +164,7 @@ export function registerBridgedOnboardingTools(
       title: "Ask Elle",
       annotations: WRITE,
       description:
-        "Elle's onboarding guide — the conversational heart of onboarding. Route EVERY onboarding turn through this: the greeting and the five Layers intake questions. Those five are the entire Q&A; Elle does not run a marketing-plan questionnaire. Ask one question at a time in Elle's voice and pass the human's reply as message. Do not skip the intake questions or answer them yourself.",
+        "Elle's onboarding guide — the conversational heart of onboarding. Route EVERY onboarding turn through this: the greeting and the five Layers intake questions. Those five are the entire pre-claim Q&A; after claim Elle drives experimentation and action. Ask one question at a time in Elle's voice and pass the human's reply as message. Do not skip the intake questions or answer them yourself.",
       inputSchema: {
         message: z.string().describe("The human's onboarding reply or turn to pass to Elle"),
       },
@@ -147,21 +189,4 @@ export function registerBridgedOnboardingTools(
     },
   );
 
-  server.registerTool(
-    "get_marketing_plan",
-    {
-      title: "Get marketing plan",
-      annotations: READ_ONLY,
-      description:
-        "Legacy: read the marketing-plan record for this trial. This is NOT the onboarding payoff — after claiming, the generated assets (influencer, first video, keyword research) appear on the preview page instead. Only call this if the human explicitly asks about a marketing plan, and relay only what it returns.",
-      inputSchema: {},
-    },
-    async () => {
-      try {
-        return await callBridge("getMarketingPlan", {});
-      } catch (error) {
-        return resultError(errorMessage(error));
-      }
-    },
-  );
 }

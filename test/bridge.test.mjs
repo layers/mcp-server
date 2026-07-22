@@ -42,7 +42,7 @@ function fakeClient({ callTool, onConnect, onClose } = {}) {
   };
 }
 
-test("bridged tool registration maps harness names to Elle's remote names and arguments", async () => {
+test("bridged tool registration maps ask_elle to Elle's remote name and arguments", async () => {
   const registered = new Map();
   const server = {
     registerTool(name, config, handler) {
@@ -65,25 +65,18 @@ test("bridged tool registration maps harness names to Elle's remote names and ar
     bridge,
   );
 
-  assert.deepEqual([...registered.keys()], ["ask_elle", "get_marketing_plan"]);
+  assert.deepEqual([...registered.keys()], ["ask_elle"]);
   assert.match(registered.get("ask_elle").config.description, /Elle/i);
-  // The teaser/full-plan reveal is retired: the post-claim payoff is the generated
-  // assets on the preview page. The description must mark this tool legacy and must
-  // NOT advertise itself as the payoff, or the model keeps selecting the old path.
-  assert.match(registered.get("get_marketing_plan").config.description, /legacy/i);
-  assert.doesNotMatch(registered.get("get_marketing_plan").config.description, /teaser/i);
-  assert.doesNotMatch(registered.get("ask_elle").config.description, /marketing-plan questions/i);
+  assert.doesNotMatch(registered.get("ask_elle").config.description, /questionnaire/i);
   assert.deepEqual(
     await registered.get("ask_elle").handler({ message: "What should I launch first?" }),
     remoteResult,
   );
-  assert.deepEqual(await registered.get("get_marketing_plan").handler({}), remoteResult);
   assert.deepEqual(calls, [
     {
       name: "ask_onboardingGuide",
       args: { message: "What should I launch first?" },
     },
-    { name: "getMarketingPlan", args: {} },
   ]);
 });
 
@@ -175,7 +168,7 @@ test("a connection-drop error reconnects and retries exactly once", async () => 
       }),
   });
 
-  const result = await bridge.callBridged("getMarketingPlan", {});
+  const result = await bridge.callBridged("ask_onboardingGuide", { message: "resume" });
   assert.equal(result.content[0].text, "reconnected");
   assert.equal(toolCalls, 2);
   assert.equal(transports, 2);
@@ -238,9 +231,9 @@ test("a transport-reported close reconnects before the next bridged call", async
     },
   });
 
-  await bridge.callBridged("getMarketingPlan", {});
+  await bridge.callBridged("ask_onboardingGuide", { message: "first" });
   clients[0].onclose();
-  await bridge.callBridged("getMarketingPlan", {});
+  await bridge.callBridged("ask_onboardingGuide", { message: "second" });
 
   assert.equal(clients.length, 2);
   assert.equal(transports, 2);
@@ -270,14 +263,16 @@ test("remote results and errors cannot echo onboarding credentials", async () =>
       }),
   });
 
-  const resultText = JSON.stringify(await bridge.callBridged("getMarketingPlan", {}));
+  const resultText = JSON.stringify(
+    await bridge.callBridged("ask_onboardingGuide", { message: "redact" }),
+  );
   for (const secret of [ACCESS_TOKEN, SESSION_HANDLE, remoteRefreshToken]) {
     assert.doesNotMatch(resultText, new RegExp(secret));
   }
   assert.match(resultText, /\[redacted\]/);
 
   throwInstead = true;
-  await assert.rejects(bridge.callBridged("getMarketingPlan", {}), (error) => {
+  await assert.rejects(bridge.callBridged("ask_onboardingGuide", { message: "redact" }), (error) => {
     for (const secret of [ACCESS_TOKEN, SESSION_HANDLE, remoteRefreshToken]) {
       assert.doesNotMatch(error.message, new RegExp(secret));
     }
@@ -308,7 +303,7 @@ test("a repeated 401 is bounded to one refresh and one retry", async () => {
       }),
   });
 
-  await assert.rejects(bridge.callBridged("getMarketingPlan", {}), (error) => {
+  await assert.rejects(bridge.callBridged("ask_onboardingGuide", { message: "retry" }), (error) => {
     assert.match(error.message, /401 still unauthorized/);
     assert.doesNotMatch(error.message, new RegExp(ACCESS_TOKEN));
     assert.doesNotMatch(error.message, new RegExp(REFRESHED_ACCESS_TOKEN));

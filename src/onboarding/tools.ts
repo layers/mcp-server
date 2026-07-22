@@ -337,7 +337,7 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
       title: "Get onboarding status",
       annotations: READ_ONLY,
       description:
-        "Poll the current onboarding trial, including build and claim states plus the reveal-gated marketing plan.",
+        "Poll the current onboarding trial, including build, claim, post-claim states, and the latest preview/workspace links.",
       inputSchema: {
         trialHandle: z
           .string()
@@ -377,7 +377,7 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
       title: "Verify onboarding claim",
       annotations: WRITE,
       description:
-        "Verify the six-digit code from the human's inbox and claim the Layers workspace without returning credentials.",
+        "Verify the six-digit code from the human's inbox and claim the Layers workspace without returning credentials. Successful responses include postclaimAssets with generationStatus, postclaimState, estimatedDuration, and message; relay postclaimAssets.message verbatim when present. The assets are generating — the influencer, first video, and keyword research — it can take a few minutes, and the preview page is where they appear when ready. The response carries no preview URL, so use the previewUrl already held or returned by get_onboarding_status. After a same-account success, continue through ask_elle immediately instead of closing with congratulations.",
       inputSchema: {
         email: z.string().email().describe("The same email used with onboard_claim_begin"),
         code: z.string().describe("Six-digit code read by the human from their inbox"),
