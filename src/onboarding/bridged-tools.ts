@@ -4,7 +4,7 @@ import { z } from "zod";
 import type { ToolResult } from "../api.js";
 import { READ_ONLY, WRITE } from "../api.js";
 import { getOnboardingBridge, type OnboardingBridge } from "./bridge.js";
-import { redact } from "./session.js";
+import { getSession, redact } from "./session.js";
 
 const resultError = (text: string): ToolResult => ({
   isError: true,
@@ -16,6 +16,8 @@ const errorMessage = (error: unknown): string =>
 
 const ASK_ELLE_FALLBACK =
   "Sorry — I didn't quite catch that. Could you say it once more?";
+const BROWSER_CONTINUITY_HANDOFF =
+  "You're all set here. Log into your Layers workspace in the browser to keep going; I'll surface any workspace, preview, or account links I already have when they're useful.";
 
 /**
  * Elle's onboarding guide is hosted as an MCP agent-as-tool, so
@@ -100,7 +102,13 @@ export function registerBridgedOnboardingTools(
     },
     async ({ message }) => {
       try {
-        const result = await callBridge("ask_onboardingGuide", { message });
+        const claim = getSession()?.claim;
+        if (claim?.continuity === "browser") {
+          return { content: [{ type: "text", text: redact(BROWSER_CONTINUITY_HANDOFF) }] };
+        }
+        const remoteToolName =
+          claim?.continuity === "same_account" ? "ask_elle" : "ask_onboardingGuide";
+        const result = await callBridge(remoteToolName, { message });
         // Relay ONLY Elle's reply — never the raw generate() envelope.
         const reply = extractElleReply(result);
         return { content: [{ type: "text", text: redact(reply ?? ASK_ELLE_FALLBACK) }] };

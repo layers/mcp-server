@@ -21,11 +21,15 @@ interface BridgeClient {
   close(): Promise<void>;
 }
 
+type BridgeTarget = "onboarding" | "full";
+type BridgeState = BridgeTarget | "browser";
+
 interface BridgeConnection {
   accessToken: string;
   client: BridgeClient;
   closed: boolean;
   sessionHandle: string;
+  target: BridgeTarget;
   trialHandle: string;
 }
 
@@ -150,6 +154,19 @@ function isUnauthorized(error: unknown): boolean {
   });
 }
 
+function isForbidden(error: unknown): boolean {
+  if (error instanceof StreamableHTTPError && error.code === 403) return true;
+
+  return errorChain(error).some((item) => {
+    const details = errorDetails(item);
+    return (
+      details.code === 403 ||
+      details.code === "403" ||
+      /\b403\b|forbidden|anonymous[- ]principal|anonymous user/i.test(details.message)
+    );
+  });
+}
+
 function isConnectionDrop(error: unknown): boolean {
   return errorChain(error).some((item) => {
     const { code, message } = errorDetails(item);
@@ -178,11 +195,45 @@ function isStaleSession(error: unknown): boolean {
   });
 }
 
-function sameSession(connection: BridgeConnection, session: OnboardingSession): boolean {
+function bridgeState(session: OnboardingSession): BridgeState {
+  if (session.claim?.continuity === "same_account") return "full";
+  if (session.claim?.continuity === "browser") return "browser";
+  return "onboarding";
+}
+
+function fullTransitionKey(session: OnboardingSession): string {
+  return `${session.sessionHandle}:${session.trialHandle}`;
+}
+
+function sessionEndedMessage(session: OnboardingSession | undefined): string {
+  const base = "Session ended - continue in your Layers workspace in the browser.";
+  return session?.workspaceUrl ? `${base} ${session.workspaceUrl}` : base;
+}
+
+function browserContinuityMessage(): string {
+  return "This workspace was claimed in the browser. Continue in your Layers workspace there, and use the links already surfaced in this chat.";
+}
+
+class BridgeCallError extends Error {
+  constructor(
+    readonly original: unknown,
+    readonly target: BridgeTarget,
+  ) {
+    super(errorDetails(original).message);
+    this.name = "BridgeCallError";
+  }
+}
+
+function sameSession(
+  connection: BridgeConnection,
+  session: OnboardingSession,
+  target: BridgeTarget,
+): boolean {
   return (
     !connection.closed &&
     connection.accessToken === session.accessToken &&
     connection.sessionHandle === session.sessionHandle &&
+    connection.target === target &&
     connection.trialHandle === session.trialHandle
   );
 }
@@ -194,6 +245,8 @@ function sameSession(connection: BridgeConnection, session: OnboardingSession): 
 export class OnboardingBridge {
   private connection: BridgeConnection | undefined;
   private connecting: Promise<BridgeConnection> | undefined;
+  private fullTransitionRefresh: Promise<void> | undefined;
+  private fullTransitionRefreshKey: string | undefined;
   private readonly dependencies: OnboardingBridgeDependencies;
 
   constructor(
@@ -211,10 +264,61 @@ export class OnboardingBridge {
     secrets.add(session.sessionHandle);
   }
 
-  private endpoint(session: OnboardingSession): URL {
+  private endpoint(session: OnboardingSession, target: BridgeTarget): URL {
+    if (target === "full") return new URL("/api/mcp/elle/mcp", this.elleMcpBaseUrl);
     const url = new URL("/api/mcp/onboarding/mcp", this.elleMcpBaseUrl);
     url.searchParams.set("trial", session.trialHandle);
     return url;
+  }
+
+  private headers(session: OnboardingSession, target: BridgeTarget): Record<string, string> {
+    const headers: Record<string, string> = {
+      Authorization: `Bearer ${session.accessToken}`,
+    };
+    if (target === "onboarding") {
+      // Elle's hosted onboarding-guide tools run in an MCP request context
+      // detached from the server middleware, so the ?trial= query the gate
+      // reads never reaches them — only request headers do. Sending the
+      // handle here lets those tools recover the gate-authorized binding.
+      // Must match ONBOARD_TRIAL_HEADER in apps/elle.
+      headers["x-layers-onboard-trial"] = session.trialHandle;
+    }
+    return headers;
+  }
+
+  private async refreshForFullPath(secrets: Set<string>): Promise<void> {
+    const session = this.dependencies.getSession();
+    try {
+      await this.dependencies.refreshSession(this.apiBaseUrl);
+      this.rememberSecrets(secrets);
+    } catch {
+      throw new Error(redactBridgeText(sessionEndedMessage(session), secrets));
+    }
+  }
+
+  private async ensureFullTransitionRefresh(
+    session: OnboardingSession,
+    secrets: Set<string>,
+  ): Promise<void> {
+    const key = fullTransitionKey(session);
+    if (this.fullTransitionRefreshKey === key) return;
+
+    if (!this.fullTransitionRefresh) {
+      const refresh = this.refreshForFullPath(secrets);
+      this.fullTransitionRefresh = refresh;
+      try {
+        await refresh;
+        const current = this.dependencies.getSession();
+        if (current && fullTransitionKey(current) === key) {
+          this.fullTransitionRefreshKey = key;
+        }
+      } finally {
+        if (this.fullTransitionRefresh === refresh) this.fullTransitionRefresh = undefined;
+      }
+      return;
+    }
+
+    await this.fullTransitionRefresh;
   }
 
   private async closeConnection(): Promise<void> {
@@ -229,7 +333,10 @@ export class OnboardingBridge {
     }
   }
 
-  private async openConnection(session: OnboardingSession): Promise<BridgeConnection> {
+  private async openConnection(
+    session: OnboardingSession,
+    target: BridgeTarget,
+  ): Promise<BridgeConnection> {
     await this.closeConnection();
 
     const client = this.dependencies.createClient();
@@ -238,6 +345,7 @@ export class OnboardingBridge {
       client,
       closed: false,
       sessionHandle: session.sessionHandle,
+      target,
       trialHandle: session.trialHandle,
     };
     client.onclose = () => {
@@ -245,17 +353,9 @@ export class OnboardingBridge {
       if (this.connection === connection) this.connection = undefined;
     };
 
-    const transport = this.dependencies.createTransport(this.endpoint(session), {
+    const transport = this.dependencies.createTransport(this.endpoint(session, target), {
       requestInit: {
-        headers: {
-          Authorization: `Bearer ${session.accessToken}`,
-          // Elle's hosted onboarding-guide tools run in an MCP request context
-          // detached from the server middleware, so the ?trial= query the gate
-          // reads never reaches them — only request headers do. Sending the
-          // handle here lets those tools recover the gate-authorized binding.
-          // Must match ONBOARD_TRIAL_HEADER in apps/elle.
-          "x-layers-onboard-trial": session.trialHandle,
-        },
+        headers: this.headers(session, target),
       },
     });
 
@@ -277,11 +377,23 @@ export class OnboardingBridge {
     }
   }
 
-  private async ensureConnected(): Promise<BridgeConnection> {
+  private async ensureConnected(secrets: Set<string>): Promise<BridgeConnection> {
     while (true) {
       const session = this.dependencies.getSession();
       if (!session) throw new Error("run onboard_start first");
-      if (this.connection && sameSession(this.connection, session)) {
+      const target = bridgeState(session);
+      if (target === "browser") {
+        throw new Error(browserContinuityMessage());
+      }
+      if (target === "full") {
+        await this.ensureFullTransitionRefresh(session, secrets);
+        this.rememberSecrets(secrets);
+        const current = this.dependencies.getSession();
+        if (!current) throw new Error(sessionEndedMessage(session));
+        if (current.accessToken !== session.accessToken) continue;
+      }
+
+      if (this.connection && sameSession(this.connection, session, target)) {
         return this.connection;
       }
 
@@ -290,12 +402,12 @@ export class OnboardingBridge {
         continue;
       }
 
-      const connecting = this.openConnection(session);
+      const connecting = this.openConnection(session, target);
       this.connecting = connecting;
       try {
         const connection = await connecting;
         const current = this.dependencies.getSession();
-        if (current && sameSession(connection, current)) return connection;
+        if (current && sameSession(connection, current, target)) return connection;
       } finally {
         if (this.connecting === connecting) this.connecting = undefined;
       }
@@ -305,16 +417,21 @@ export class OnboardingBridge {
   private async callOnce(
     remoteToolName: string,
     args: Record<string, unknown>,
+    secrets: Set<string>,
   ): Promise<CallToolResult> {
-    const connection = await this.ensureConnected();
-    const result = await connection.client.callTool({
-      name: remoteToolName,
-      arguments: args,
-    });
-    if (!("content" in result)) {
-      throw new Error("Onboarding bridge returned an invalid tool result");
+    const connection = await this.ensureConnected(secrets);
+    try {
+      const result = await connection.client.callTool({
+        name: remoteToolName,
+        arguments: args,
+      });
+      if (!("content" in result)) {
+        throw new Error("Onboarding bridge returned an invalid tool result");
+      }
+      return result as CallToolResult;
+    } catch (error) {
+      throw new BridgeCallError(error, connection.target);
     }
-    return result as CallToolResult;
   }
 
   async callBridged(
@@ -327,21 +444,28 @@ export class OnboardingBridge {
     try {
       let result: CallToolResult;
       try {
-        result = await this.callOnce(remoteToolName, args);
+        result = await this.callOnce(remoteToolName, args, secrets);
       } catch (firstError) {
         this.rememberSecrets(secrets);
-        if (isUnauthorized(firstError)) {
+        const original =
+          firstError instanceof BridgeCallError ? firstError.original : firstError;
+        const target = firstError instanceof BridgeCallError ? firstError.target : undefined;
+        if (target === "full" && (isUnauthorized(original) || isForbidden(original))) {
+          await this.refreshForFullPath(secrets);
+          this.rememberSecrets(secrets);
+          await this.closeConnection();
+        } else if (isUnauthorized(original)) {
           await this.dependencies.refreshSession(this.apiBaseUrl);
           this.rememberSecrets(secrets);
           await this.closeConnection();
-        } else if (isConnectionDrop(firstError) || isStaleSession(firstError)) {
+        } else if (isConnectionDrop(original) || isStaleSession(original)) {
           await this.closeConnection();
         } else {
-          throw firstError;
+          throw original;
         }
 
         // Exactly one retry, regardless of how the retry itself fails.
-        result = await this.callOnce(remoteToolName, args);
+        result = await this.callOnce(remoteToolName, args, secrets);
       }
 
       this.rememberSecrets(secrets);

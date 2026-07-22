@@ -1,3 +1,9 @@
+export type ClaimContinuity = "same_account" | "browser";
+
+export interface OnboardingClaim {
+  continuity: ClaimContinuity;
+}
+
 export interface OnboardingSession {
   accessToken: string;
   expiresAtMs: number;
@@ -6,6 +12,9 @@ export interface OnboardingSession {
   claimToken: string;
   previewUrl: string;
   claimUrl: string;
+  workspaceUrl?: string;
+  connectAccountsUrl?: string;
+  claim?: OnboardingClaim;
 }
 
 let currentSession: OnboardingSession | undefined;
@@ -16,6 +25,33 @@ export function getSession(): OnboardingSession | undefined {
 
 export function rememberSession(session: OnboardingSession): void {
   currentSession = session;
+}
+
+export function isClaimContinuity(value: unknown): value is ClaimContinuity {
+  return value === "same_account" || value === "browser";
+}
+
+export function rememberSessionClaim(continuity: ClaimContinuity): void {
+  if (!currentSession) return;
+  currentSession.claim = { continuity };
+}
+
+export function rememberSessionLinks({
+  previewUrl,
+  claimUrl,
+  workspaceUrl,
+  connectAccountsUrl,
+}: {
+  previewUrl?: string;
+  claimUrl?: string;
+  workspaceUrl?: string;
+  connectAccountsUrl?: string;
+}): void {
+  if (!currentSession) return;
+  if (previewUrl) currentSession.previewUrl = previewUrl;
+  if (claimUrl) currentSession.claimUrl = claimUrl;
+  if (workspaceUrl) currentSession.workspaceUrl = workspaceUrl;
+  if (connectAccountsUrl) currentSession.connectAccountsUrl = connectAccountsUrl;
 }
 
 export function updateSessionAccess(

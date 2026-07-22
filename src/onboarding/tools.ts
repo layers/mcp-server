@@ -4,7 +4,14 @@ import { z } from "zod";
 import type { ToolResult } from "../api.js";
 import { READ_ONLY, WRITE } from "../api.js";
 import { authedFetch } from "./api.js";
-import { getSession, redact, rememberSession } from "./session.js";
+import {
+  getSession,
+  isClaimContinuity,
+  redact,
+  rememberSession,
+  rememberSessionClaim,
+  rememberSessionLinks,
+} from "./session.js";
 
 const POW_ATTEMPT_LIMIT = 2 ** 26;
 
@@ -45,6 +52,38 @@ const resultError = (text: string): ToolResult => ({
 
 const errorMessage = (error: unknown): string =>
   redact(error instanceof Error ? error.message : String(error));
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+}
+
+function optionalString(record: Record<string, unknown>, key: string): string | undefined {
+  const value = record[key];
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function rememberStatusMetadata(body: unknown): void {
+  const record = asRecord(body);
+  if (!record) return;
+
+  rememberSessionLinks({
+    previewUrl: optionalString(record, "previewUrl"),
+    claimUrl: optionalString(record, "claimUrl"),
+    workspaceUrl: optionalString(record, "workspaceUrl"),
+    connectAccountsUrl: optionalString(record, "connectAccountsUrl"),
+  });
+
+  if (record.claimed === true && isClaimContinuity(record.continuity)) {
+    rememberSessionClaim(record.continuity);
+  }
+}
+
+function rememberVerifiedClaim(body: unknown): void {
+  const record = asRecord(body);
+  if (record && isClaimContinuity(record.continuity)) {
+    rememberSessionClaim(record.continuity);
+  }
+}
 
 async function runTool(operation: () => Promise<unknown>): Promise<ToolResult> {
   try {
@@ -217,7 +256,9 @@ export async function getOnboardingStatus(baseUrl: string, trialHandle?: string)
     baseUrl,
     `/api/onboard/agent/trials/${encodeURIComponent(handle)}`,
   );
-  return parseSuccess<unknown>(response, "Onboarding status");
+  const body = await parseSuccess<unknown>(response, "Onboarding status");
+  rememberStatusMetadata(body);
+  return body;
 }
 
 async function beginClaim(baseUrl: string, email: string, claimToken?: string): Promise<unknown> {
@@ -265,7 +306,9 @@ async function verifyClaim(
   } catch (error) {
     throw new Error(redact(`Onboarding claim verification failed: ${errorMessage(error)}`));
   }
-  return parseSuccess<unknown>(response, "Onboarding claim verify");
+  const body = await parseSuccess<unknown>(response, "Onboarding claim verify");
+  rememberVerifiedClaim(body);
+  return body;
 }
 
 export function registerOnboardingTools(server: McpServer, baseUrl: string): void {

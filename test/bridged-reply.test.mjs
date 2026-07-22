@@ -25,8 +25,36 @@ function envelopeResult(text) {
   return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
 }
 
+function fullElleEnvelopeResult(text) {
+  const envelope = {
+    text,
+    content: [{ type: "text", text }],
+    usage: { inputTokens: 2214, outputTokens: 84 },
+    steps: [
+      {
+        stepType: "initial",
+        toolCalls: [{ toolName: "getProject", args: { projectId: "prj_hidden" } }],
+      },
+    ],
+    request: {
+      body: {
+        systemInstruction: {
+          parts: [{ text: "FULL ELLE SYSTEM PROMPT — must never reach the human." }],
+        },
+      },
+    },
+  };
+  return { content: [{ type: "text", text: JSON.stringify(envelope) }] };
+}
+
 test("extractElleReply returns only the reply text from a full envelope", () => {
   assert.equal(extractElleReply(envelopeResult(ELLE_REPLY)), ELLE_REPLY);
+});
+
+test("extractElleReply handles the full Elle ask_elle envelope shape", () => {
+  const reply = extractElleReply(fullElleEnvelopeResult("Your first assets are landing now."));
+  assert.equal(reply, "Your first assets are landing now.");
+  assert.doesNotMatch(reply ?? "", /FULL ELLE SYSTEM PROMPT|inputTokens|getProject/);
 });
 
 test("extractElleReply never leaks the system prompt or envelope internals", () => {
