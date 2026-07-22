@@ -421,10 +421,18 @@ export class OnboardingBridge {
   ): Promise<CallToolResult> {
     const connection = await this.ensureConnected(secrets);
     try {
-      const result = await connection.client.callTool({
-        name: remoteToolName,
-        arguments: args,
-      });
+      // The SDK's default request timeout is 60s. Full-Elle coordinator turns
+      // (multi-tool + generation reads) legitimately run longer — a live turn
+      // timed out at exactly 60s on 2026-07-22. 180s hard ceiling, extended
+      // while the server streams progress.
+      const result = await connection.client.callTool(
+        {
+          name: remoteToolName,
+          arguments: args,
+        },
+        undefined,
+        { timeout: 180_000, resetTimeoutOnProgress: true },
+      );
       if (!("content" in result)) {
         throw new Error("Onboarding bridge returned an invalid tool result");
       }
