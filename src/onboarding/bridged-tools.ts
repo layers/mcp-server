@@ -93,7 +93,7 @@ export function registerBridgedOnboardingTools(
       title: "Ask Elle",
       annotations: WRITE,
       description:
-        "Elle's onboarding guide — the conversational heart of onboarding. Route EVERY onboarding turn through this: the greeting, the marketing-plan questions, and the five Layers intake questions. Ask one question at a time in Elle's voice and pass the human's reply as message. Do not skip the intake questions or answer them yourself.",
+        "Elle's onboarding guide — the conversational heart of onboarding. Route EVERY onboarding turn through this: the greeting and the five Layers intake questions. Those five are the entire Q&A; Elle does not run a marketing-plan questionnaire. Ask one question at a time in Elle's voice and pass the human's reply as message. Do not skip the intake questions or answer them yourself.",
       inputSchema: {
         message: z.string().describe("The human's onboarding reply or turn to pass to Elle"),
       },
@@ -116,7 +116,7 @@ export function registerBridgedOnboardingTools(
       title: "Get marketing plan",
       annotations: READ_ONLY,
       description:
-        "Fetch your reveal-gated marketing plan: a teaser before claim and the full plan after claim.",
+        "Legacy: read the marketing-plan record for this trial. This is NOT the onboarding payoff — after claiming, the generated assets (influencer, first video, keyword research) appear on the preview page instead. Only call this if the human explicitly asks about a marketing plan, and relay only what it returns.",
       inputSchema: {},
     },
     async () => {

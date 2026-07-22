@@ -67,7 +67,12 @@ test("bridged tool registration maps harness names to Elle's remote names and ar
 
   assert.deepEqual([...registered.keys()], ["ask_elle", "get_marketing_plan"]);
   assert.match(registered.get("ask_elle").config.description, /Elle/i);
-  assert.match(registered.get("get_marketing_plan").config.description, /teaser/i);
+  // The teaser/full-plan reveal is retired: the post-claim payoff is the generated
+  // assets on the preview page. The description must mark this tool legacy and must
+  // NOT advertise itself as the payoff, or the model keeps selecting the old path.
+  assert.match(registered.get("get_marketing_plan").config.description, /legacy/i);
+  assert.doesNotMatch(registered.get("get_marketing_plan").config.description, /teaser/i);
+  assert.doesNotMatch(registered.get("ask_elle").config.description, /marketing-plan questions/i);
   assert.deepEqual(
     await registered.get("ask_elle").handler({ message: "What should I launch first?" }),
     remoteResult,
