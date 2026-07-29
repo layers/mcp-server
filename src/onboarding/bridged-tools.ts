@@ -327,6 +327,20 @@ async function elicitIntakeAnswer(
   baseUrl: string,
 ): Promise<string | null> {
   try {
+    // OFF BY DEFAULT, and that is a UX decision rather than a doubt about the
+    // protocol. This client renders elicitation as a FORM — collapsed fields,
+    // "expand to edit", Accept/Decline — while the relaying agent's own question
+    // UI renders an inline picker with every option and its blurb visible and
+    // one keystroke to choose. Founder call 2026-07-29, after seeing both: the
+    // picker wins, so we let the agent ask and keep this ready for the day the
+    // form renders as a real select. Flip with LAYERS_ONBOARD_ELICITATION=1.
+    //
+    // What elicitation would buy back when that day comes: the question is asked
+    // deterministically by the server that owns the flow, validated against a
+    // schema, and correctly attributed — instead of depending on the model
+    // choosing to render a picker at all.
+    if (!["1", "true"].includes(process.env.LAYERS_ONBOARD_ELICITATION ?? "")) return null;
+
     // The client must DECLARE elicitation; the SDK throws otherwise. This is the
     // capability gate, checked per call rather than assumed at startup.
     const caps = server.server.getClientCapabilities();
