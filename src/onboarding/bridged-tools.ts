@@ -187,6 +187,38 @@ function readEnvelopeText(envelope: unknown): string | null {
   return null;
 }
 
+/**
+ * Attach the onboarding links to the hand-off turn, deterministically.
+ *
+ * Elle is forbidden from writing URLs (she has none and would fabricate them),
+ * so the relaying agent is supposed to supply them. Twice in live testing it
+ * did not: it sent the claim link alone, once even labelling it "open it to
+ * preview your workspace" — conflating the two. Instructions were added to the
+ * flow, then promoted to golden rules; both were ignored. Meanwhile the
+ * link-expansion rules enforced HERE held perfectly in the same runs. That is
+ * the whole lesson: on the relay path, a rule the bridge applies is a fact and
+ * a rule the prompt asks for is a preference.
+ *
+ * Fires only on the hand-off turn — pre-claim, preview known, and Elle inviting
+ * them to claim (which the guide's prompt makes her do exactly once, at
+ * `nextAction: "hand_off"`). Never duplicates a url already present.
+ */
+export function appendOnboardingLinks(
+  reply: string,
+  session: { previewUrl?: string; claimUrl?: string; claim?: unknown } | undefined,
+): string {
+  const previewUrl = session?.previewUrl;
+  if (!previewUrl || session?.claim) return reply;
+  if (!/\bclaim(ing|ed)?\b/i.test(reply)) return reply;
+  if (reply.includes(previewUrl)) return reply;
+
+  const lines = [`Preview your brand: ${previewUrl}`];
+  if (session?.claimUrl && !reply.includes(session.claimUrl)) {
+    lines.push(`Claim your workspace: ${session.claimUrl}`);
+  }
+  return `${reply.trimEnd()}\n\n${lines.join("\n")}`;
+}
+
 export function registerBridgedOnboardingTools(
   server: McpServer,
   apiBaseUrl: string,
@@ -221,10 +253,16 @@ export function registerBridgedOnboardingTools(
         const result = await callBridge(remoteToolName, { message });
         // Relay ONLY Elle's reply — never the raw generate() envelope.
         const reply = extractElleReply(result);
+        // Order matters: append the raw urls LAST, after expansion, so the
+        // expander never sees them as markdown and the buffered form we add
+        // here survives untouched.
         const usable =
           reply === null
             ? ASK_ELLE_FALLBACK
-            : exposeLinkTargets(absolutizeAppLinks(reply, getSession()));
+            : appendOnboardingLinks(
+                exposeLinkTargets(absolutizeAppLinks(reply, getSession())),
+                getSession(),
+              );
         return { content: [{ type: "text", text: redact(usable) }] };
       } catch (error) {
         return resultError(errorMessage(error));

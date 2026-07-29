@@ -4,6 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   absolutizeAppLinks,
+  appendOnboardingLinks,
   exposeLinkTargets,
   extractElleReply,
 } from "../dist/onboarding/bridged-tools.js";
@@ -214,4 +215,43 @@ test("exposeLinkTargets does not double-space when the label IS the url", () => 
 test("exposeLinkTargets preserves list indentation", () => {
   const url = "https://app.layers.com/p/x";
   assert.equal(exposeLinkTargets(`  - [accounts](${url})`), `  - accounts ( ${url} )`);
+});
+
+// The relaying agent shipped the claim link ALONE twice in live testing — once
+// labelling it "open it to preview your workspace", conflating the two links.
+// Flow instructions and then golden rules were both ignored, while the
+// link-expansion rules enforced in this same module held perfectly. So the
+// hand-off links are a bridge fact now, not a prompt request.
+const LINK_SESSION = {
+  previewUrl: "https://app.layers.localhost/p/abc123",
+  claimUrl: "https://app.layers.localhost/claim?token=xyz",
+};
+const HANDOFF =
+  "Your brand preview is ready! Head over to the claim link your assistant shared to claim your workspace.";
+
+test("appendOnboardingLinks attaches BOTH links on the hand-off turn", () => {
+  const out = appendOnboardingLinks(HANDOFF, LINK_SESSION);
+  assert.match(out, /Preview your brand: https:\/\/app\.layers\.localhost\/p\/abc123/);
+  assert.match(out, /Claim your workspace: https:\/\/app\.layers\.localhost\/claim\?token=xyz/);
+});
+
+test("appendOnboardingLinks stays silent mid-intake", () => {
+  const q = "Are you running ads today?\n1. Yes\n2. No";
+  assert.equal(appendOnboardingLinks(q, LINK_SESSION), q);
+});
+
+test("appendOnboardingLinks stays silent once claimed", () => {
+  assert.equal(
+    appendOnboardingLinks(HANDOFF, { ...LINK_SESSION, claim: { continuity: "same_account" } }),
+    HANDOFF,
+  );
+});
+
+test("appendOnboardingLinks never duplicates a url already in the reply", () => {
+  const withPreview = `claim it — ${LINK_SESSION.previewUrl}`;
+  assert.equal(appendOnboardingLinks(withPreview, LINK_SESSION), withPreview);
+});
+
+test("appendOnboardingLinks is a no-op with no session preview url", () => {
+  assert.equal(appendOnboardingLinks(HANDOFF, undefined), HANDOFF);
 });
