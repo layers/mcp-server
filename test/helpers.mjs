@@ -13,20 +13,38 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 export const SERVER = path.join(ROOT, "dist", "index.js");
 
-/** Connect an MCP client to a freshly spawned server. Caller must client.close(). */
-export async function startClient(extraArgs = [], { apiKey = "lp_test_dummy", baseUrl } = {}) {
-  const args = [SERVER, "--api-key", apiKey];
+/** Connect an MCP client to a freshly spawned server. Caller must client.close().
+ *  Pass apiKey: null for keyless mode; extraEnv can exercise env-key resolution. */
+export async function startClient(
+  extraArgs = [],
+  { apiKey = "lp_test_dummy", baseUrl, extraEnv = {} } = {},
+) {
+  const args = [SERVER];
+  if (apiKey !== null) args.push("--api-key", apiKey);
   if (baseUrl) args.push("--base-url", baseUrl);
   args.push(...extraArgs);
-  const transport = new StdioClientTransport({ command: process.execPath, args });
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter((entry) => typeof entry[1] === "string"),
+  );
+  for (const key of [
+    "LAYERS_API_KEY",
+    "LAYERS_BASE_URL",
+    "LAYERS_ELLE_MCP_URL",
+    "LAYERS_ORGANIZATION",
+    "LAYERS_READ_ONLY",
+  ]) {
+    delete env[key];
+  }
+  Object.assign(env, extraEnv);
+  const transport = new StdioClientTransport({ command: process.execPath, args, env });
   const client = new Client({ name: "layers-mcp-tests", version: "0.0.0" });
   await client.connect(transport);
   return client;
 }
 
 /** List the server's registered tools, then tear the client down. */
-export async function listTools(extraArgs = []) {
-  const client = await startClient(extraArgs);
+export async function listTools(extraArgs = [], options = {}) {
+  const client = await startClient(extraArgs, options);
   try {
     return (await client.listTools()).tools;
   } finally {
@@ -46,26 +64,42 @@ export async function callTool(client, name, args = {}) {
 /**
  * Run `fn(client, requests)` with the server pointed at a localhost recorder.
  * `requests` accumulates every captured { method, url, headers, body }.
- * `handler(req)` may return { status, json } to simulate API responses;
+ * `handler(req, captured)` may return { status, json, text, headers } or { destroy: true };
  * the default is a 200 with an empty list page.
  */
-export async function withMockApi(fn, { extraArgs = [], apiKey = "lp_test_x", handler } = {}) {
+export async function withMockApi(
+  fn,
+  { extraArgs = [], apiKey = "lp_test_x", extraEnv = {}, handler } = {},
+) {
   const requests = [];
   const server = http.createServer((req, res) => {
     let body = "";
     req.on("data", (c) => (body += c));
-    req.on("end", () => {
-      requests.push({ method: req.method, url: req.url, headers: req.headers, body });
-      const out = handler?.(req) ?? { status: 200, json: { ok: true, items: [], nextCursor: null } };
-      res.writeHead(out.status, { "content-type": "application/json" });
-      res.end(JSON.stringify(out.json));
+    req.on("end", async () => {
+      const captured = { method: req.method, url: req.url, headers: req.headers, body };
+      requests.push(captured);
+      try {
+        const out = (await handler?.(req, captured)) ?? {
+          status: 200,
+          json: { ok: true, items: [], nextCursor: null },
+        };
+        if (out.destroy) {
+          req.socket.destroy();
+          return;
+        }
+        res.writeHead(out.status, { "content-type": "application/json", ...out.headers });
+        res.end(out.text ?? JSON.stringify(out.json));
+      } catch {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "mock handler failed" }));
+      }
     });
   });
   await new Promise((r) => server.listen(0, "127.0.0.1", r));
   const baseUrl = `http://127.0.0.1:${server.address().port}`;
-  const client = await startClient(extraArgs, { apiKey, baseUrl });
+  const client = await startClient(extraArgs, { apiKey, baseUrl, extraEnv });
   try {
-    return await fn(client, requests);
+    return await fn(client, requests, baseUrl);
   } finally {
     await client.close();
     await new Promise((r) => server.close(r));
