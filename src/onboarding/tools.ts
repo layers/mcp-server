@@ -5,12 +5,14 @@ import type { ToolResult } from "../api.js";
 import { READ_ONLY, WRITE } from "../api.js";
 import { authedFetch } from "./api.js";
 import {
+  getClaimedApiKey,
   getSession,
   isClaimContinuity,
   redact,
   rememberSession,
   rememberSessionClaim,
   rememberSessionLinks,
+  rememberWorkspaceKey,
 } from "./session.js";
 
 const POW_ATTEMPT_LIMIT = 2 ** 26;
@@ -275,7 +277,54 @@ export async function getOnboardingStatus(baseUrl: string, trialHandle?: string)
   );
   const body = await parseSuccess<unknown>(response, "Onboarding status");
   rememberStatusMetadata(body);
+  await ensureWorkspaceKey(baseUrl, handle, body);
   return body;
+}
+
+/**
+ * Acquire a workspace key once the trial is claimed, so the Layers tool set can
+ * act on the workspace this session just created.
+ *
+ * `claim/verify` returns a key too, but only to whoever CALLED it — and the flow
+ * deliberately steers claiming to the web page, so in the normal path the
+ * browser gets that key and this session never sees one. The secret is returned
+ * once and only hashed at rest, so it cannot be handed over after the fact;
+ * minting a fresh one for this caller is the only correct answer.
+ *
+ * Runs off the status poll because that is the one call already made repeatedly
+ * across the claim boundary — no new polling, and it self-heals a session that
+ * was already running when the claim landed. Idempotent on our side (skipped
+ * once a key is held) and best-effort: a failure here must never break a status
+ * read, which is load-bearing for the whole flow.
+ */
+async function ensureWorkspaceKey(
+  baseUrl: string,
+  trialHandle: string,
+  status: unknown,
+): Promise<void> {
+  if (getClaimedApiKey()) return;
+  const record = asRecord(status);
+  if (!record || record.claimed !== true) return;
+
+  try {
+    const response = await authedFetch(
+      baseUrl,
+      `/api/onboard/agent/trials/${encodeURIComponent(trialHandle)}/workspace-key`,
+      { method: "POST" },
+    );
+    if (!response.ok) {
+      await response.body?.cancel();
+      return;
+    }
+    const body = asRecord(await response.json());
+    const secret = body && typeof body.secret === "string" ? body.secret : undefined;
+    const organizationId =
+      body && typeof body.organizationId === "string" ? body.organizationId : undefined;
+    if (secret) rememberWorkspaceKey(secret, organizationId);
+  } catch {
+    // Never surface or log the error — this path holds a credential, and a
+    // status read must not fail because a key could not be minted.
+  }
 }
 
 async function beginClaim(baseUrl: string, email: string, claimToken?: string): Promise<unknown> {

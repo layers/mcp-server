@@ -18,15 +18,6 @@ export interface OnboardingClaim {
    * only alongside the code that needs it.
    */
   organizationId?: string;
-  /**
-   * A partner API key for the claimed org, minted by claim/verify.
-   *
-   * This is what lets the onboarding server act on the workspace it just
-   * created: the pre-existing key (if any) is bound to a DIFFERENT org and 404s
-   * on the new project. Held in process memory only, never persisted, and
-   * covered by `redact()` so it cannot leak into relayed text.
-   */
-  apiKeySecret?: string;
 }
 
 export interface OnboardingSession {
@@ -40,6 +31,18 @@ export interface OnboardingSession {
   workspaceUrl?: string;
   connectAccountsUrl?: string;
   claim?: OnboardingClaim;
+  /**
+   * A partner API key for the claimed workspace's org.
+   *
+   * Lives at the session root, NOT under `claim`, on purpose: a web claim never
+   * routes through onboard_claim_verify, so when the key is fetched afterwards
+   * there is no claim record and no known continuity. Nesting it would force
+   * inventing one — and `ask_elle` ROUTES on continuity, so a fabricated value
+   * would silently change which Elle the human talks to.
+   *
+   * Process memory only, never persisted, and covered by `redact()`.
+   */
+  workspaceApiKey?: string;
 }
 
 let currentSession: OnboardingSession | undefined;
@@ -65,13 +68,24 @@ export function rememberSessionClaim(
   currentSession.claim = {
     continuity,
     ...(organizationId ? { organizationId } : {}),
-    ...(apiKeySecret ? { apiKeySecret } : {}),
   };
+  if (apiKeySecret) currentSession.workspaceApiKey = apiKeySecret;
 }
 
-/** The claimed workspace's API key, if a claim has issued one. */
+/** Record a workspace key fetched after the fact (the web-claim path). */
+export function rememberWorkspaceKey(apiKeySecret: string, organizationId?: string): void {
+  if (!currentSession) return;
+  currentSession.workspaceApiKey = apiKeySecret;
+  // Only ENRICH an existing claim record — never synthesize one, since that
+  // would mean guessing `continuity`.
+  if (organizationId && currentSession.claim && !currentSession.claim.organizationId) {
+    currentSession.claim.organizationId = organizationId;
+  }
+}
+
+/** The claimed workspace's API key, if one has been issued to this session. */
 export function getClaimedApiKey(): string | undefined {
-  return currentSession?.claim?.apiKeySecret;
+  return currentSession?.workspaceApiKey;
 }
 
 export function rememberSessionLinks({
@@ -113,7 +127,7 @@ export function redact(text: string): string {
   const secrets = [
     currentSession.accessToken,
     currentSession.sessionHandle,
-    currentSession.claim?.apiKeySecret,
+    currentSession.workspaceApiKey,
   ]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .sort((a, b) => b.length - a.length);
