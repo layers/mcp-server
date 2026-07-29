@@ -5,6 +5,7 @@ import type { ToolResult } from "../api.js";
 import { WRITE } from "../api.js";
 import { getOnboardingBridge, type OnboardingBridge } from "./bridge.js";
 import { getSession, redact } from "./session.js";
+import { getOnboardingStatus } from "./tools.js";
 
 const resultError = (text: string): ToolResult => ({
   isError: true,
@@ -273,6 +274,31 @@ export function appendPostclaimLinks(
   return `${reply.trimEnd()}\n\n${lines.join("\n")}`;
 }
 
+/**
+ * Make sure the post-claim destinations are KNOWN before we try to attach them.
+ *
+ * `connectAccountsUrl` does not exist until the status route has seen a claimed
+ * trial with a bound project — it is gated on exactly that. `previewUrl` has
+ * been in the session since onboard_start, which is why the preview link
+ * attached on the first post-claim turn and the connect link did not (observed
+ * live 2026-07-29): the bridge had nothing to attach and correctly refused to
+ * invent a URL.
+ *
+ * So refresh once, on the first post-claim turn that still lacks it. Bounded by
+ * the `connectAccountsUrl` check, so this is a single extra call across the whole
+ * session rather than a poll. Best-effort: a relay turn must never fail because
+ * a link could not be resolved.
+ */
+async function ensurePostclaimLinks(baseUrl: string): Promise<void> {
+  const session = getSession();
+  if (!session?.claim || session.connectAccountsUrl) return;
+  try {
+    await getOnboardingStatus(baseUrl);
+  } catch {
+    // The reply still relays; it just goes out without the connect link.
+  }
+}
+
 export function registerBridgedOnboardingTools(
   server: McpServer,
   apiBaseUrl: string,
@@ -305,6 +331,10 @@ export function registerBridgedOnboardingTools(
         const remoteToolName =
           claim?.continuity === "same_account" ? "ask_elle" : "ask_onboardingGuide";
         const result = await callBridge(remoteToolName, { message });
+        // Resolve the post-claim destinations BEFORE composing the reply, so the
+        // first post-claim turn can carry the connect link instead of naming a
+        // page it has no address for.
+        await ensurePostclaimLinks(apiBaseUrl);
         // Relay ONLY Elle's reply — never the raw generate() envelope.
         const reply = extractElleReply(result);
         // Order matters: append the raw urls LAST, after expansion, so the
