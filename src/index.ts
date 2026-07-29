@@ -164,6 +164,28 @@ async function runOnboardingServer(): Promise<void> {
   registerMeasurementTools(server, claimedClient, readOnly);
   registerFrameworkTools(server, claimedClient, readOnly);
 
+  // Report what the connected client can do, once it has told us.
+  //
+  // Capabilities are only known AFTER initialize, so this cannot be read at
+  // connect time. It answers a question no amount of code reading can: whether
+  // this client supports `elicitation`, i.e. whether the server may ask for
+  // structured input (the intake questions as a real picker) or must keep
+  // relaying them as prose. The SDK throws if you elicit without support, so
+  // this gates that work rather than guessing at it.
+  server.server.oninitialized = () => {
+    try {
+      const caps = server.server.getClientCapabilities();
+      const names = caps ? Object.keys(caps).sort() : [];
+      console.error(
+        `[client] capabilities: ${names.length ? names.join(", ") : "(none declared)"} | elicitation: ${
+          caps && "elicitation" in caps ? "SUPPORTED" : "not supported"
+        }`,
+      );
+    } catch {
+      console.error("[client] capabilities: unavailable");
+    }
+  };
+
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
