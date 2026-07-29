@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   absolutizeAppLinks,
   appendOnboardingLinks,
+  appendPostclaimLinks,
   exposeLinkTargets,
   extractElleReply,
 } from "../dist/onboarding/bridged-tools.js";
@@ -254,4 +255,50 @@ test("appendOnboardingLinks never duplicates a url already in the reply", () => 
 
 test("appendOnboardingLinks is a no-op with no session preview url", () => {
   assert.equal(appendOnboardingLinks(HANDOFF, undefined), HANDOFF);
+});
+
+// The turn AFTER the claim. appendOnboardingLinks deliberately stops firing once
+// claimed, so this turn had no enforcement at all and went back to naming
+// destinations in prose — "your accounts page", "your preview page" — with no
+// address attached (observed live 2026-07-29). Same defect as the pre-claim
+// version, one turn later.
+const CLAIMED_SESSION = {
+  previewUrl: "https://app.layers.localhost/p/abc123",
+  connectAccountsUrl: "https://app.layers.localhost/project/p1/social/accounts",
+  claim: { continuity: "same_account" },
+};
+
+test("appendPostclaimLinks attaches the connect-accounts destination", () => {
+  const reply =
+    "Elle's next step: connect your TikTok and Instagram accounts. You can do that on your accounts page.";
+  const out = appendPostclaimLinks(reply, CLAIMED_SESSION);
+  assert.match(
+    out,
+    /Connect your accounts: https:\/\/app\.layers\.localhost\/project\/p1\/social\/accounts/,
+  );
+});
+
+test("appendPostclaimLinks attaches the preview page when assets are generating", () => {
+  const reply =
+    "Your influencer, first video, and keyword research are generating now — watch them land on your preview page.";
+  const out = appendPostclaimLinks(reply, CLAIMED_SESSION);
+  assert.match(out, /Your preview page: https:\/\/app\.layers\.localhost\/p\/abc123/);
+});
+
+test("appendPostclaimLinks stays silent on an unrelated turn", () => {
+  const reply = "Great — which platform would you like to start with?";
+  assert.equal(appendPostclaimLinks(reply, CLAIMED_SESSION), reply);
+});
+
+test("appendPostclaimLinks stays silent BEFORE the claim (that turn belongs to appendOnboardingLinks)", () => {
+  const reply = "Your assets are generating on your preview page.";
+  const preClaim = { ...CLAIMED_SESSION, claim: undefined };
+  assert.equal(appendPostclaimLinks(reply, preClaim), reply);
+});
+
+test("appendPostclaimLinks never duplicates a url already in the reply", () => {
+  const reply =
+    "Connect your accounts here: https://app.layers.localhost/project/p1/social/accounts";
+  const out = appendPostclaimLinks(reply, CLAIMED_SESSION);
+  assert.equal(out.match(/social\/accounts/g).length, 1);
 });

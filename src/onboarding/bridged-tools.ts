@@ -219,6 +219,60 @@ export function appendOnboardingLinks(
   return `${reply.trimEnd()}\n\n${lines.join("\n")}`;
 }
 
+/**
+ * Attach the POST-claim destinations, deterministically.
+ *
+ * `appendOnboardingLinks` covers the hand-off turn and then stops firing the
+ * moment a claim lands — so the very next turn, where Elle points at "your
+ * accounts page" and "your preview page", went back to naming destinations in
+ * prose with no address attached (observed live 2026-07-29). Same failure as
+ * before, one turn later: a page the human is told to visit but cannot reach.
+ *
+ * The lesson from the pre-claim version applies unchanged — on the relay path a
+ * rule the bridge APPLIES is a fact and a rule the prompt asks for is a
+ * preference — so both links are enforced here rather than requested upstream.
+ *
+ * Fires only when the reply actually raises the subject, so a turn about
+ * something else does not collect a footer of links. Never duplicates a url the
+ * reply already contains.
+ */
+export function appendPostclaimLinks(
+  reply: string,
+  session:
+    | { previewUrl?: string; connectAccountsUrl?: string; claim?: unknown }
+    | undefined,
+): string {
+  // Post-claim only. Before the claim, appendOnboardingLinks owns this job and
+  // running both would double up the preview link on the hand-off turn.
+  if (!session?.claim) return reply;
+
+  const lines: string[] = [];
+
+  const connectUrl = session.connectAccountsUrl;
+  if (
+    connectUrl &&
+    !reply.includes(connectUrl) &&
+    /\b(connect|link|linked|linking)\b/i.test(reply) &&
+    /\b(account|accounts|tiktok|instagram|social)\b/i.test(reply)
+  ) {
+    lines.push(`Connect your accounts: ${connectUrl}`);
+  }
+
+  // The preview page is where the post-claim assets actually appear, so a turn
+  // that says they are generating owes the human the address, not the noun.
+  const previewUrl = session.previewUrl;
+  if (
+    previewUrl &&
+    !reply.includes(previewUrl) &&
+    /\b(generating|generate|preview|asset|assets|influencer|video|keyword)/i.test(reply)
+  ) {
+    lines.push(`Your preview page: ${previewUrl}`);
+  }
+
+  if (lines.length === 0) return reply;
+  return `${reply.trimEnd()}\n\n${lines.join("\n")}`;
+}
+
 export function registerBridgedOnboardingTools(
   server: McpServer,
   apiBaseUrl: string,
@@ -259,8 +313,11 @@ export function registerBridgedOnboardingTools(
         const usable =
           reply === null
             ? ASK_ELLE_FALLBACK
-            : appendOnboardingLinks(
-                exposeLinkTargets(absolutizeAppLinks(reply, getSession())),
+            : appendPostclaimLinks(
+                appendOnboardingLinks(
+                  exposeLinkTargets(absolutizeAppLinks(reply, getSession())),
+                  getSession(),
+                ),
                 getSession(),
               );
         return { content: [{ type: "text", text: redact(usable) }] };
