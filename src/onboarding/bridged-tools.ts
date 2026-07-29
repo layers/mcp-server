@@ -299,6 +299,78 @@ async function ensurePostclaimLinks(baseUrl: string): Promise<void> {
   }
 }
 
+type IntakeOption = { value: string; label: string; blurb?: string };
+type IntakeQuestion = { field: string; title: string; options: IntakeOption[] };
+
+/**
+ * Ask the outstanding intake question as a REAL structured prompt.
+ *
+ * Until now the question reached the human as prose and the picker they saw was
+ * the relaying client choosing, of its own accord, to render one — so the
+ * experience depended on the model's discretion and the question could arrive
+ * twice, once as text and once as a picker. Eliciting makes it deterministic,
+ * schema-validated and correctly attributed to the server that owns the flow.
+ *
+ * The questions come from the trial status response, which serves the CANONICAL
+ * set — never a copy in this repo, so the browser, Elle and this surface cannot
+ * drift. Each option's `blurb` becomes part of its label, because that is where
+ * a price or commitment lives and this is the moment the human commits to it.
+ *
+ * Returns the chosen value, or null for every "carry on as before" case:
+ * a client that does not support elicitation, no question outstanding, a
+ * decline, or any failure. Null means the caller relays Elle's prose exactly as
+ * it always did — this is an upgrade over a working path, never a replacement
+ * that can strand someone.
+ */
+async function elicitIntakeAnswer(
+  server: McpServer,
+  baseUrl: string,
+): Promise<string | null> {
+  try {
+    // The client must DECLARE elicitation; the SDK throws otherwise. This is the
+    // capability gate, checked per call rather than assumed at startup.
+    const caps = server.server.getClientCapabilities();
+    if (!caps || !("elicitation" in caps)) return null;
+
+    const status = (await getOnboardingStatus(baseUrl)) as {
+      claimed?: boolean;
+      intake?: { remaining?: IntakeQuestion[] };
+    } | null;
+    // Intake is the pre-claim Q&A only; after the claim Elle drives.
+    if (!status || status.claimed === true) return null;
+
+    const question = status.intake?.remaining?.[0];
+    if (!question || !Array.isArray(question.options) || question.options.length === 0) return null;
+
+    const result = await server.server.elicitInput({
+      message: question.title,
+      requestedSchema: {
+        type: "object",
+        properties: {
+          [question.field]: {
+            type: "string",
+            title: question.title,
+            enum: question.options.map((o) => o.value),
+            // The blurb rides the label. A surface may render a question as
+            // plain text; it may never drop the field carrying the consequence.
+            enumNames: question.options.map((o) =>
+              o.blurb ? `${o.label} — ${o.blurb}` : o.label,
+            ),
+          },
+        },
+        required: [question.field],
+      },
+    });
+
+    if (result.action !== "accept") return null;
+    const chosen = (result.content as Record<string, unknown> | undefined)?.[question.field];
+    return typeof chosen === "string" && chosen.length > 0 ? chosen : null;
+  } catch {
+    // Any failure falls back to prose. Never break a relay turn over an upgrade.
+    return null;
+  }
+}
+
 export function registerBridgedOnboardingTools(
   server: McpServer,
   apiBaseUrl: string,
@@ -330,7 +402,19 @@ export function registerBridgedOnboardingTools(
         }
         const remoteToolName =
           claim?.continuity === "same_account" ? "ask_elle" : "ask_onboardingGuide";
-        const result = await callBridge(remoteToolName, { message });
+        let result = await callBridge(remoteToolName, { message });
+
+        // Elle has just asked the next intake question. Put it to the human as a
+        // real structured prompt and hand her the answer, so they act on ONE
+        // picker instead of reading the question as prose and then answering a
+        // copy of it. Returns null whenever that is not possible — no
+        // elicitation support, nothing outstanding, or a decline — and then this
+        // is exactly the prose flow it has always been.
+        const elicited = await elicitIntakeAnswer(server, apiBaseUrl);
+        if (elicited !== null) {
+          result = await callBridge(remoteToolName, { message: elicited });
+        }
+
         // Resolve the post-claim destinations BEFORE composing the reply, so the
         // first post-claim turn can carry the connect link instead of naming a
         // page it has no address for.
