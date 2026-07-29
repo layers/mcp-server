@@ -165,7 +165,7 @@ test("exposeLinkTargets unwraps markdown links into visible URLs", () => {
     "👉 [Connect your accounts](https://app.layers.com/project/p1/social/accounts?kind=connected) and [Upload your demo video](https://app.layers.com/project/p1/library).";
   assert.equal(
     exposeLinkTargets(reply),
-    "👉 Connect your accounts (https://app.layers.com/project/p1/social/accounts?kind=connected) and Upload your demo video (https://app.layers.com/project/p1/library).",
+    "👉 Connect your accounts ( https://app.layers.com/project/p1/social/accounts?kind=connected ) and Upload your demo video ( https://app.layers.com/project/p1/library ).",
   );
 });
 
@@ -186,6 +186,32 @@ test("exposeLinkTargets reads correctly MID-sentence, not just at a sentence end
   const url = "https://app.layers.com/project/p1/social/accounts?kind=connected";
   assert.equal(
     exposeLinkTargets(`Once [your accounts](${url}) are linked, we start the loop.`),
-    `Once your accounts (${url}) are linked, we start the loop.`,
+    `Once your accounts ( ${url} ) are linked, we start the loop.`,
   );
+});
+
+test("exposeLinkTargets leaves every url whitespace-delimited on both sides", () => {
+  // Terminals linkify a bare url by scanning to the next whitespace, and their
+  // handling of trailing punctuation varies — `(https://…).` can hand the user
+  // a url with `).` glued on. Every emitted url must be its own token.
+  const url = "https://app.layers.com/project/p1/social/accounts?kind=connected";
+  const out = exposeLinkTargets(
+    `Head to [your accounts page](${url}). Then [check gen](${url}), ok?`,
+  );
+  for (const m of out.matchAll(/https?:\/\/[^\s]+/g)) {
+    const before = out[m.index - 1];
+    const after = out[m.index + m[0].length];
+    assert.equal(before, " ", `no space before ${m[0]}`);
+    assert.equal(after, " ", `no space after ${m[0]}`);
+  }
+});
+
+test("exposeLinkTargets does not double-space when the label IS the url", () => {
+  const url = "https://app.layers.com/p/x";
+  assert.equal(exposeLinkTargets(`See [${url}](${url}) now.`), `See ${url} now.`);
+});
+
+test("exposeLinkTargets preserves list indentation", () => {
+  const url = "https://app.layers.com/p/x";
+  assert.equal(exposeLinkTargets(`  - [accounts](${url})`), `  - accounts ( ${url} )`);
 });

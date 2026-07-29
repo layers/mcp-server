@@ -104,11 +104,27 @@ export function absolutizeAppLinks(
  * produced broken prose — "Once your accounts: https://… are linked, we start
  * the loop." The parenthetical reads correctly in BOTH positions and keeps the
  * URL adjacent to its label, which is what makes it copyable.
+ *
+ * SPACE-BUFFERED inside the parens: `text ( url )`. Terminals auto-linkify bare
+ * URLs by scanning to the next whitespace, and their handling of trailing
+ * punctuation varies — `(https://…).` can hand the user a URL with `).` glued
+ * on. A space on each side means the URL is its own whitespace-delimited token
+ * on every client, so no linkifier and no double-click selection can absorb the
+ * surrounding punctuation. Costs a little typographic air; buys a link that
+ * always works.
  */
 export function exposeLinkTargets(reply: string): string {
-  return reply.replace(
-    /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
-    (_match, text: string, url: string) => (text.trim() === url ? url : `${text.trim()} (${url})`),
+  return (
+    reply
+      .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, (_match, text: string, url: string) =>
+        text.trim() === url ? ` ${url} ` : `${text.trim()} ( ${url} )`,
+      )
+      // The collapse branch adds a buffer to text that usually already had one,
+      // which doubles the space. Tidy ONLY next to the urls we just emitted —
+      // a global whitespace collapse would eat markdown indentation and table
+      // alignment elsewhere in the reply.
+      .replace(/ {2,}(?=https?:\/\/)/g, ' ')
+      .replace(/(https?:\/\/[^\s)]+) {2,}/g, '$1 ')
   );
 }
 
