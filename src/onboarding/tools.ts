@@ -81,7 +81,15 @@ function rememberStatusMetadata(body: unknown): void {
 function rememberVerifiedClaim(body: unknown): void {
   const record = asRecord(body);
   if (record && isClaimContinuity(record.continuity)) {
-    rememberSessionClaim(record.continuity);
+    // The verify response also carries organizationId — the org the workspace
+    // was claimed INTO. It used to be dropped on the floor, which is how a
+    // claimed user ended up unable to explain why the `layers` partner MCP
+    // could not see their brand-new project (it is keyed to a different org).
+    const organizationId =
+      typeof record.organizationId === "string" && record.organizationId.length > 0
+        ? record.organizationId
+        : undefined;
+    rememberSessionClaim(record.continuity, organizationId);
   }
 }
 
