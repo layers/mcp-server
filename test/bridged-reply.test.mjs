@@ -6,6 +6,7 @@ import {
   absolutizeAppLinks,
   appendOnboardingLinks,
   appendPostclaimLinks,
+  presentIntakeQuestion,
   exposeLinkTargets,
   extractElleReply,
 } from "../dist/onboarding/bridged-tools.js";
@@ -333,4 +334,53 @@ test("elicitation options keep their labels through SDK validation", async () =>
   assert.equal(parsed.oneOf.length, 2);
   // The blurb rides the option title, so this is also the price-parity guard.
   assert.match(parsed.oneOf[0].title, /active on TikTok and Instagram/);
+});
+
+// The picker directive — the FACT version of "ask each question once". The
+// golden-rule version was conditional ("if you render a picker, don't also
+// print the list") and the model satisfied it the cheap way: prose only, no
+// picker at all (live, 2026-07-29). So the bridge now strips Elle's prose list
+// and attaches the canonical question as a per-turn directive block, making the
+// picker the only presentation of the options.
+const INTAKE_Q = {
+  field: "managedInterest",
+  title: "Want us to manage your accounts?",
+  options: [
+    { value: "yes", label: "Yes, manage them", blurb: "$150 per account per month" },
+    { value: "no", label: "No, I'll run them myself" },
+  ],
+};
+
+test("presentIntakeQuestion strips Elle's prose list and attaches the canonical block", () => {
+  const reply = [
+    "I'm Elle, your Layers marketing expert, here to help you along the way.",
+    "",
+    "Want us to manage your accounts?",
+    "1. Yes please",
+    "2. No thanks",
+  ].join("\n");
+  const out = presentIntakeQuestion(reply, INTAKE_Q);
+
+  // Elle's own option lines are gone — they are NOT the canonical ones, so
+  // their absence proves the prose list was stripped rather than re-listed.
+  assert.doesNotMatch(out, /Yes please/);
+  assert.doesNotMatch(out, /No thanks/);
+  // Her voice survives.
+  assert.match(out, /I'm Elle, your Layers marketing expert/);
+  // The question appears exactly once — in the directive block.
+  assert.equal(out.split(INTAKE_Q.title).length - 1, 1);
+  // The directive is present and the canonical options ride it with their
+  // blurbs VERBATIM — the managed-account price is the whole reason.
+  assert.match(out, /INTAKE QUESTION/);
+  assert.match(out, /structured question tool/);
+  assert.match(out, /\$150 per account per month/);
+  assert.match(out, /No, I'll run them myself/);
+});
+
+test("presentIntakeQuestion still attaches the block when Elle sent no list", () => {
+  const reply = "Quick one before your preview lands.";
+  const out = presentIntakeQuestion(reply, INTAKE_Q);
+  assert.match(out, /Quick one before your preview lands\./);
+  assert.match(out, /INTAKE QUESTION/);
+  assert.equal(out.split(INTAKE_Q.title).length - 1, 1);
 });

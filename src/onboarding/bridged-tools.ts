@@ -303,6 +303,74 @@ type IntakeOption = { value: string; label: string; blurb?: string };
 type IntakeQuestion = { field: string; title: string; options: IntakeOption[] };
 
 /**
+ * The intake question the human is on right now, from the trial status
+ * response — the CANONICAL set served over HTTP, never a copy in this repo.
+ * Null for every not-applicable case: no session, claimed, nothing outstanding,
+ * or any failure. Pre-claim only; after the claim Elle drives.
+ */
+async function fetchPendingIntakeQuestion(baseUrl: string): Promise<IntakeQuestion | null> {
+  try {
+    const session = getSession();
+    if (!session || session.claim) return null;
+    const status = (await getOnboardingStatus(baseUrl)) as {
+      claimed?: boolean;
+      intake?: { remaining?: IntakeQuestion[] };
+    } | null;
+    if (!status || status.claimed === true) return null;
+    const question = status.intake?.remaining?.[0];
+    if (!question || !Array.isArray(question.options) || question.options.length === 0) return null;
+    return question;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Recompose an intake turn so the PICKER is the only presentation of the
+ * options.
+ *
+ * The first attempt at this was a golden rule — "if you render a picker, don't
+ * also print the list" — and it failed exactly the way every prompt-only rule
+ * in this flow has failed: the model took the cheap path and relayed prose with
+ * no picker at all (live, 2026-07-29). A conditional rule is a preference. This
+ * is the fact version: Elle's numbered list is STRIPPED from the relayed text,
+ * and the question rides a per-turn directive block carrying the canonical
+ * title and options, so rendering the picker is the only way to present what
+ * the reply no longer contains as prose.
+ *
+ * The block also fixes option fidelity: the agent was inventing plausible
+ * descriptions for options whose blurbs it had never seen. These are the
+ * canonical ones — the managed-account PRICE lives in a blurb — and the
+ * directive says verbatim, because this is the moment the human commits.
+ *
+ * If the agent ignores the directive entirely, the block itself still lists the
+ * title and options legibly, so the human is never stranded.
+ */
+export function presentIntakeQuestion(reply: string, question: IntakeQuestion): string {
+  const kept = reply
+    .split("\n")
+    // Elle's numbered option lines. The directive block below re-lists the
+    // options canonically, so dropping these is what makes "asked once" true.
+    .filter((line) => !/^\s*\d+[.)]\s/.test(line))
+    // Her question sentence too, when it is recognizably the canonical title —
+    // the picker's header shows the question, and that is its one appearance.
+    .filter((line) => !line.includes(question.title))
+    .join("\n")
+    .replace(/\n{3,}/g, "\n\n")
+    .trimEnd();
+
+  const options = question.options
+    .map((o, i) => `${i + 1}. ${o.label}${o.blurb ? ` — ${o.blurb}` : ""}`)
+    .join("\n");
+
+  return `${kept}
+
+[INTAKE QUESTION — ask this with your structured question tool (the UI that renders options as a selectable picker), NOT as plain text. Title and options VERBATIM: the option descriptions carry prices and consequences; never reword, trim, or invent them. Send the human's choice back through ask_elle as their reply — the option label or its number both work.]
+${question.title}
+${options}`;
+}
+
+/**
  * Ask the outstanding intake question as a REAL structured prompt.
  *
  * Until now the question reached the human as prose and the picker they saw was
@@ -324,7 +392,7 @@ type IntakeQuestion = { field: string; title: string; options: IntakeOption[] };
  */
 async function elicitIntakeAnswer(
   server: McpServer,
-  baseUrl: string,
+  question: IntakeQuestion,
 ): Promise<string | null> {
   try {
     // OFF BY DEFAULT, and that is a UX decision rather than a doubt about the
@@ -345,16 +413,6 @@ async function elicitIntakeAnswer(
     // capability gate, checked per call rather than assumed at startup.
     const caps = server.server.getClientCapabilities();
     if (!caps || !("elicitation" in caps)) return null;
-
-    const status = (await getOnboardingStatus(baseUrl)) as {
-      claimed?: boolean;
-      intake?: { remaining?: IntakeQuestion[] };
-    } | null;
-    // Intake is the pre-claim Q&A only; after the claim Elle drives.
-    if (!status || status.claimed === true) return null;
-
-    const question = status.intake?.remaining?.[0];
-    if (!question || !Array.isArray(question.options) || question.options.length === 0) return null;
 
     const result = await server.server.elicitInput({
       // The question itself is the prompt header. The FIELD gets a short label —
@@ -413,7 +471,7 @@ export function registerBridgedOnboardingTools(
       title: "Ask Elle",
       annotations: WRITE,
       description:
-        "Elle's onboarding guide — the conversational heart of onboarding. Route EVERY onboarding turn through this: the greeting and the five Layers intake questions. Those five are the entire pre-claim Q&A; after claim Elle drives experimentation and action. Ask one question at a time in Elle's voice and pass the human's reply as message. Do not skip the intake questions or answer them yourself. Every URL in this tool's reply is ALREADY expanded to plain text on purpose — pass each one through exactly as written, never re-wrapped as [text](url) or 'click here', because most MCP clients render link text as colored, unclickable words and hide the address the human needs. AFTER the claim this is still the route to the claimed workspace — ask Elle here about the project's influencers, videos, keywords, or anything else that was generated. Do NOT reach for a general-purpose Layers project/API tool from another server to inspect it: those authenticate with a key bound to a DIFFERENT organization, and claiming mints a brand-new one, so they answer 'Project not found' for a project that exists and is fine.",
+        "Elle's onboarding guide — the conversational heart of onboarding. Route EVERY onboarding turn through this: the greeting and the five Layers intake questions. Those five are the entire pre-claim Q&A; after claim Elle drives experimentation and action. Ask one question at a time in Elle's voice and pass the human's reply as message. Do not skip the intake questions or answer them yourself. Pre-claim, intake questions arrive as an [INTAKE QUESTION …] block at the end of the reply — present that block with your structured question tool, verbatim, exactly as the block instructs; the prose above it deliberately no longer contains the options. Every URL in this tool's reply is ALREADY expanded to plain text on purpose — pass each one through exactly as written, never re-wrapped as [text](url) or 'click here', because most MCP clients render link text as colored, unclickable words and hide the address the human needs. AFTER the claim this is still the route to the claimed workspace — ask Elle here about the project's influencers, videos, keywords, or anything else that was generated. Do NOT reach for a general-purpose Layers project/API tool from another server to inspect it: those authenticate with a key bound to a DIFFERENT organization, and claiming mints a brand-new one, so they answer 'Project not found' for a project that exists and is fine.",
       inputSchema: {
         message: z.string().describe("The human's onboarding reply or turn to pass to Elle"),
       },
@@ -428,15 +486,20 @@ export function registerBridgedOnboardingTools(
           claim?.continuity === "same_account" ? "ask_elle" : "ask_onboardingGuide";
         let result = await callBridge(remoteToolName, { message });
 
-        // Elle has just asked the next intake question. Put it to the human as a
-        // real structured prompt and hand her the answer, so they act on ONE
-        // picker instead of reading the question as prose and then answering a
-        // copy of it. Returns null whenever that is not possible — no
-        // elicitation support, nothing outstanding, or a decline — and then this
-        // is exactly the prose flow it has always been.
-        const elicited = await elicitIntakeAnswer(server, apiBaseUrl);
-        if (elicited !== null) {
-          result = await callBridge(remoteToolName, { message: elicited });
+        // The intake question the human is on, from the canonical set. Drives
+        // BOTH presentation paths: elicitation when the flag is on, and the
+        // picker directive below otherwise.
+        let question = await fetchPendingIntakeQuestion(apiBaseUrl);
+        if (question) {
+          // Flag-gated (off by default). When on: put the question to the human
+          // as a real structured prompt, hand Elle the answer, and relay her
+          // NEXT reply — then re-fetch, since a fresh question may now be
+          // outstanding and it needs presenting too.
+          const elicited = await elicitIntakeAnswer(server, question);
+          if (elicited !== null) {
+            result = await callBridge(remoteToolName, { message: elicited });
+            question = await fetchPendingIntakeQuestion(apiBaseUrl);
+          }
         }
 
         // Resolve the post-claim destinations BEFORE composing the reply, so the
@@ -448,7 +511,7 @@ export function registerBridgedOnboardingTools(
         // Order matters: append the raw urls LAST, after expansion, so the
         // expander never sees them as markdown and the buffered form we add
         // here survives untouched.
-        const usable =
+        let usable =
           reply === null
             ? ASK_ELLE_FALLBACK
             : appendPostclaimLinks(
@@ -458,6 +521,11 @@ export function registerBridgedOnboardingTools(
                 ),
                 getSession(),
               );
+        // Intake turn: strip Elle's prose list and attach the canonical
+        // question as a picker directive — the fact version of "ask once".
+        if (reply !== null && question) {
+          usable = presentIntakeQuestion(usable, question);
+        }
         return { content: [{ type: "text", text: redact(usable) }] };
       } catch (error) {
         return resultError(errorMessage(error));
