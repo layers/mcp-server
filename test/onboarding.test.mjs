@@ -69,22 +69,33 @@ function onboardingHandler(overrides = {}) {
   };
 }
 
-test("keyless mode registers the four native and one bridged onboarding tools", async () => {
+test("keyless mode registers the onboarding tools AND the claimable workspace tool set", async () => {
   const client = await startClient(["--read-only", "--organization", "ignored_org"], {
     apiKey: null,
   });
   try {
     const tools = (await client.listTools()).tools;
-    assert.deepEqual(
-      tools.map((tool) => tool.name),
-      [
-        "onboard_start",
-        "get_onboarding_status",
-        "onboard_claim_begin",
-        "onboard_claim_verify",
-        "ask_elle",
-      ],
-    );
+    const names = tools.map((tool) => tool.name);
+
+    // The five onboarding tools, in order, still lead the surface.
+    assert.deepEqual(names.slice(0, 5), [
+      "onboard_start",
+      "get_onboarding_status",
+      "onboard_claim_begin",
+      "onboard_claim_verify",
+      "ask_elle",
+    ]);
+
+    // The workspace tools are registered UP FRONT, before any claim, and that is
+    // deliberate: MCP advertises its tool list at initialize, and a client that
+    // has already read that list will not necessarily re-read it mid-session.
+    // Tools that appeared only after claiming would be invisible to exactly the
+    // caller who just earned them — which is the failure this replaced, where a
+    // freshly-onboarded user reached for a Layers tool and got 404 "Project not
+    // found" from a key belonging to another org.
+    assert.ok(names.includes("list_influencers"), "workspace tools are claimable");
+    assert.ok(names.includes("list_projects"), "workspace tools are claimable");
+    assert.ok(names.length > 5, "keyless mode is no longer onboarding-only");
     assert.match(client.getInstructions(), /stateless/i);
     assert.match(client.getInstructions(), /six-digit code/i);
     assert.match(client.getInstructions(), /never invent/i);
@@ -101,7 +112,15 @@ test("bridged tools fail clearly before onboard_start without crashing the serve
     assert.match(result.text, /run onboard_start first/i);
 
     const tools = (await client.listTools()).tools;
-    assert.equal(tools.length, 5, "the MCP server must remain live after bridge errors");
+    assert.ok(tools.length > 0, "the MCP server must remain live after bridge errors");
+
+    // A workspace tool before any claim must REFUSE, legibly. There is no key
+    // yet, and sending `Bearer undefined` would come back as a malformed-key
+    // rejection — blaming the credential instead of naming the real state,
+    // which is simply that nothing has been claimed yet.
+    const unclaimed = await callTool(client, "list_influencers", { projectId: "prj_whatever" });
+    assert.equal(unclaimed.isError, true, "workspace tools refuse before a claim");
+    assert.match(unclaimed.text, /claim a workspace first/i);
   } finally {
     await client.close();
   }

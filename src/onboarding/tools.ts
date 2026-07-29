@@ -89,7 +89,16 @@ function rememberVerifiedClaim(body: unknown): void {
       typeof record.organizationId === "string" && record.organizationId.length > 0
         ? record.organizationId
         : undefined;
-    rememberSessionClaim(record.continuity, organizationId);
+    // The workspace key for the org just created. Returned exactly once by
+    // claim/verify and never retrievable again, so if we drop it here the only
+    // way back is issuing another. Optional: minting is best-effort server-side,
+    // and a claim without a key is still a good claim.
+    const claimApiKey = asRecord(record.apiKey);
+    const apiKeySecret =
+      claimApiKey && typeof claimApiKey.secret === "string" && claimApiKey.secret.length > 0
+        ? claimApiKey.secret
+        : undefined;
+    rememberSessionClaim(record.continuity, organizationId, apiKeySecret);
   }
 }
 

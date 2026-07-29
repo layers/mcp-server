@@ -18,6 +18,15 @@ export interface OnboardingClaim {
    * only alongside the code that needs it.
    */
   organizationId?: string;
+  /**
+   * A partner API key for the claimed org, minted by claim/verify.
+   *
+   * This is what lets the onboarding server act on the workspace it just
+   * created: the pre-existing key (if any) is bound to a DIFFERENT org and 404s
+   * on the new project. Held in process memory only, never persisted, and
+   * covered by `redact()` so it cannot leak into relayed text.
+   */
+  apiKeySecret?: string;
 }
 
 export interface OnboardingSession {
@@ -50,12 +59,19 @@ export function isClaimContinuity(value: unknown): value is ClaimContinuity {
 export function rememberSessionClaim(
   continuity: ClaimContinuity,
   organizationId?: string,
+  apiKeySecret?: string,
 ): void {
   if (!currentSession) return;
   currentSession.claim = {
     continuity,
     ...(organizationId ? { organizationId } : {}),
+    ...(apiKeySecret ? { apiKeySecret } : {}),
   };
+}
+
+/** The claimed workspace's API key, if a claim has issued one. */
+export function getClaimedApiKey(): string | undefined {
+  return currentSession?.claim?.apiKeySecret;
 }
 
 export function rememberSessionLinks({
@@ -91,8 +107,15 @@ export function redact(text: string): string {
   if (!currentSession) return text;
 
   let redacted = text;
-  const secrets = [currentSession.accessToken, currentSession.sessionHandle]
-    .filter((value) => value.length > 0)
+  // The claimed workspace key rides this list too. The server USES that key on
+  // the caller's behalf, so it never needs to appear in text — and a partner key
+  // reaching the transcript is the one leak here with no expiry to save us.
+  const secrets = [
+    currentSession.accessToken,
+    currentSession.sessionHandle,
+    currentSession.claim?.apiKeySecret,
+  ]
+    .filter((value): value is string => typeof value === "string" && value.length > 0)
     .sort((a, b) => b.length - a.length);
 
   for (const secret of secrets) {

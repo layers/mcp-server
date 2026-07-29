@@ -43,14 +43,39 @@ export const WRITE = { readOnlyHint: false, destructiveHint: false };
 export const WRITE_IDEMPOTENT = { readOnlyHint: false, destructiveHint: false, idempotentHint: true };
 export const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true };
 
+/**
+ * The key, or a resolver for one.
+ *
+ * Onboarding starts KEYLESS and only acquires a key at claim, so the onboarding
+ * server cannot bind a key at construction the way the legacy server does.
+ * A resolver lets the same client instance be registered up front and pick up
+ * the claimed key the moment it exists — resolved per request, never cached,
+ * so a later claim (or a re-claim) is picked up without rebuilding tools.
+ */
+export type ApiKeySource = string | (() => string | undefined);
+
 export class LayersClient {
   constructor(
-    private readonly apiKey: string,
+    private readonly apiKey: ApiKeySource,
     private readonly baseUrl: string,
     /** Optional child org to act on behalf of, sent as X-Layers-Organization
      *  on every request. Requires an org:admin parent key. */
     private readonly organization?: string,
   ) {}
+
+  /** Resolve the bearer for THIS request. Throws a caller-legible error rather
+   *  than sending `Bearer undefined`, which the API would reject as a malformed
+   *  key instead of the real cause: nothing has been claimed yet. */
+  private resolveKey(): string {
+    const key = typeof this.apiKey === "function" ? this.apiKey() : this.apiKey;
+    if (!key) {
+      throw new Error(
+        "No Layers workspace key yet — claim a workspace first (onboard_claim_verify), " +
+          "then this tool will act on the claimed workspace.",
+      );
+    }
+    return key;
+  }
 
   /**
    * Issue a request and shape the outcome as an MCP tool result.
@@ -68,7 +93,7 @@ export class LayersClient {
     }
 
     const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.apiKey}`,
+      Authorization: `Bearer ${this.resolveKey()}`,
     };
     if (this.organization) {
       headers["X-Layers-Organization"] = this.organization;

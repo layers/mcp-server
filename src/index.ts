@@ -13,7 +13,7 @@ import {
   startOnboarding,
 } from "./onboarding/tools.js";
 import { registerBridgedOnboardingTools } from "./onboarding/bridged-tools.js";
-import { redact } from "./onboarding/session.js";
+import { getClaimedApiKey, redact } from "./onboarding/session.js";
 
 // Flag-first, env-fallback config, mirroring the Supabase server's install style.
 const argv = process.argv.slice(2);
@@ -141,6 +141,28 @@ async function runOnboardingServer(): Promise<void> {
   );
   registerOnboardingTools(server, baseUrl);
   registerBridgedOnboardingTools(server, baseUrl, elleMcpBaseUrl);
+
+  // The full Layers tool set, bound to whatever workspace this session claims.
+  //
+  // Onboarding starts keyless, so there is no key to bind at construction — the
+  // client resolves `getClaimedApiKey()` PER REQUEST instead, and claim/verify
+  // fills it in. Before a claim these tools exist but refuse with a legible
+  // "claim a workspace first" rather than sending `Bearer undefined`.
+  //
+  // Registering them up front (rather than after the claim) is deliberate: MCP
+  // advertises its tool list at initialize, and a client that has already seen
+  // the list will not necessarily re-read it mid-session. Tools that appear only
+  // after a claim would be invisible to exactly the caller who just earned them.
+  //
+  // This is what closes the gap where a freshly-onboarded user reached for a
+  // Layers tool and got 404 "Project not found" — the key they were implicitly
+  // using belonged to a different organization entirely.
+  const claimedClient = new LayersClient(getClaimedApiKey, baseUrl, organization);
+  registerCoreTools(server, claimedClient, readOnly);
+  registerCreativeTools(server, claimedClient, readOnly);
+  registerDistributionTools(server, claimedClient, readOnly);
+  registerMeasurementTools(server, claimedClient, readOnly);
+  registerFrameworkTools(server, claimedClient, readOnly);
 
   const transport = new StdioServerTransport();
   await server.connect(transport);
