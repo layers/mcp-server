@@ -165,7 +165,7 @@ test("exposeLinkTargets unwraps markdown links into visible URLs", () => {
     "👉 [Connect your accounts](https://app.layers.com/project/p1/social/accounts?kind=connected) and [Upload your demo video](https://app.layers.com/project/p1/library).";
   assert.equal(
     exposeLinkTargets(reply),
-    "👉 Connect your accounts: https://app.layers.com/project/p1/social/accounts?kind=connected and Upload your demo video: https://app.layers.com/project/p1/library.",
+    "👉 Connect your accounts (https://app.layers.com/project/p1/social/accounts?kind=connected) and Upload your demo video (https://app.layers.com/project/p1/library).",
   );
 });
 
@@ -177,4 +177,15 @@ test("exposeLinkTargets collapses a link whose text is already the URL", () => {
 test("exposeLinkTargets leaves non-http links and plain text untouched", () => {
   const reply = "Email [us](mailto:hi@layers.com), see [notes](#below), plain https://layers.com text.";
   assert.equal(exposeLinkTargets(reply), reply);
+});
+
+test("exposeLinkTargets reads correctly MID-sentence, not just at a sentence end", () => {
+  // The colon form ("label: url") only worked when the link ended a sentence.
+  // Elle links mid-sentence constantly, and there it produced broken prose:
+  // "Once your accounts: https://... are linked, we start the loop."
+  const url = "https://app.layers.com/project/p1/social/accounts?kind=connected";
+  assert.equal(
+    exposeLinkTargets(`Once [your accounts](${url}) are linked, we start the loop.`),
+    `Once your accounts (${url}) are linked, we start the loop.`,
+  );
 });

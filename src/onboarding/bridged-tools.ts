@@ -95,14 +95,20 @@ export function absolutizeAppLinks(
  * clients are plain-text surfaces with no guarantee of clickable links, so a
  * URL hidden behind link text is a button that cannot be pressed. Like
  * absolutizing above, this is enforced deterministically rather than by
- * prompt: `[text](https://url)` becomes `text: https://url`, and a link whose
+ * prompt: `[text](https://url)` becomes `text (https://url)`, and a link whose
  * text already IS the URL collapses to the bare URL. Only http(s) targets are
  * unwrapped — anchors/mailto pass through untouched.
+ *
+ * PARENTHETICAL, not `text: url`. The colon form only reads correctly when the
+ * link ends a sentence; Elle links mid-sentence all the time, and there it
+ * produced broken prose — "Once your accounts: https://… are linked, we start
+ * the loop." The parenthetical reads correctly in BOTH positions and keeps the
+ * URL adjacent to its label, which is what makes it copyable.
  */
 export function exposeLinkTargets(reply: string): string {
   return reply.replace(
     /\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g,
-    (_match, text: string, url: string) => (text.trim() === url ? url : `${text.trim()}: ${url}`),
+    (_match, text: string, url: string) => (text.trim() === url ? url : `${text.trim()} (${url})`),
   );
 }
 
