@@ -343,19 +343,29 @@ async function elicitIntakeAnswer(
     if (!question || !Array.isArray(question.options) || question.options.length === 0) return null;
 
     const result = await server.server.elicitInput({
+      // The question itself is the prompt header. The FIELD gets a short label —
+      // repeating the question there renders it twice, once as the header and
+      // again beside the input (observed live 2026-07-29).
       message: question.title,
       requestedSchema: {
         type: "object",
         properties: {
           [question.field]: {
             type: "string",
-            title: question.title,
-            enum: question.options.map((o) => o.value),
-            // The blurb rides the label. A surface may render a question as
-            // plain text; it may never drop the field carrying the consequence.
-            enumNames: question.options.map((o) =>
-              o.blurb ? `${o.label} — ${o.blurb}` : o.label,
-            ),
+            title: "Select one",
+            // `oneOf: [{const, title}]` — TitledSingleSelectEnumSchema. NOT
+            // `enum` + `enumNames`: that is LegacyTitledEnumSchema, which the
+            // SDK marks for removal and, decisively, leaves OUT of the
+            // SingleSelectEnumSchema union. A client validating against that
+            // union does not see a select at all — it renders an unset scalar
+            // with only Accept/Decline and no way to choose (observed live).
+            oneOf: question.options.map((o) => ({
+              const: o.value,
+              // The blurb rides the option title. A surface may render a
+              // question as plain text; it may never drop the field carrying
+              // the price or consequence.
+              title: o.blurb ? `${o.label} — ${o.blurb}` : o.label,
+            })),
           },
         },
         required: [question.field],

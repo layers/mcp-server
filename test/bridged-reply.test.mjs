@@ -302,3 +302,35 @@ test("appendPostclaimLinks never duplicates a url already in the reply", () => {
   const out = appendPostclaimLinks(reply, CLAIMED_SESSION);
   assert.equal(out.match(/social\/accounts/g).length, 1);
 });
+
+// The elicitation option schema must survive the SDK's OWN validation with its
+// human labels intact. `enum` + `enumNames` does NOT: it matches
+// UntitledSingleSelectEnumSchema, and zod strips the unknown `enumNames` key —
+// so the client renders a select whose options are raw values ("both",
+// "tiktok") with no labels and no blurbs, which is what shipped on 2026-07-29
+// and read as "nothing to pick". Only `oneOf: [{const, title}]` keeps them.
+test("elicitation options keep their labels through SDK validation", async () => {
+  const t = await import("@modelcontextprotocol/sdk/types.js");
+
+  const legacy = {
+    type: "string",
+    enum: ["both", "none"],
+    enumNames: ["Yes, on both", "Not yet"],
+  };
+  const parsedLegacy = t.SingleSelectEnumSchemaSchema.parse(legacy);
+  assert.equal("enumNames" in parsedLegacy, false, "enumNames is stripped — labels are lost");
+
+  const titled = {
+    type: "string",
+    title: "Select one",
+    oneOf: [
+      { const: "both", title: "Yes, on both — active on TikTok and Instagram" },
+      { const: "none", title: "Not yet" },
+    ],
+  };
+  const parsed = t.SingleSelectEnumSchemaSchema.parse(titled);
+  assert.ok(Array.isArray(parsed.oneOf), "oneOf survives validation");
+  assert.equal(parsed.oneOf.length, 2);
+  // The blurb rides the option title, so this is also the price-parity guard.
+  assert.match(parsed.oneOf[0].title, /active on TikTok and Instagram/);
+});
