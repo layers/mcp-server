@@ -215,17 +215,38 @@ test("status attaches bearer auth, refreshes once on 401, and retries with the n
 });
 
 test("claim begin and verify mirror public tokenless contracts", async () => {
+  const postclaimAssets = {
+    generationStatus: "generating",
+    postclaimState: "running",
+    estimatedDuration: "these may take a few minutes",
+    message:
+      "Your influencer, first video, and keyword research are generating. They can take a few minutes and will appear on your preview page when ready.",
+  };
+  // What the API actually sends: conversation payload PLUS plumbing and
+  // credentials — the org id, the claimed user's Supabase session, and the
+  // minted workspace key. The tool result must carry ONLY the first part:
+  // the org id was displayed to the human verbatim (live, 2026-07-29), and
+  // the session tokens were one model-whim away from the transcript.
   const verifyResponse = {
     status: "claimed",
     organizationId: "org_test_123",
     continuity: "browser",
-    postclaimAssets: {
-      generationStatus: "generating",
-      postclaimState: "running",
-      estimatedDuration: "a few minutes",
-      message:
-        "Your influencer, first video, and keyword research are generating. They can take a few minutes and will appear on your preview page when ready.",
+    postclaimAssets,
+    session: {
+      access_token: "claimed-user-access-token",
+      refresh_token: "claimed-user-refresh-token",
+      expires_in: 3600,
     },
+    apiKey: {
+      secret: "lp_live_TESTSECRET_never-in-transcript",
+      prefix: "lp_live_TEST",
+      organizationId: "org_test_123",
+    },
+  };
+  const sanitizedResult = {
+    status: "claimed",
+    continuity: "browser",
+    postclaimAssets,
   };
 
   await withMockApi(
@@ -244,8 +265,13 @@ test("claim begin and verify mirror public tokenless contracts", async () => {
         code: "123456",
       });
       assert.equal(verified.isError, false, verified.text);
-      assert.deepEqual(JSON.parse(verified.text), verifyResponse);
+      assert.deepEqual(JSON.parse(verified.text), sanitizedResult);
       assert.doesNotMatch(verified.text, /access_token|sessionHandle|refresh_token/);
+      // The plumbing and credentials the API response carried must be stripped
+      // at the source — never left to the relay's taste in what to quote.
+      assert.doesNotMatch(verified.text, /org_test_123/);
+      assert.doesNotMatch(verified.text, /TESTSECRET/);
+      assert.doesNotMatch(verified.text, /apiKey/);
 
       const beginRequest = requests.find(
         (request) => parseUrl(request).pathname === "/api/onboard/claim/begin",

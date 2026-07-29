@@ -104,6 +104,29 @@ function rememberVerifiedClaim(body: unknown): void {
   }
 }
 
+/**
+ * The claim/verify tool result, reduced to what the HUMAN's side of the
+ * conversation needs: status, continuity, postclaimAssets.
+ *
+ * The raw API response also carries plumbing and credentials — organizationId,
+ * a Supabase session (access + refresh tokens for the claimed user), and the
+ * minted workspace key. All of it is captured into process state by
+ * rememberVerifiedClaim BEFORE this runs, and none of it belongs in the agent
+ * transcript: the org id was being displayed to the human verbatim (live,
+ * 2026-07-29), and the session tokens were only unreadable by luck of what the
+ * model chose to quote. redact() covers the workspace key's secret; this stops
+ * the rest at the source instead of trusting the relay's taste.
+ */
+function sanitizeClaimVerifyResult(body: unknown): unknown {
+  const record = asRecord(body);
+  if (!record) return body;
+  return {
+    status: record.status,
+    continuity: record.continuity,
+    ...(record.postclaimAssets !== undefined ? { postclaimAssets: record.postclaimAssets } : {}),
+  };
+}
+
 async function runTool(operation: () => Promise<unknown>): Promise<ToolResult> {
   try {
     return resultOk(await operation());
@@ -373,8 +396,10 @@ async function verifyClaim(
     throw new Error(redact(`Onboarding claim verification failed: ${errorMessage(error)}`));
   }
   const body = await parseSuccess<unknown>(response, "Onboarding claim verify");
+  // Capture FIRST (org id + workspace key into process state), then strip the
+  // plumbing and credentials out of what the agent gets to see.
   rememberVerifiedClaim(body);
-  return body;
+  return sanitizeClaimVerifyResult(body);
 }
 
 export function registerOnboardingTools(server: McpServer, baseUrl: string): void {
