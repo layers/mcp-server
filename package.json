@@ -1,12 +1,17 @@
 {
   "name": "@layers/mcp-server",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "MCP server exposing the Layers API as tools",
   "author": "Layers AI, Inc.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/layers/mcp-server#readme",
-  "repository": { "type": "git", "url": "git+https://github.com/layers/mcp-server.git" },
-  "bugs": { "url": "https://github.com/layers/mcp-server/issues" },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/layers/mcp-server.git"
+  },
+  "bugs": {
+    "url": "https://github.com/layers/mcp-server/issues"
+  },
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -18,9 +23,16 @@
     "content-generation"
   ],
   "type": "module",
-  "engines": { "node": ">=20" },
-  "bin": { "layers-mcp-server": "dist/index.js" },
-  "files": ["dist", "NOTICE"],
+  "engines": {
+    "node": ">=20"
+  },
+  "bin": {
+    "layers-mcp-server": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "NOTICE"
+  ],
   "scripts": {
     "prebuild": "rm -rf dist",
     "build": "tsc",
@@ -29,7 +41,9 @@
     "smoke": "node scripts/smoke.mjs",
     "prepublishOnly": "npm run build"
   },
-  "publishConfig": { "access": "public" },
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.29.0",
     "zod": "^4.4.3"

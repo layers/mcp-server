@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { readFileSync } from "node:fs";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { LayersClient } from "./api.js";
@@ -14,6 +15,20 @@ import {
 } from "./onboarding/tools.js";
 import { registerBridgedOnboardingTools } from "./onboarding/bridged-tools.js";
 import { getClaimedApiKey, redact } from "./onboarding/session.js";
+
+// The version clients see in server info. Read from package.json so a release
+// bump cannot drift from what the server self-reports (both constructors were
+// hardcoded "1.0.0" and shipped that way through 1.1.0).
+const SERVER_VERSION = (() => {
+  try {
+    const pkg = JSON.parse(
+      readFileSync(new URL("../package.json", import.meta.url), "utf8"),
+    ) as { version?: string };
+    return pkg.version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
 
 // Flag-first, env-fallback config, mirroring the Supabase server's install style.
 const argv = process.argv.slice(2);
@@ -120,7 +135,7 @@ async function runOnboardCli(): Promise<void> {
 }
 
 async function runLegacyServer(key: string): Promise<void> {
-  const server = new McpServer({ name: "layers", version: "1.0.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "layers", version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
   const client = new LayersClient(key, baseUrl, organization);
 
   registerCoreTools(server, client, readOnly);
@@ -138,7 +153,7 @@ async function runLegacyServer(key: string): Promise<void> {
 
 async function runOnboardingServer(): Promise<void> {
   const server = new McpServer(
-    { name: "layers", version: "1.0.0" },
+    { name: "layers", version: SERVER_VERSION },
     { instructions: ONBOARDING_INSTRUCTIONS },
   );
   registerOnboardingTools(server, baseUrl);
