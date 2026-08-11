@@ -32,8 +32,9 @@ outbound network are needed**. This is what CI runs.
   right MCP annotation hints: `readOnlyHint` on the 25 reads, `destructiveHint`
   on delete/archive/cancel, `idempotentHint` on PATCH/set-style writes.
 - **[`onboarding.test.mjs`](onboarding.test.mjs)** — keyless native onboarding,
-  session refresh/redaction, claim contracts, the cold-start CLI, all six
-  keyless tool registrations, and graceful pre-session bridge failures.
+  session refresh/redaction, claim contracts, the cold-start CLI, all five
+  onboarding tool registrations plus the claimable workspace tool surface, and
+  graceful pre-session bridge failures.
 - **[`bridge.test.mjs`](bridge.test.mjs)** — the Elle tool-name mappings,
   Streamable HTTP URL/auth construction, 401 refresh with a new token,
   bounded reconnects, and remote result/error redaction.

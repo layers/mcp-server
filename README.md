@@ -9,11 +9,23 @@ any MCP client.
 
 ## Install
 
+For keyless onboarding, start the connector without an API key:
+
+```sh
+claude mcp add layers -- npx -y @layers/mcp-server@latest
+```
+
+The server enters keyless onboarding mode when neither `--api-key` nor
+`LAYERS_API_KEY` is set. It can create and claim a workspace without an
+existing Layers account or API key.
+
+To connect an existing Layers workspace with an API key:
+
 ```sh
 claude mcp add layers -- npx -y @layers/mcp-server@latest --api-key lp_YOUR_KEY
 ```
 
-Or in any MCP client's JSON config:
+Or configure API-key mode in any MCP client's JSON config:
 
 ```json
 {
@@ -35,9 +47,9 @@ Flags take precedence; environment variables are the fallback.
 
 | Flag | Env var | Default | Description |
 |---|---|---|---|
-| `--api-key` | `LAYERS_API_KEY` | — (required) | Layers API key (`lp_...`). The server exits with an error if missing. |
+| `--api-key` | `LAYERS_API_KEY` | unset | Layers API key (`lp_...`). When neither form is set, the server starts in keyless onboarding mode. |
 | `--base-url` | `LAYERS_BASE_URL` | `https://api.layers.com` | API host. Paths are versioned under `/v1`. |
-| `--read-only` | `LAYERS_READ_ONLY=1` | off | Register only read tools (25 of 52). Mutating tools are not exposed at all. |
+| `--read-only` | `LAYERS_READ_ONLY=1` | off | In API-key mode, register only the 25 read tools. In keyless mode, this limits the workspace API tools; the five onboarding tools remain available. |
 | `--organization` | `LAYERS_ORGANIZATION` | unset | Act on behalf of a child org (`org_...`), sent as the `X-Layers-Organization` header on every request. Requires an `org:admin` parent key. |
 
 **Security note:** flags end up in your client's config file and in the process
@@ -61,8 +73,22 @@ content, OAuth, and publish return fixture-backed results.
 
 ## Tools
 
-52 tools, one per API route. Write tools (marked W) are hidden by
-`--read-only`.
+The tool surface depends on how the server starts:
+
+- **API-key mode:** 52 workspace tools, one per API route.
+- **Keyless onboarding mode:** five onboarding tools plus the same 52 workspace
+  tools. The workspace tools are registered up front so the MCP client can see
+  them, but they refuse calls until the onboarding session claims a workspace.
+
+`--read-only` hides workspace write tools (marked W below). The five onboarding
+tools remain available in keyless mode.
+
+### Keyless onboarding
+
+`onboard_start` · `get_onboarding_status` · `onboard_claim_begin` ·
+`onboard_claim_verify` · `ask_elle`
+
+### Workspace API tools (52)
 
 ### Core
 `whoami` · `list_projects` · `get_project` · `get_credits` ·
