@@ -25,10 +25,19 @@ The server today resolves the key from **either** `--api-key` **or** the `LAYERS
 | `onboard_claim_begin` | write | `POST /api/onboard/claim/begin` | `{ status: 'otp_sent' }` |
 | `onboard_claim_verify` | write | `POST /api/onboard/claim/verify` | `{ status: 'claimed', organizationId, continuity }` (tokenless) |
 
-**Bridged** (proxied from the remote Elle `onboarding` MCP server over Streamable HTTP, `Authorization: Bearer <access JWT>`, `?trial=<trialHandle>`; lazy-connect after `onboard_start` succeeds; on 401 → `POST /api/onboard/agent/refresh { sessionHandle }` → retry; reconnect on drop). **The harness owns the client-facing tool names**, so these are exposed as:
+**Bridged** (proxied from the remote Elle `onboarding` MCP server over Streamable HTTP, `Authorization: Bearer <access JWT>`, `?trial=<trialHandle>`; lazy-connect after `onboard_start` succeeds; on 401 → `POST /api/onboard/agent/refresh { sessionHandle }` → retry; reconnect on drop). **The harness owns the client-facing tool name**, which is exposed as:
 
 - `ask_elle` — backed by the remote onboarding guide agent (whatever its internal Mastra key; the alias decouples us from it).
-- `get_marketing_plan` — teaser pre-claim, full content post-claim (server enforces the reveal gate).
+
+There is no separate `get_marketing_plan` tool. Plan state and available plan
+content arrive through `get_onboarding_status`, while the guided conversation
+continues through `ask_elle`.
+
+Keyless mode also registers the existing 52 workspace API tools up front so an
+MCP client does not need to rediscover tools after claim. Before the workspace
+is claimed, those tools refuse with a claim-first error. `--read-only` limits
+the workspace API subset to its 25 read tools; it does not remove the five
+onboarding tools.
 
 The remote Elle host is configured only for keyless onboarding through
 `LAYERS_ELLE_MCP_URL` (default `https://elle.layers.com`). The bridge appends
@@ -65,7 +74,7 @@ Keyless-mode registration; **both** credential forms (`--api-key` and `LAYERS_AP
 
 ---
 
-*Status: §1–§4 (mode selection, the four native tools, bridged `ask_elle`/
-`get_marketing_plan`, session memory + redaction, and the `onboard` CLI subcommand) are
+*Status: §1–§4 (mode selection, the four native tools, bridged `ask_elle`,
+session memory + redaction, and the `onboard` CLI subcommand) are
 **implemented**. Still pending: §5 `llms.txt` and §6 publish hardening (launch-blocking). Full
 cross-repo context and sequencing live in the monorepo plan.*
