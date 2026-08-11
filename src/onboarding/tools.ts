@@ -16,6 +16,9 @@ import {
 } from "./session.js";
 
 const POW_ATTEMPT_LIMIT = 2 ** 26;
+const ONBOARD_START_SUPPORT_CODE = "ONBOARD_START_INTERNAL";
+const SAFE_ONBOARD_START_REQUEST_ID =
+  /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|req_[A-Za-z0-9_-]{1,96})$/i;
 
 interface ChallengeResponse {
   nonce: string;
@@ -170,6 +173,31 @@ async function responseText(response: Response): Promise<string> {
 
 const responseBytes = (text: string): number => Buffer.byteLength(text, "utf8");
 
+function supportedStartError(response: Response, text: string): string | null {
+  let body: unknown;
+  try {
+    body = JSON.parse(text) as unknown;
+  } catch {
+    return null;
+  }
+
+  const record = asRecord(body);
+  const details = record ? asRecord(record.details) : null;
+  if (details?.supportCode !== ONBOARD_START_SUPPORT_CODE) return null;
+
+  const requestIdCandidate = response.headers.get("x-request-id")?.trim();
+  const requestId =
+    requestIdCandidate && SAFE_ONBOARD_START_REQUEST_ID.test(requestIdCandidate)
+      ? requestIdCandidate
+      : undefined;
+
+  return [
+    `Onboarding start failed (${response.status}).`,
+    `Support code: ${ONBOARD_START_SUPPORT_CODE}`,
+    ...(requestId ? [`Request ID: ${requestId}`] : []),
+  ].join("\n");
+}
+
 function parseJson<T>(text: string, context: string): T {
   try {
     return JSON.parse(text) as T;
@@ -244,6 +272,8 @@ export async function startOnboarding(baseUrl: string, url: string): Promise<Onb
     throw new Error(`Onboarding is rate limited.${retryAfterText(startResponse)}`);
   }
   if (startResponse.status !== 202) {
+    const supportError = supportedStartError(startResponse, startText);
+    if (supportError) throw new Error(supportError);
     throw new Error(
       `Onboarding start failed (${startResponse.status}): response body (${responseBytes(startText)} bytes)`,
     );

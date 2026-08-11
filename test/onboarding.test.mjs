@@ -560,10 +560,17 @@ test("separate onboard_start calls use different startRequestIds", async () => {
   );
 });
 
-test("a failed onboard_start leaves the previous session intact", async () => {
+test("a supported failed onboard_start exposes only safe correlation and leaves the previous session intact", async () => {
   let startCalls = 0;
   const rejectedAccessToken = "access_token_rejected_start_secret";
   const rejectedSessionHandle = "sessionHandle_rejected_start_secret";
+  const supportCode = "ONBOARD_START_INTERNAL";
+  const responseRequestId = "req_support-ABC_123";
+  const bodyRequestId = "req_body_must_not_be_trusted";
+  const plantedError = "arbitrary upstream start error";
+  const plantedDetails = "internal reservation details";
+  const plantedHint = "retry the unsafe internal operation";
+  const plantedUnknown = "unknown response field";
 
   await withMockApi(
     async (client, requests) => {
@@ -572,9 +579,21 @@ test("a failed onboard_start leaves the previous session intact", async () => {
 
       const failed = await callTool(client, "onboard_start", { url: "https://two.example.com" });
       assert.equal(failed.isError, true);
-      assert.match(failed.text, /Onboarding start failed \(502\): response body \(\d+ bytes\)/);
-      assert.doesNotMatch(failed.text, new RegExp(rejectedAccessToken));
-      assert.doesNotMatch(failed.text, new RegExp(rejectedSessionHandle));
+      assert.equal(
+        failed.text,
+        `Onboarding start failed (500).\nSupport code: ${supportCode}\nRequest ID: ${responseRequestId}`,
+      );
+      for (const plantedValue of [
+        rejectedAccessToken,
+        rejectedSessionHandle,
+        plantedError,
+        bodyRequestId,
+        plantedDetails,
+        plantedHint,
+        plantedUnknown,
+      ]) {
+        assert.equal(failed.text.includes(plantedValue), false, `${plantedValue} must stay hidden`);
+      }
 
       const status = await callTool(client, "get_onboarding_status");
       assert.equal(status.isError, false, status.text);
@@ -591,10 +610,19 @@ test("a failed onboard_start leaves the previous session intact", async () => {
           return startCalls === 1
             ? { status: 202, json: START_RESPONSE }
             : {
-                status: 502,
+                status: 500,
+                headers: { "x-request-id": responseRequestId },
                 json: {
-                  access_token: rejectedAccessToken,
+                  error: plantedError,
+                  details: {
+                    supportCode,
+                    requestId: bodyRequestId,
+                    internal: plantedDetails,
+                  },
+                  session: { access_token: rejectedAccessToken },
                   sessionHandle: rejectedSessionHandle,
+                  hint: plantedHint,
+                  unknown: plantedUnknown,
                 },
               };
         },
@@ -605,6 +633,80 @@ test("a failed onboard_start leaves the previous session intact", async () => {
       }),
     },
   );
+});
+
+test("a supported start failure omits an invalid response-header request ID", async () => {
+  const supportCode = "ONBOARD_START_INTERNAL";
+  const invalidRequestId = "req_invalid.with-dot";
+
+  await withMockApi(
+    async (client) => {
+      const result = await callTool(client, "onboard_start", { url: "https://example.com" });
+      assert.equal(result.isError, true);
+      assert.equal(result.text, `Onboarding start failed (500).\nSupport code: ${supportCode}`);
+      assert.doesNotMatch(result.text, /Request ID:/);
+      assert.equal(result.text.includes(invalidRequestId), false);
+    },
+    {
+      apiKey: null,
+      handler: onboardingHandler({
+        "/api/onboard/agent/start": () => ({
+          status: 500,
+          headers: { "x-request-id": invalidRequestId },
+          json: {
+            error: "safe envelope with invalid header correlation",
+            details: {
+              supportCode,
+              requestId: "req_valid_body_id_is_still_ignored",
+            },
+          },
+        }),
+      }),
+    },
+  );
+});
+
+test("unsupported start failure bodies retain the status and byte-count fallback", async () => {
+  const supportCode = "ONBOARD_START_INTERNAL";
+  const cases = [
+    {
+      label: "malformed JSON",
+      body: `{"details":{"supportCode":"${supportCode}"`,
+    },
+    { label: "non-object body", body: JSON.stringify("not an error envelope") },
+    {
+      label: "unknown support code",
+      body: JSON.stringify({ details: { supportCode: "ONBOARD_START_UNKNOWN" } }),
+    },
+    {
+      label: "wrong nesting",
+      body: JSON.stringify({ supportCode }),
+    },
+    {
+      label: "wrong support-code type",
+      body: JSON.stringify({ details: { supportCode: 500 } }),
+    },
+  ];
+
+  for (const { label, body } of cases) {
+    await withMockApi(
+      async (client) => {
+        const result = await callTool(client, "onboard_start", { url: "https://example.com" });
+        assert.equal(result.isError, true, label);
+        assert.equal(
+          result.text,
+          `Onboarding start failed (500): response body (${Buffer.byteLength(body, "utf8")} bytes)`,
+          label,
+        );
+      },
+      {
+        apiKey: null,
+        handler: onboardingHandler({
+          "/api/onboard/agent/start": () => ({ status: 500, text: body }),
+        }),
+      },
+    );
+  }
 });
 
 test("the onboard CLI redacts session-bearing progress and catch output", async () => {
