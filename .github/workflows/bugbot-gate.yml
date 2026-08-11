@@ -1,0 +1,482 @@
+name: Bugbot Gate
+
+# Enforces: "Cursor Bugbot attested the exact head commit, and every review
+# thread is resolved." Bugbot's own status check cannot be the required check:
+# findings leave it neutral (= passing), and it never reports on merge-group
+# commits, which hangs the merge queue ~60 min per entry. This gate converts
+# Bugbot's outputs into an enforceable check that also runs on merge_group.
+#
+# Evidence for "Bugbot attested this head" is EITHER a Bugbot review object
+# for the head SHA OR Cursor's own completed check-run with conclusion
+# `success` on that SHA (pinned to the Cursor app id). Both are accepted
+# because Bugbot does not reliably emit a review object on clean runs —
+# sometimes only the check-run.
+#
+# Timing model: a run fired before Bugbot has attested the head (a fresh
+# push; a teammate's approval or a thread reply — GitHub wraps those in
+# implicit review submissions — racing Bugbot) WAITS, polling every 15s, and
+# turns green within one tick of Bugbot finishing. It never stamps a
+# premature red; a red means real findings (unresolved threads), a dismissed
+# head review, or a Bugbot that never started within the budget. merge_group
+# judges instantly — entering the queue already required a green gate.
+#
+# Manual paths (no webhook exists for either):
+# - A thread resolved with no accompanying comment/review: rerun the last gate
+#   run (`gh run rerun <run-id>`).
+# - Bugbot never started on the head (e.g. a force-push can lose its
+#   trigger): the waiting run fails after the 20-min budget — comment
+#   `bugbot run` on the PR.
+on:
+  # Pushes fire a waiting run (yellow, never a premature red): Bugbot's
+  # attestation for the new head cannot exist yet, and Bugbot does NOT
+  # reliably emit a review object on clean runs — sometimes only its
+  # check-run — so no review event may ever fire. The push-fired run polls
+  # (15s) and turns green within one tick of Bugbot finishing.
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted, dismissed]
+  # Comment edits/deletions fire no review submission; a deletion can remove
+  # a thread, so these runs self-heal what would otherwise be a stale red.
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+  pull-requests: read
+  # Required by the commit check-runs endpoint backing the Cursor check-run
+  # attestation fallback; explicit permissions deny omitted scopes, so
+  # without it that path 403s and fails the gate.
+  checks: read
+
+# NO concurrency block — deliberately. Cancelling a superseded run leaves a
+# CANCELLED check run of the REQUIRED context on the head, and the rules
+# engine holds the PR BLOCKED on it even when a newer run is green (observed
+# on #3101: 9+ min BLOCKED beside a passing latest run). Duplicate runs are
+# cheap — evaluation is instant once Bugbot has attested — and every run
+# completing with a verdict beats one green run beside a poisoned ✗.
+
+jobs:
+  gate:
+    name: Bugbot Gate
+    runs-on: ubuntu-latest
+    # Covers the bounded review-wait (20 min) on review-fired runs.
+    timeout-minutes: 25
+    steps:
+      - name: Require current Bugbot review and resolved threads
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          MERGE_GROUP_HEAD_REF: ${{ github.event.merge_group.head_ref }}
+          MERGE_GROUP_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+
+          gate_fail() {
+            echo "::error title=Bugbot Gate::$*"
+            {
+              echo "### Bugbot Gate failed"
+              echo
+              echo "$*"
+              echo
+              echo "GitHub Actions has no review-thread resolution trigger. After resolving without review-comment activity, rerun this workflow with \`gh run rerun <run-id>\` or synchronize the PR."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 1
+          }
+
+          run_graphql() {
+            local context="$1"
+            local query="$2"
+            shift 2
+
+            if ! GRAPHQL_RESPONSE="$(gh api graphql -f query="$query" "$@" 2>&1)"; then
+              gate_fail "GitHub GraphQL query failed while ${context}: ${GRAPHQL_RESPONSE}"
+            fi
+
+            if jq -e '.errors? | length > 0' <<< "$GRAPHQL_RESPONSE" > /dev/null; then
+              local errors
+              errors="$(jq -c '.errors' <<< "$GRAPHQL_RESPONSE")"
+              gate_fail "GitHub GraphQL returned errors while ${context}: ${errors}"
+            fi
+
+            if ! jq -e '.data != null' <<< "$GRAPHQL_RESPONSE" > /dev/null; then
+              gate_fail "GitHub GraphQL returned no data while ${context}."
+            fi
+          }
+
+          run_rest() {
+            local context="$1"
+            local endpoint="$2"
+            shift 2
+
+            if ! REST_RESPONSE="$(gh api "$endpoint" "$@" 2>&1)"; then
+              gate_fail "GitHub REST request failed while ${context}: ${REST_RESPONSE}"
+            fi
+
+            if ! jq -e . <<< "$REST_RESPONSE" > /dev/null; then
+              gate_fail "GitHub REST returned invalid JSON while ${context}."
+            fi
+          }
+
+          OWNER="${GH_REPO%%/*}"
+          REPOSITORY="${GH_REPO#*/}"
+          declare -a pr_numbers=()
+
+          if [[ "$EVENT_NAME" == "merge_group" ]]; then
+            # The merge_group payload has the synthetic head ref/SHA, but no
+            # member PR array. Its ref ends in the queue entry PR number. The
+            # API then supplies that entry and every earlier entry whose changes
+            # are included in this cumulative merge group.
+            if [[ ! "$MERGE_GROUP_HEAD_REF" =~ /pr-([0-9]+)- ]]; then
+              gate_fail "Could not resolve the terminal PR from merge-group ref '${MERGE_GROUP_HEAD_REF}' (SHA ${MERGE_GROUP_HEAD_SHA})."
+            fi
+            terminal_pr="${BASH_REMATCH[1]}"
+
+            read -r -d '' merge_queue_query <<'GRAPHQL' || true
+          query($owner: String!, $repository: String!, $number: Int!, $cursor: String) {
+            repository(owner: $owner, name: $repository) {
+              pullRequest(number: $number) {
+                number
+                mergeQueueEntry {
+                  position
+                  mergeQueue {
+                    entries(first: 100, after: $cursor) {
+                      nodes {
+                        position
+                        pullRequest {
+                          number
+                        }
+                      }
+                      pageInfo {
+                        hasNextPage
+                        endCursor
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+          GRAPHQL
+
+            queue_cursor=""
+            target_position=""
+            while :; do
+              declare -a queue_args=(
+                -F owner="$OWNER"
+                -F repository="$REPOSITORY"
+                -F number="$terminal_pr"
+              )
+              if [[ -n "$queue_cursor" ]]; then
+                queue_args+=(-f cursor="$queue_cursor")
+              fi
+
+              run_graphql "resolving merge-group members from PR #${terminal_pr}" "$merge_queue_query" "${queue_args[@]}"
+
+              if ! jq -e '.data.repository.pullRequest != null' <<< "$GRAPHQL_RESPONSE" > /dev/null; then
+                gate_fail "Merge-group ref '${MERGE_GROUP_HEAD_REF}' named PR #${terminal_pr}, but the API could not find that PR."
+              fi
+              if ! jq -e '.data.repository.pullRequest.mergeQueueEntry != null' <<< "$GRAPHQL_RESPONSE" > /dev/null; then
+                gate_fail "PR #${terminal_pr} no longer has a merge-queue entry; merge-group membership cannot be proven for ${MERGE_GROUP_HEAD_SHA}."
+              fi
+              if ! jq -e '.data.repository.pullRequest.mergeQueueEntry.mergeQueue != null' <<< "$GRAPHQL_RESPONSE" > /dev/null; then
+                gate_fail "PR #${terminal_pr} has no readable merge queue; merge-group membership cannot be proven for ${MERGE_GROUP_HEAD_SHA}."
+              fi
+
+              page_target_position="$(jq -r '.data.repository.pullRequest.mergeQueueEntry.position' <<< "$GRAPHQL_RESPONSE")"
+              if [[ ! "$page_target_position" =~ ^[0-9]+$ ]]; then
+                gate_fail "PR #${terminal_pr} returned an invalid merge-queue position '${page_target_position}'."
+              fi
+              if [[ -z "$target_position" ]]; then
+                target_position="$page_target_position"
+              elif [[ "$target_position" != "$page_target_position" ]]; then
+                gate_fail "The merge queue changed while resolving group ${MERGE_GROUP_HEAD_SHA}; rerun the check on the replacement group."
+              fi
+
+              mapfile -t page_prs < <(
+                jq -r --argjson target "$target_position" '
+                  .data.repository.pullRequest.mergeQueueEntry.mergeQueue.entries.nodes[]?
+                  | select(.pullRequest != null and .position <= $target)
+                  | .pullRequest.number
+                ' <<< "$GRAPHQL_RESPONSE"
+              )
+              pr_numbers+=("${page_prs[@]}")
+
+              if [[ "$(jq -r '.data.repository.pullRequest.mergeQueueEntry.mergeQueue.entries.pageInfo.hasNextPage' <<< "$GRAPHQL_RESPONSE")" != "true" ]]; then
+                break
+              fi
+              queue_cursor="$(jq -r '.data.repository.pullRequest.mergeQueueEntry.mergeQueue.entries.pageInfo.endCursor // empty' <<< "$GRAPHQL_RESPONSE")"
+              if [[ -z "$queue_cursor" ]]; then
+                gate_fail "Merge-queue pagination reported another page without an end cursor."
+              fi
+            done
+
+            mapfile -t pr_numbers < <(printf '%s\n' "${pr_numbers[@]}" | sort -nu)
+            terminal_found=false
+            for member_pr in "${pr_numbers[@]}"; do
+              if [[ "$member_pr" == "$terminal_pr" ]]; then
+                terminal_found=true
+                break
+              fi
+            done
+            if [[ "$terminal_found" != "true" ]]; then
+              gate_fail "Resolved merge-group members did not include terminal PR #${terminal_pr}; refusing to pass group ${MERGE_GROUP_HEAD_SHA}."
+            fi
+          else
+            if [[ ! "$PR_NUMBER" =~ ^[0-9]+$ ]]; then
+              gate_fail "Event '${EVENT_NAME}' did not contain a pull request number."
+            fi
+            pr_numbers=("$PR_NUMBER")
+          fi
+
+          read -r -d '' review_threads_query <<'GRAPHQL' || true
+          query(
+            $owner: String!
+            $repository: String!
+            $number: Int!
+            $threadsCursor: String
+          ) {
+            repository(owner: $owner, name: $repository) {
+              pullRequest(number: $number) {
+                reviewThreads(first: 100, after: $threadsCursor) {
+                  nodes {
+                    isResolved
+                  }
+                  pageInfo {
+                    hasNextPage
+                    endCursor
+                  }
+                }
+              }
+            }
+          }
+          GRAPHQL
+
+          # Evaluate one PR (caller sets `pr_number`): resolve the head and
+          # Bugbot's reviews over REST, paginate review threads over GraphQL,
+          # leaving results in `expected_head`, `bugbot_reviewed`,
+          # `bugbot_dismissed`, and `unresolved_threads`.
+          evaluate_pr() {
+            threads_cursor=""
+            bugbot_reviewed=false
+            bugbot_dismissed=false
+            unresolved_threads=0
+
+            run_rest "resolving the head SHA for PR #${pr_number}" "/repos/${GH_REPO}/pulls/${pr_number}"
+            expected_head="$(jq -r '.head.sha // empty' <<< "$REST_RESPONSE")"
+            if [[ -z "$expected_head" ]]; then
+              gate_fail "PR #${pr_number} has no head SHA."
+            fi
+
+            run_rest "listing reviews for PR #${pr_number}" "/repos/${GH_REPO}/pulls/${pr_number}/reviews" --paginate
+            reviews_response="$REST_RESPONSE"
+            if ! jq -s -e 'length > 0 and all(.[]; type == "array")' <<< "$reviews_response" > /dev/null; then
+              gate_fail "GitHub REST returned an unexpected reviews payload while checking PR #${pr_number}."
+            fi
+
+            # REST reports GitHub App logins with the [bot] suffix. Accept the
+            # GraphQL-style login too so the gate remains robust across API
+            # representation changes. `submitted_at` excludes PENDING drafts.
+            if jq -s -e --arg head "$expected_head" '
+              .[][]?
+              | select(
+                  (.user.login == "cursor[bot]" or .user.login == "cursor")
+                  and .commit_id == $head
+                  and .state != "DISMISSED"
+                  and .submitted_at != null
+                )
+            ' <<< "$reviews_response" > /dev/null; then
+              bugbot_reviewed=true
+            fi
+
+            # A DISMISSED review for the current head means no fresh review
+            # is coming on its own (dismissal does not retrigger Bugbot);
+            # the judgment below names it so the failure carries the fix.
+            if jq -s -e --arg head "$expected_head" '
+              .[][]?
+              | select(
+                  (.user.login == "cursor[bot]" or .user.login == "cursor")
+                  and .commit_id == $head
+                  and .state == "DISMISSED"
+                )
+            ' <<< "$reviews_response" > /dev/null; then
+              bugbot_dismissed=true
+            fi
+
+            # Bugbot does not reliably submit a review OBJECT on clean runs —
+            # sometimes only its per-SHA check-run. Accept Cursor's own
+            # completed check-run with conclusion `success` on the current
+            # head as equal attestation (pinned to the Cursor app id so a
+            # same-named check from any other app can never satisfy it).
+            # `neutral` is NOT accepted: per Cursor docs it means findings
+            # (which always arrive with a review object and unresolved
+            # threads), a run cancelled by a newer commit, or an internal
+            # error — none of which attest a clean review of this head.
+            # A DISMISSED head review blocks this fallback: dismissal is an
+            # explicit human "this review does not count", and only a FRESH
+            # review object (checked above) may supersede it — never the
+            # check-run left over from the dismissed run.
+            if [[ "$bugbot_reviewed" != "true" && "$bugbot_dismissed" != "true" ]]; then
+              run_rest "reading Cursor Bugbot's check-run for ${expected_head}" \
+                "/repos/${GH_REPO}/commits/${expected_head}/check-runs?check_name=Cursor%20Bugbot"
+              # Only the LATEST Cursor run on the SHA is authoritative:
+              # re-runs on the same commit (e.g. `bugbot run`) can leave an
+              # older success beside a newer in-progress/neutral/failed run,
+              # and Bugbot is nondeterministic across runs. An in-progress
+              # latest run is simply not-yet-attested — the wait loop keeps
+              # polling until it completes.
+              if jq -e '
+                [.check_runs[]? | select(.app.id == 1210556)]
+                | max_by(.started_at)
+                | select(
+                    . != null
+                    and .status == "completed"
+                    and .conclusion == "success"
+                  )
+              ' <<< "$REST_RESPONSE" > /dev/null; then
+                bugbot_reviewed=true
+              fi
+            fi
+
+            # Third currency: Cursor's LOCAL-review sync credit. When a
+            # developer runs the /review-bugbot agent skill locally
+            # (bugbot-local), Cursor syncs the result by patch id and posts a
+            # cursor[bot] comment — "Current version of PR was reviewed by
+            # /review-bugbot" — instead of a review object or a fresh
+            # check-run, and its dedup then refuses `bugbot run` re-reviews
+            # of the same patch. Without this branch that path deadlocks the
+            # gate (proven live on PR #4036, 2026-08-07: empty-commit head
+            # refreshes don't help either, since the patch id is unchanged).
+            # Accept the credit only when the comment is cursor[bot]-authored,
+            # carries the marker, and was posted AFTER the head commit —
+            # "current version" is Cursor's own head binding, and the
+            # timestamp keeps a stale credit from attesting newer code.
+            # Findings still cannot slip through: any finding arrives as
+            # review threads, and the unresolved-thread check below fails the
+            # gate regardless of how review currency was earned.
+            if [[ "$bugbot_reviewed" != "true" && "$bugbot_dismissed" != "true" ]]; then
+              run_rest "reading head commit date for ${expected_head}" \
+                "/repos/${GH_REPO}/commits/${expected_head}"
+              head_committed_at="$(jq -r '.commit.committer.date // empty' <<< "$REST_RESPONSE")"
+              if [[ -n "$head_committed_at" ]]; then
+                # Issue comments arrive oldest-first, so the credit is on the
+                # LAST page of a chatty PR — paginate like the reviews path
+                # (`jq -s` + `.[][]?` flattens the per-page arrays).
+                run_rest "reading issue comments on PR #${pr_number}" \
+                  "/repos/${GH_REPO}/issues/${pr_number}/comments?per_page=100" --paginate
+                if jq -s -e --arg after "$head_committed_at" '
+                  [.[][]?
+                    | select(
+                        .user.login == "cursor[bot]"
+                        and (.body | contains("reviewed by /review-bugbot"))
+                        and .created_at > $after
+                      )
+                  ] | length > 0
+                ' <<< "$REST_RESPONSE" > /dev/null; then
+                  bugbot_reviewed=true
+                fi
+              fi
+            fi
+
+            while :; do
+              declare -a pr_args=(
+                -F owner="$OWNER"
+                -F repository="$REPOSITORY"
+                -F number="$pr_number"
+              )
+              if [[ -n "$threads_cursor" ]]; then
+                pr_args+=(-f threadsCursor="$threads_cursor")
+              fi
+
+              run_graphql "checking unresolved review threads on PR #${pr_number}" "$review_threads_query" "${pr_args[@]}"
+
+              if ! jq -e '.data.repository.pullRequest != null' <<< "$GRAPHQL_RESPONSE" > /dev/null; then
+                gate_fail "PR #${pr_number} disappeared while Bugbot Gate was checking it."
+              fi
+
+              page_unresolved="$(
+                jq '[.data.repository.pullRequest.reviewThreads.nodes[]? | select(.isResolved == false)] | length' \
+                  <<< "$GRAPHQL_RESPONSE"
+              )"
+              unresolved_threads=$((unresolved_threads + page_unresolved))
+
+              threads_has_next="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.hasNextPage' <<< "$GRAPHQL_RESPONSE")"
+              threads_cursor="$(jq -r '.data.repository.pullRequest.reviewThreads.pageInfo.endCursor // empty' <<< "$GRAPHQL_RESPONSE")"
+
+              if [[ "$threads_has_next" != "true" ]]; then
+                break
+              fi
+              if [[ -z "$threads_cursor" ]]; then
+                gate_fail "Review-thread pagination for PR #${pr_number} reported another page without an end cursor."
+              fi
+            done
+
+            run_rest "confirming the head SHA for PR #${pr_number}" "/repos/${GH_REPO}/pulls/${pr_number}"
+            current_head="$(jq -r '.head.sha // empty' <<< "$REST_RESPONSE")"
+            if [[ -z "$current_head" ]]; then
+              gate_fail "PR #${pr_number} has no head SHA after Bugbot Gate checked it."
+            elif [[ "$expected_head" != "$current_head" ]]; then
+              gate_fail "PR #${pr_number} changed head SHA while Bugbot Gate was checking it; rerun for the new push."
+            fi
+          }
+
+          # Review/comment-fired runs can race Bugbot's async review of the
+          # head (see header). While the head has no Bugbot review, poll —
+          # re-evaluating in FULL each tick so findings or resolutions that
+          # arrive WITH the review are counted — then judge. Never wait on
+          # merge_group (queue entry already required a green gate) or after a
+          # dismissal (dismissal does not retrigger Bugbot). Pushes fire no
+          # run at all, so waiters only ever spawn on review activity.
+          # 15s interval = the maximum delay between Bugbot finishing and the
+          # gate turning green. The budget only bounds a Bugbot that never
+          # starts (lost trigger) — normal runs exit at Bugbot's own latency.
+          WAIT_BUDGET_SECONDS=1200
+          POLL_INTERVAL_SECONDS=15
+
+          declare -a failures=()
+          declare -a passed=()
+
+          for pr_number in "${pr_numbers[@]}"; do
+            evaluate_pr
+
+            if [[ "$EVENT_NAME" != "merge_group" ]]; then
+              wait_deadline=$((SECONDS + WAIT_BUDGET_SECONDS))
+              while [[ "$bugbot_reviewed" != "true" && "$bugbot_dismissed" != "true" ]] && ((SECONDS < wait_deadline)); do
+                echo "PR #${pr_number}: no Cursor Bugbot review for head ${expected_head} yet; retrying in ${POLL_INTERVAL_SECONDS}s ($((wait_deadline - SECONDS))s left in wait budget)."
+                sleep "$POLL_INTERVAL_SECONDS"
+                evaluate_pr
+              done
+            fi
+
+            if [[ "$bugbot_reviewed" != "true" ]]; then
+              if [[ "$bugbot_dismissed" == "true" ]]; then
+                failures+=("PR #${pr_number}: Cursor Bugbot's review for current head ${expected_head} was dismissed; trigger a fresh review (comment 'bugbot run').")
+              else
+                failures+=("PR #${pr_number}: Cursor Bugbot has not submitted a review for current head ${expected_head}.")
+              fi
+            fi
+            if ((unresolved_threads > 0)); then
+              failures+=("PR #${pr_number}: ${unresolved_threads} unresolved review thread(s) remain.")
+            fi
+            if [[ "$bugbot_reviewed" == "true" ]] && ((unresolved_threads == 0)); then
+              passed+=("PR #${pr_number} (${expected_head})")
+            fi
+          done
+
+          if ((${#failures[@]} > 0)); then
+            printf -v failure_message '%s ' "${failures[@]}"
+            gate_fail "${failure_message% }"
+          fi
+
+          {
+            echo "### Bugbot Gate passed"
+            echo
+            printf -- '- %s\n' "${passed[@]}"
+          } >> "$GITHUB_STEP_SUMMARY"
+          printf 'Bugbot Gate passed: %s\n' "${passed[*]}"
+
