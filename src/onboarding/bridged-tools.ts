@@ -22,7 +22,7 @@ const BROWSER_CONTINUITY_HANDOFF =
 const MAX_ELLE_ENVELOPE_BYTES = 1_048_576;
 const MAX_ELLE_REPLY_BYTES = 32_768;
 const ENVELOPE_MARKER =
-  /(?:systemInstruction|inputTokens|outputTokens|toolCalls|refresh[_-]?token|access[_-]?token|session[_-]?handle|\bAuthorization\b|\bBearer\s+)/i;
+  /(?:systemInstruction|inputTokens|outputTokens|toolCalls|refresh[_-]?token|access[_-]?token|session[_-]?handle|(?:^|\n)\s*Authorization\s*:\s*(?:Bearer|Basic)\s+\S+)/im;
 
 /**
  * The remote guide returns a JSON envelope whose public reply is the top-level
@@ -31,8 +31,8 @@ const ENVELOPE_MARKER =
  *
  * The human only ever needs Elle's reply — the envelope's top-level `text`.
  * Pull just that out. A bounded plain-text reply remains supported for a server
- * that deliberately returns prose, but structured, code-fenced, oversized, or
- * envelope-like text fails closed.
+ * that deliberately returns prose, but malformed object envelopes,
+ * code-fenced, oversized, or envelope-like text fails closed.
  */
 export function extractElleReply(result: CallToolResult): string | null {
   const parts = Array.isArray(result.content) ? result.content : [];
@@ -50,7 +50,10 @@ export function extractElleReply(result: CallToolResult): string | null {
         if (reply) return reply;
         continue;
       } catch {
-        // A structured-looking response that is not valid JSON is not prose.
+        // A malformed object is an invalid remote envelope. A leading `[` is
+        // also normal Markdown (`[label](url)`, `[ ] task`), so it may continue
+        // through the same size/marker checks as every other plain reply.
+        if (trimmed.startsWith("[") && isBoundedReply(part.text)) return part.text;
         continue;
       }
     }
@@ -295,8 +298,8 @@ async function ensurePostclaimLinks(baseUrl: string): Promise<void> {
   }
 }
 
-type IntakeOption = { value: string; label: string; blurb?: string };
-type IntakeQuestion = { field: string; title: string; options: IntakeOption[] };
+type IntakeOption = { value: string; label: string };
+type IntakeQuestion = { field: string; title: string; subtitle?: string; options: IntakeOption[] };
 
 /**
  * The intake question the human is on right now, from the trial status
@@ -330,10 +333,10 @@ async function fetchPendingIntakeQuestion(baseUrl: string): Promise<IntakeQuesti
  * title and options, so rendering the picker is the only way to present what
  * the reply no longer contains as prose.
  *
- * The block also fixes option fidelity: the agent was inventing plausible
- * descriptions for options whose blurbs it had never seen. These are the
- * canonical ones — the managed-account PRICE lives in a blurb — and the
- * directive says verbatim, because this is the moment the human commits.
+ * The block also fixes question fidelity: the managed-account price and
+ * consequence live in the canonical subtitle. The directive includes that
+ * subtitle and every option label verbatim because this is the moment the
+ * human commits.
  *
  * If the agent ignores the directive entirely, the block itself still lists the
  * title and options legibly, so the human is never stranded.
@@ -347,19 +350,18 @@ export function presentIntakeQuestion(reply: string, question: IntakeQuestion): 
     // Her question sentence too, when it is recognizably the canonical title —
     // the picker's header shows the question, and that is its one appearance.
     .filter((line) => !line.includes(question.title))
+    .filter((line) => !question.subtitle || !line.includes(question.subtitle))
     .join("\n")
     .replace(/\n{3,}/g, "\n\n")
     .trimEnd();
 
-  const options = question.options
-    .map((o, i) => `${i + 1}. ${o.label}${o.blurb ? ` — ${o.blurb}` : ""}`)
-    .join("\n");
+  const options = question.options.map((o, i) => `${i + 1}. ${o.label}`).join("\n");
 
   return `${kept}
 
-[INTAKE QUESTION — ask this with your structured question tool (the UI that renders options as a selectable picker), NOT as plain text. Title and options VERBATIM: the option descriptions carry prices and consequences; never reword, trim, or invent them. Send the human's choice back through ask_elle as their reply — the option label or its number both work.]
+[INTAKE QUESTION — ask this with your structured question tool (the UI that renders options as a selectable picker), NOT as plain text. Title, subtitle when present, and options VERBATIM: the subtitle can carry a price or consequence; never reword, trim, or invent them. Send the human's choice back through ask_elle as their reply — the option label or its number both work.]
 ${question.title}
-${options}`;
+${question.subtitle ? `${question.subtitle}\n` : ""}${options}`;
 }
 
 /**
@@ -373,8 +375,8 @@ ${options}`;
  *
  * The questions come from the trial status response, which serves the CANONICAL
  * set — never a copy in this repo, so the browser, Elle and this surface cannot
- * drift. Each option's `blurb` becomes part of its label, because that is where
- * a price or commitment lives and this is the moment the human commits to it.
+ * drift. The canonical subtitle becomes part of the elicitation message,
+ * because that is where a price or commitment lives.
  *
  * Returns the chosen value, or null for every "carry on as before" case:
  * a client that does not support elicitation, no question outstanding, a
@@ -390,7 +392,7 @@ async function elicitIntakeAnswer(
     // OFF BY DEFAULT, and that is a UX decision rather than a doubt about the
     // protocol. This client renders elicitation as a FORM — collapsed fields,
     // "expand to edit", Accept/Decline — while the relaying agent's own question
-    // UI renders an inline picker with every option and its blurb visible and
+    // UI renders an inline picker with every option visible and
     // one keystroke to choose. Founder call 2026-07-29, after seeing both: the
     // picker wins, so we let the agent ask and keep this ready for the day the
     // form renders as a real select. Flip with LAYERS_ONBOARD_ELICITATION=1.
@@ -410,7 +412,9 @@ async function elicitIntakeAnswer(
       // The question itself is the prompt header. The FIELD gets a short label —
       // repeating the question there renders it twice, once as the header and
       // again beside the input.
-      message: question.title,
+      message: question.subtitle
+        ? `${question.title}\n${question.subtitle}`
+        : question.title,
       requestedSchema: {
         type: "object",
         properties: {
@@ -425,10 +429,7 @@ async function elicitIntakeAnswer(
             // with only Accept/Decline and no way to choose.
             oneOf: question.options.map((o) => ({
               const: o.value,
-              // The blurb rides the option title. A surface may render a
-              // question as plain text; it may never drop the field carrying
-              // the price or consequence.
-              title: o.blurb ? `${o.label} — ${o.blurb}` : o.label,
+              title: o.label,
             })),
           },
         },

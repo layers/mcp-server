@@ -115,8 +115,8 @@ function rememberVerifiedClaim(body: unknown): void {
  *
  * The raw API response also carries plumbing and credentials — organizationId,
  * a Supabase session (access + refresh tokens for the claimed user), and the
- * minted workspace key. Process-only fields are captured before the response
- * is projected through the explicit public contract.
+ * minted workspace key. The public projection is validated before process
+ * state changes; only then are process-only fields captured from the raw body.
  */
 async function runTool(operation: () => Promise<unknown>): Promise<ToolResult> {
   try {
@@ -416,10 +416,12 @@ async function verifyClaim(
     throw new Error(redact(`Onboarding claim verification failed: ${errorMessage(error)}`));
   }
   const body = await parseSuccess<unknown>(response, "Onboarding claim verify");
-  // Capture FIRST (org id + workspace key into process state), then strip the
-  // plumbing and credentials out of what the agent gets to see.
+  // Validate what the agent will receive before mutating local claim state. A
+  // drifted response must fail as one operation, not report an error after the
+  // process has already switched into post-claim routing.
+  const publicBody = sanitizeClaimVerify(body);
   rememberVerifiedClaim(body);
-  return sanitizeClaimVerify(body);
+  return publicBody;
 }
 
 export function registerOnboardingTools(server: McpServer, baseUrl: string): void {

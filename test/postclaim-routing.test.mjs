@@ -4,6 +4,7 @@ import { OnboardingBridge } from "../dist/onboarding/bridge.js";
 import { registerBridgedOnboardingTools } from "../dist/onboarding/bridged-tools.js";
 import { registerOnboardingTools, getOnboardingStatus } from "../dist/onboarding/tools.js";
 import {
+  getClaimedApiKey,
   getSession,
   rememberSession,
   updateSessionAccess,
@@ -191,6 +192,35 @@ test("onboard_claim_verify same-account claim refreshes before the first full El
     assert.equal(header(transports[0].options, "x-layers-onboard-trial"), null);
     assert.equal(new URL(transports[0].url).search, "");
     await bridge.close();
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("claim projection failure leaves process claim state untouched", async () => {
+  rememberSession(session());
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    jsonResponse({
+      status: "claimed",
+      organizationId: "org_must_not_be_retained",
+      continuity: "same_account",
+      apiKey: { secret: "lp_live_must_not_be_retained" },
+    });
+
+  try {
+    const onboardingTools = toolRegistry((server) =>
+      registerOnboardingTools(server, "https://api.layers.test"),
+    );
+    const result = await onboardingTools.get("onboard_claim_verify").handler({
+      email: "human@example.com",
+      code: "123456",
+    });
+
+    assert.equal(result.isError, true);
+    assert.match(result.content[0].text, /invalid public response/);
+    assert.equal(getSession().claim, undefined);
+    assert.equal(getClaimedApiKey(), undefined);
   } finally {
     globalThis.fetch = originalFetch;
   }

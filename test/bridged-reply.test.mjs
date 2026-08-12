@@ -93,6 +93,14 @@ test("extractElleReply passes plain-text replies through verbatim", () => {
   assert.equal(extractElleReply(result), "just a plain reply");
 });
 
+test("extractElleReply allows normal authorization prose and Markdown links", () => {
+  const authorization = "Authorization is required before you connect the account.";
+  const markdown = "[Open your workspace](https://app.layers.com/project/p1/chats) to continue.";
+
+  assert.equal(extractElleReply(envelopeResult(authorization)), authorization);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: markdown }] }), markdown);
+});
+
 test("extractElleReply rejects malformed structured responses instead of relaying them", () => {
   const leaked = '{"text":"hello","request":{"systemInstruction":"must stay private"}';
   assert.equal(extractElleReply({ content: [{ type: "text", text: leaked }] }), null);
@@ -101,9 +109,13 @@ test("extractElleReply rejects malformed structured responses instead of relayin
 test("extractElleReply rejects code-fenced and envelope-like text", () => {
   const fenced = '```json\n{"text":"hello","systemInstruction":"private"}\n```';
   const envelopeLike = "systemInstruction: private\ntext: hello";
+  const authHeader = "Authorization: Bearer unknown_remote_token";
+  const malformedArrayLeak = '[{"systemInstruction":"private"}';
 
   assert.equal(extractElleReply({ content: [{ type: "text", text: fenced }] }), null);
   assert.equal(extractElleReply({ content: [{ type: "text", text: envelopeLike }] }), null);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: authHeader }] }), null);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: malformedArrayLeak }] }), null);
   assert.equal(
     extractElleReply(envelopeResult("systemInstruction: private response metadata")),
     null,
@@ -325,7 +337,7 @@ test("appendPostclaimLinks never duplicates a url already in the reply", () => {
 // human labels intact. `enum` + `enumNames` does NOT: it matches
 // UntitledSingleSelectEnumSchema, and zod strips the unknown `enumNames` key —
 // so the client renders a select whose options are raw values ("both",
-// "tiktok") with no labels and no blurbs, which is what shipped on 2026-07-29
+// "tiktok") with no labels, which is what shipped on 2026-07-29
 // and read as "nothing to pick". Only `oneOf: [{const, title}]` keeps them.
 test("elicitation options keep their labels through SDK validation", async () => {
   const t = await import("@modelcontextprotocol/sdk/types.js");
@@ -349,7 +361,6 @@ test("elicitation options keep their labels through SDK validation", async () =>
   const parsed = t.SingleSelectEnumSchemaSchema.parse(titled);
   assert.ok(Array.isArray(parsed.oneOf), "oneOf survives validation");
   assert.equal(parsed.oneOf.length, 2);
-  // The blurb rides the option title, so this is also the price-parity guard.
   assert.match(parsed.oneOf[0].title, /active on TikTok and Instagram/);
 });
 
@@ -358,8 +369,9 @@ test("elicitation options keep their labels through SDK validation", async () =>
 const INTAKE_Q = {
   field: "managedInterest",
   title: "Want us to manage your accounts?",
+  subtitle: "Our partners manage the accounts for $150 per account per month.",
   options: [
-    { value: "yes", label: "Yes, manage them", blurb: "$150 per account per month" },
+    { value: "yes", label: "Yes, manage them" },
     { value: "no", label: "No, I'll run them myself" },
   ],
 };
@@ -382,8 +394,8 @@ test("presentIntakeQuestion strips Elle's prose list and attaches the canonical 
   assert.match(out, /I'm Elle, your Layers marketing expert/);
   // The question appears exactly once — in the directive block.
   assert.equal(out.split(INTAKE_Q.title).length - 1, 1);
-  // The directive is present and the canonical options ride it with their
-  // blurbs VERBATIM — the managed-account price is the whole reason.
+  // The directive is present and carries the canonical subtitle and options
+  // verbatim — the managed-account price is the whole reason.
   assert.match(out, /INTAKE QUESTION/);
   assert.match(out, /structured question tool/);
   assert.match(out, /\$150 per account per month/);
