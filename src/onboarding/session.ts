@@ -42,14 +42,41 @@ export interface OnboardingSession {
   workspaceApiKey?: string;
 }
 
+/**
+ * The capability returned by a protocol-v1 URL-free reservation.
+ *
+ * This is deliberately separate from `OnboardingSession`: reserving a trial
+ * does not mint the authenticated session, preview, or claim links used by the
+ * legacy URL flow. The later evidence-submission tool can consume this value
+ * from process memory without ever returning it to the host agent.
+ */
+export interface OnboardingReservation {
+  protocolVersion: 1;
+  trialHandle: string;
+  reservationCapability: string;
+  expiresAt: string;
+  state: "awaiting_evidence";
+}
+
 let currentSession: OnboardingSession | undefined;
+let currentReservation: OnboardingReservation | undefined;
 
 export function getSession(): OnboardingSession | undefined {
   return currentSession;
 }
 
+export function getReservation(): OnboardingReservation | undefined {
+  return currentReservation;
+}
+
 export function rememberSession(session: OnboardingSession): void {
   currentSession = session;
+  currentReservation = undefined;
+}
+
+export function rememberReservation(reservation: OnboardingReservation): void {
+  currentReservation = reservation;
+  currentSession = undefined;
 }
 
 export function isClaimContinuity(value: unknown): value is ClaimContinuity {
@@ -115,16 +142,15 @@ export function updateSessionAccess(
 
 /** Remove process-held credentials before any onboarding text is serialized. */
 export function redact(text: string): string {
-  if (!currentSession) return text;
-
   let redacted = text;
   // The claimed workspace key rides this list too. The server USES that key on
   // the caller's behalf, so it never needs to appear in text — and a partner key
   // reaching the transcript is the one leak here with no expiry to save us.
   const secrets = [
-    currentSession.accessToken,
-    currentSession.sessionHandle,
-    currentSession.workspaceApiKey,
+    currentSession?.accessToken,
+    currentSession?.sessionHandle,
+    currentSession?.workspaceApiKey,
+    currentReservation?.reservationCapability,
   ]
     .filter((value): value is string => typeof value === "string" && value.length > 0)
     .sort((a, b) => b.length - a.length);
