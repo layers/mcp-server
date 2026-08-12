@@ -19,6 +19,12 @@ const PREVIEW_URL = "https://layers.test/p/postclaim";
 const CLAIM_URL = `https://layers.test/claim?token=${CLAIM_TOKEN}`;
 const WORKSPACE_URL = "https://layers.test/project/prj_postclaim/chats";
 const CONNECT_ACCOUNTS_URL = "https://layers.test/project/prj_postclaim/social/accounts";
+const POSTCLAIM_ASSETS = {
+  generationStatus: "generating",
+  postclaimState: "running",
+  estimatedDuration: "these may take a few minutes",
+  message: "Your first assets are generating and will appear on the preview page.",
+};
 
 function session(accessToken = ACCESS_TOKEN, continuity, links = {}) {
   return {
@@ -122,6 +128,7 @@ test("onboard_claim_verify same-account claim refreshes before the first full El
       status: "claimed",
       organizationId: "org_postclaim",
       continuity: "same_account",
+      postclaimAssets: POSTCLAIM_ASSETS,
     });
   };
 
@@ -199,11 +206,17 @@ test("status convergence marks same-account claim and flips ask_elle to the full
     );
     assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${ACCESS_TOKEN}`);
     return jsonResponse({
+      buildState: "preview_ready",
+      planState: "ready",
+      claimState: "claimed",
+      postclaimState: "running",
       claimed: true,
       continuity: "same_account",
       previewUrl: PREVIEW_URL,
+      claimUrl: CLAIM_URL,
       workspaceUrl: WORKSPACE_URL,
       connectAccountsUrl: CONNECT_ACCOUNTS_URL,
+      plan: { state: "ready" },
     });
   };
 

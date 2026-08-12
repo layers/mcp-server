@@ -779,7 +779,7 @@ test("unsupported start failure bodies retain the status and byte-count fallback
   }
 });
 
-test("the onboard CLI redacts session-bearing progress and catch output", async () => {
+test("the onboard CLI fails closed before session-bearing status can reach output", async () => {
   await withMockApi(
     async (_client, _requests, baseUrl) => {
       const result = await spawnServer(
@@ -794,8 +794,11 @@ test("the onboard CLI redacts session-bearing progress and catch output", async 
         },
       );
       assert.equal(result.code, 1);
-      assert.match(result.stdout, /\[redacted\]/);
-      assert.match(result.stderr, /\[redacted\]/);
+      assert.equal(
+        result.stdout,
+        "Starting keyless Layers onboarding...\nOnboarding started; waiting for the preview...\n",
+      );
+      assert.match(result.stderr, /Onboarding status returned an invalid public response/);
       assert.doesNotMatch(result.stdout + result.stderr, new RegExp(ACCESS_TOKEN));
       assert.doesNotMatch(result.stdout + result.stderr, new RegExp(SESSION_HANDLE));
     },
