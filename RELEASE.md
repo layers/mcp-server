@@ -34,6 +34,8 @@ verifies it directly. Consequences:
   while CI publishes without a password.
 - **Provenance.** Every tarball ships a signed attestation linking it to the
   exact commit and workflow run (`npm publish --provenance`).
+- **Pinned build chain.** Release Actions use reviewed commit SHAs and the npm
+  CLI is pinned to an exact OIDC-capable version.
 - **Human gate.** The `npm-publish` GitHub Environment requires a reviewer to
   approve each publish — so even a malicious tag push cannot ship without a
   person clicking approve.

@@ -38,7 +38,7 @@ Or configure API-key mode in any MCP client's JSON config:
 }
 ```
 
-> Pin a version (`@layers/mcp-server@0.1.0`) in production setups instead of
+> Pin a reviewed version (`@layers/mcp-server@<version>`) in production setups instead of
 > `@latest` if you want releases to be deliberate on your side.
 
 ## Configuration
@@ -137,9 +137,10 @@ tools remain available in keyless mode.
   `{ items, nextCursor }`; pass `nextCursor` back verbatim.
 - **Idempotency.** The server stamps a fresh UUID `Idempotency-Key` on every
   mutating POST/PATCH automatically.
-- **Errors** surface the Layers envelope as tool errors:
-  `Layers API <status> <code>: <message>` plus `requestId` and `details` —
-  include the `requestId` in support tickets.
+- **Errors** expose only the public status, stable error code, safe message, and
+  validated `requestId`. Backend details and non-contract response bodies are
+  not copied into the agent transcript. Include the `requestId` in support
+  tickets.
 - **Timestamps** are ISO 8601 UTC with a `Z` suffix everywhere (offset forms
   are rejected by the API). `scheduledFor` is a literal UTC instant — convert
   from local time before calling.
@@ -179,3 +180,5 @@ full breakdown and the sandbox smoke script.
 
 Apache-2.0 — see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 Copyright 2026 Layers AI, Inc.
+
+Report vulnerabilities privately as described in [SECURITY.md](SECURITY.md).
