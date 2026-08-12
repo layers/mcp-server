@@ -1,80 +1,74 @@
-# `@layers/mcp-server` — Keyless Onboarding Mode (spec)
+# Keyless onboarding mode
 
-**Status:** reviewed spec — the harness slice of the cross-repo "Onboarding via Agent" plan (authored + skeptic-reviewed to consensus in the `layers/layers` monorepo, `docs/onboarding-via-agent/IMPLEMENTATION_PLAN.md`). This doc is the self-contained brief for **this** repo so its own CI/reviewers have full context without the monorepo.
+This document describes the behavior shipped by `@layers/mcp-server`. It is a
+public runtime contract, not an implementation plan.
 
-**Goal:** let anyone tell their MCP client "Implement Layers.ai" and, with **no API key and no account**, bootstrap a Layers workspace, talk to Elle, and claim it by email — all JWT-only, no `lp_` key on this path. The existing 52-tool key-required mode is **unchanged**.
+## Mode selection
 
----
+The server reads an API key from `--api-key` first, then `LAYERS_API_KEY`.
 
-## 1. Mode selection (must not regress existing installs)
+- When a key is present, the server registers the Layers workspace API tools.
+- When no key is present, the server registers the keyless onboarding tools and
+  the workspace tools. Workspace tools become usable after the onboarding
+  session claims a workspace.
+- `--read-only` limits workspace tools. It does not remove the onboarding tools.
 
-The server today resolves the key from **either** `--api-key` **or** the `LAYERS_API_KEY` env var (`src/index.ts:18` — `flagValue("api-key") ?? process.env.LAYERS_API_KEY`).
+Both flag-based and environment-based API-key configurations are covered by the
+registration tests.
 
-- **Legacy mode (unchanged, byte-identical):** entered whenever a key resolves from **either** source. All 52 tools register exactly as today.
-- **Keyless onboarding mode:** entered **only** when **neither** a `--api-key` flag nor `LAYERS_API_KEY` is present — or via the explicit `onboard` subcommand (§4).
-- ⚠ Keying mode on `--api-key` absence alone would silently drop env-var installs into onboarding mode and strip their tools. Test **both** credential forms for byte-identical registration.
+## Public onboarding tools
 
-## 2. Tools in onboarding mode
+Keyless mode exposes five tools:
 
-**Native** (to be implemented here — REST → `apps/api` public onboarding routes; base URL `--base-url`/`LAYERS_BASE_URL`, default `https://api.layers.com`):
+- `onboard_start` starts a trial from a supported public product URL.
+- `get_onboarding_status` returns the public build, preview, claim, intake, and
+  post-claim status projection.
+- `onboard_claim_begin` starts the optional in-chat email-code claim flow.
+- `onboard_claim_verify` completes that optional claim without returning
+  credentials to the host agent.
+- `ask_elle` carries the guided onboarding conversation and post-claim next
+  steps.
 
-| Tool | Kind | REST | Returns |
-|---|---|---|---|
-| `onboard_start` | write | `POST /api/onboard/agent/start` (after solving the PoW challenge from `GET /api/onboard/agent/challenge`) | `{ trialHandle, previewUrl, claimUrl, expiresAt }` — plus the session is captured **into process memory**, never returned to the agent |
-| `get_onboarding_status` | read | `GET /api/onboard/agent/trials/:trialHandle` | `{ status, progress[], previewUrl, claimUrl, claimed, plan:{state,teaser?,content?} }` (long-poll) |
-| `onboard_claim_begin` | write | `POST /api/onboard/claim/begin` | `{ status: 'otp_sent' }` |
-| `onboard_claim_verify` | write | `POST /api/onboard/claim/verify` | `{ status: 'claimed', organizationId, continuity }` (tokenless) |
+The default claim experience uses the portable browser claim URL. The email-code
+tools remain available for a person who explicitly asks to claim inside the
+current chat.
 
-**Bridged** (proxied from the remote Elle `onboarding` MCP server over Streamable HTTP, `Authorization: Bearer <access JWT>`, `?trial=<trialHandle>`; lazy-connect after `onboard_start` succeeds; on 401 → `POST /api/onboard/agent/refresh { sessionHandle }` → retry; reconnect on drop). **The harness owns the client-facing tool name**, which is exposed as:
+The CLI form remains available for hosts that launch a one-shot process:
 
-- `ask_elle` — backed by the remote onboarding guide agent (whatever its internal Mastra key; the alias decouples us from it).
+```sh
+npx -y @layers/mcp-server onboard <url>
+```
 
-There is no separate `get_marketing_plan` tool. Plan state and available plan
-content arrive through `get_onboarding_status`, while the guided conversation
-continues through `ask_elle`.
+It prints the public preview and claim links after the preview is ready.
 
-Keyless mode also registers the existing 52 workspace API tools up front so an
-MCP client does not need to rediscover tools after claim. Before the workspace
-is claimed, those tools refuse with a claim-first error. `--read-only` limits
-the workspace API subset to its 25 read tools; it does not remove the five
-onboarding tools.
+## Security boundaries
 
-The remote Elle host is configured only for keyless onboarding through
-`LAYERS_ELLE_MCP_URL` (default `https://elle.layers.com`). The bridge appends
-`/api/mcp/onboarding/mcp?trial=<trialHandle>`; the native REST routes continue to use
-`--base-url`/`LAYERS_BASE_URL`.
+- Short-lived onboarding credentials and the claimed workspace key stay in
+  process memory. They are not returned in MCP tool results or logs.
+- Public tool results are projected through explicit schemas. Unknown backend
+  fields are discarded instead of copied into the host-agent transcript.
+- The remote guide response is reduced to its bounded public reply. Structured,
+  malformed, oversized, or envelope-like fallback text fails closed.
+- The server refreshes its short-lived onboarding session internally and retries
+  an interrupted remote call at most once.
+- Release publishing uses GitHub OIDC and npm provenance; no long-lived npm token
+  is stored in this repository.
 
-## 3. Session handling (security-critical)
+## Configuration
 
-- `onboard_start` returns, to this process only, a short-lived **access token** + an opaque **`sessionHandle`**. **No refresh token ever reaches the client** — the refresh chain is owned server-side; renew via `POST /api/onboard/agent/refresh { sessionHandle }`.
-- Tokens live in **process memory only** and **must never appear** in any tool result, log line, or error string. **Redaction tests over every serializer** (`ok()`/`err()` in `src/api.ts` and any logging) assert no `access_token` / `sessionHandle` / refresh-token substring can escape.
-- The MCP claim path is tokenless — it never serializes the verify-minted session.
+| Setting | Purpose |
+|---|---|
+| `--api-key` / `LAYERS_API_KEY` | Select API-key mode. |
+| `--base-url` / `LAYERS_BASE_URL` | Override the Layers API host. |
+| `LAYERS_ELLE_MCP_URL` | Override the hosted onboarding conversation service. |
+| `--organization` / `LAYERS_ORGANIZATION` | Act for an authorized child organization in API-key mode. |
+| `--read-only` / `LAYERS_READ_ONLY=1` | Limit the workspace API tools to reads. |
 
-## 4. Cold-start CLI subcommand
+## Verification
 
-`npx -y @layers/mcp-server onboard <url>` → runs `onboard_start`, prints progress lines + `previewUrl` + `claimUrl`, then exits with claim instructions. (The `amba init` one-package pattern.) `<url>` v1: website or Apple App Store URL.
+The hermetic Node test suite covers mode selection, tool registration, public
+response projection, credential redaction, claim behavior, session refresh,
+remote reconnect, reply-envelope filtering, and the legacy API-key surface.
 
-## 5. `llms.txt` (served from layers.com, not this repo)
-
-Prescriptive two-branch install so agents don't improvise: **Branch A** (client already has the Layers connector) → call `onboard_start`; **Branch B** (no connector) → the exact `npx -y @layers/mcp-server onboard <url>` line.
-
-## 6. Publish hardening (launch-blocking)
-
-`llms.txt` instructs arbitrary agents to `npx -y @layers/mcp-server` — a compromised publish is code-execution on every adopter. Before shipping onboarding mode:
-
-- npm **2FA** on all maintainers; **provenance/attestations** on publish.
-- Publish **only** from tag-gated CI — no laptop `npm publish`.
-- README pin guidance (`@layers/mcp-server@<version>` in production).
-- The 52→~57-tool diff gets monorepo-grade review (name reviewers on the PR).
-- A **contract drift check** in CI against fixtures exported from the monorepo's `@layers/shared-types` for the `/api/onboard/agent/*` shapes this package hand-mirrors.
-
-## 7. Test matrix (`node --test`)
-
-Keyless-mode registration; **both** credential forms (`--api-key` and `LAYERS_API_KEY`) → byte-identical legacy registration; two-phase claim (browser + MCP token modes); `401 → refresh → retry`; bridge reconnect; `ask_elle` client-name mapping (independent of Elle's internal agent key); **session redaction** across every serializer; `--api-key` mode unchanged.
-
----
-
-*Status: §1–§4 (mode selection, the four native tools, bridged `ask_elle`,
-session memory + redaction, and the `onboard` CLI subcommand) are
-**implemented**. Still pending: §5 `llms.txt` and §6 publish hardening (launch-blocking). Full
-cross-repo context and sequencing live in the monorepo plan.*
+See [README.md](README.md) for installation and [RELEASE.md](RELEASE.md) for the
+tag-to-npm release process.

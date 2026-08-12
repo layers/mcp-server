@@ -6,11 +6,8 @@ export interface OnboardingClaim {
    * The organization the workspace was claimed INTO.
    *
    * Claiming mints a brand-new org, and the separate `layers` partner MCP
-   * authenticates with a static key bound to one *other* org — so it answers
-   * "Project not found" for a freshly-claimed project no matter what id it is
-   * given (observed live 2026-07-29). Holding the claimed org id lets the
-   * onboarding server say WHY rather than leaving the caller to conclude the
-   * project failed to build.
+   * authenticates with a static key bound to one *other* org. Holding the
+   * claimed org id keeps post-claim routing bound to the correct workspace.
    *
    * Identity, not a credential. The claim response also carries a Supabase
    * session; that is deliberately NOT retained here, because nothing in this

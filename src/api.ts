@@ -43,6 +43,10 @@ export const WRITE = { readOnlyHint: false, destructiveHint: false };
 export const WRITE_IDEMPOTENT = { readOnlyHint: false, destructiveHint: false, idempotentHint: true };
 export const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true };
 
+const SAFE_ERROR_CODE = /^[A-Z][A-Z0-9_]{0,63}$/;
+const SAFE_REQUEST_ID = /^(?:req_[A-Za-z0-9_-]{1,96}|[0-9a-f-]{36})$/i;
+const MAX_ERROR_MESSAGE_LENGTH = 2_000;
+
 /**
  * The key, or a resolver for one.
  *
@@ -92,9 +96,8 @@ export class LayersClient {
       }
     }
 
-    const headers: Record<string, string> = {
-      Authorization: `Bearer ${this.resolveKey()}`,
-    };
+    const apiKey = this.resolveKey();
+    const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
     if (this.organization) {
       headers["X-Layers-Organization"] = this.organization;
     }
@@ -113,12 +116,17 @@ export class LayersClient {
         body: opts.body !== undefined ? JSON.stringify(opts.body) : undefined,
       });
     } catch (e) {
-      return err(`Request to Layers API failed: ${e instanceof Error ? e.message : String(e)}`);
+      return err(
+        redactApiText(
+          `Request to Layers API failed: ${e instanceof Error ? e.message : String(e)}`,
+          apiKey,
+        ),
+      );
     }
 
     const text = await res.text();
     if (!res.ok) {
-      return err(formatApiError(res.status, text));
+      return err(formatApiError(res.status, text, apiKey));
     }
 
     if (!text) return ok({ status: res.status });
@@ -130,22 +138,45 @@ export class LayersClient {
   }
 }
 
-function formatApiError(status: number, text: string): string {
+function formatApiError(status: number, text: string, apiKey: string): string {
+  let code: string | undefined;
+  let message: string | undefined;
+  let requestId: string | undefined;
+
   try {
     const parsed = JSON.parse(text) as {
       error?: { code?: string; message?: string; requestId?: string; details?: unknown };
     };
     const e = parsed.error;
-    if (e?.code || e?.message) {
-      let out = `Layers API ${status} ${e.code ?? ""}: ${e.message ?? ""}`.trim();
-      if (e.requestId) out += `\nrequestId: ${e.requestId}`;
-      if (e.details !== undefined && e.details !== null) {
-        out += `\ndetails: ${JSON.stringify(e.details, null, 2)}`;
-      }
-      return out;
-    }
+    code = typeof e?.code === "string" && SAFE_ERROR_CODE.test(e.code) ? e.code : undefined;
+    message =
+      status < 500 &&
+      typeof e?.message === "string" &&
+      e.message.trim().length > 0 &&
+      e.message.length <= MAX_ERROR_MESSAGE_LENGTH
+        ? e.message.trim()
+        : undefined;
+    requestId =
+      typeof e?.requestId === "string" && SAFE_REQUEST_ID.test(e.requestId)
+        ? e.requestId
+        : undefined;
   } catch {
-    // not the JSON envelope — fall through to raw text
+    // Non-contract responses are never copied into the agent transcript.
   }
-  return `Layers API ${status}: ${text}`;
+
+  const label = code ? ` ${code}` : "";
+  let out = `Layers API ${status}${label}: ${message ?? "Request failed."}`;
+  if (requestId) out += `\nrequestId: ${requestId}`;
+  return redactApiText(out, apiKey);
+}
+
+function redactApiText(text: string, apiKey: string): string {
+  return text
+    .split(apiKey)
+    .join("[redacted]")
+    .replace(/\bBearer\s+[^\s,;"'}\]]+/gi, "Bearer [redacted]")
+    .replace(
+      /((?:access|refresh|session)[\s_-]?(?:token|handle)\s*[:=]\s*)(?:"[^"]*"|'[^']*'|[^\s,;}]+)/gi,
+      "$1[redacted]",
+    );
 }

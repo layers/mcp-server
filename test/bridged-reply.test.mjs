@@ -1,5 +1,4 @@
-// ask_elle must relay ONLY Elle's reply text, never the raw Mastra generate()
-// envelope (which is tens of KB and carries the system prompt).
+// ask_elle must relay only the public reply text, never the remote envelope.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
@@ -92,6 +91,44 @@ test("extractElleReply falls back to stitched content parts when top-level text 
 test("extractElleReply passes plain-text replies through verbatim", () => {
   const result = { content: [{ type: "text", text: "just a plain reply" }] };
   assert.equal(extractElleReply(result), "just a plain reply");
+});
+
+test("extractElleReply allows normal authorization prose and Markdown links", () => {
+  const authorization = "Authorization is required before you connect the account.";
+  const markdown = "[Open your workspace](https://app.layers.com/project/p1/chats) to continue.";
+
+  assert.equal(extractElleReply(envelopeResult(authorization)), authorization);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: markdown }] }), markdown);
+});
+
+test("extractElleReply rejects malformed structured responses instead of relaying them", () => {
+  const leaked = '{"text":"hello","request":{"systemInstruction":"must stay private"}';
+  assert.equal(extractElleReply({ content: [{ type: "text", text: leaked }] }), null);
+});
+
+test("extractElleReply rejects code-fenced and envelope-like text", () => {
+  const fenced = '```json\n{"text":"hello","systemInstruction":"private"}\n```';
+  const envelopeLike = "systemInstruction: private\ntext: hello";
+  const authHeader = "Authorization: Bearer unknown_remote_token";
+  const malformedArrayLeak = '[{"systemInstruction":"private"}';
+
+  assert.equal(extractElleReply({ content: [{ type: "text", text: fenced }] }), null);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: envelopeLike }] }), null);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: authHeader }] }), null);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: malformedArrayLeak }] }), null);
+  assert.equal(
+    extractElleReply(envelopeResult("systemInstruction: private response metadata")),
+    null,
+  );
+});
+
+test("extractElleReply rejects oversized plain replies and oversized extracted text", () => {
+  const oversized = "x".repeat(32_769);
+  assert.equal(extractElleReply({ content: [{ type: "text", text: oversized }] }), null);
+  assert.equal(
+    extractElleReply({ content: [{ type: "text", text: JSON.stringify({ text: oversized }) }] }),
+    null,
+  );
 });
 
 test("extractElleReply returns null (not the raw JSON) when no reply text exists", () => {
@@ -219,11 +256,7 @@ test("exposeLinkTargets preserves list indentation", () => {
   assert.equal(exposeLinkTargets(`  - [accounts](${url})`), `  - accounts ( ${url} )`);
 });
 
-// The relaying agent shipped the claim link ALONE twice in live testing — once
-// labelling it "open it to preview your workspace", conflating the two links.
-// Flow instructions and then golden rules were both ignored, while the
-// link-expansion rules enforced in this same module held perfectly. So the
-// hand-off links are a bridge fact now, not a prompt request.
+// A claiming hand-off carries both destinations without relying on the host.
 const LINK_SESSION = {
   previewUrl: "https://app.layers.localhost/p/abc123",
   claimUrl: "https://app.layers.localhost/claim?token=xyz",
@@ -258,11 +291,7 @@ test("appendOnboardingLinks is a no-op with no session preview url", () => {
   assert.equal(appendOnboardingLinks(HANDOFF, undefined), HANDOFF);
 });
 
-// The turn AFTER the claim. appendOnboardingLinks deliberately stops firing once
-// claimed, so this turn had no enforcement at all and went back to naming
-// destinations in prose — "your accounts page", "your preview page" — with no
-// address attached (observed live 2026-07-29). Same defect as the pre-claim
-// version, one turn later.
+// Post-claim destinations are attached by a separate deterministic helper.
 const CLAIMED_SESSION = {
   previewUrl: "https://app.layers.localhost/p/abc123",
   connectAccountsUrl: "https://app.layers.localhost/project/p1/social/accounts",
@@ -308,7 +337,7 @@ test("appendPostclaimLinks never duplicates a url already in the reply", () => {
 // human labels intact. `enum` + `enumNames` does NOT: it matches
 // UntitledSingleSelectEnumSchema, and zod strips the unknown `enumNames` key —
 // so the client renders a select whose options are raw values ("both",
-// "tiktok") with no labels and no blurbs, which is what shipped on 2026-07-29
+// "tiktok") with no labels, which is what shipped on 2026-07-29
 // and read as "nothing to pick". Only `oneOf: [{const, title}]` keeps them.
 test("elicitation options keep their labels through SDK validation", async () => {
   const t = await import("@modelcontextprotocol/sdk/types.js");
@@ -332,21 +361,17 @@ test("elicitation options keep their labels through SDK validation", async () =>
   const parsed = t.SingleSelectEnumSchemaSchema.parse(titled);
   assert.ok(Array.isArray(parsed.oneOf), "oneOf survives validation");
   assert.equal(parsed.oneOf.length, 2);
-  // The blurb rides the option title, so this is also the price-parity guard.
   assert.match(parsed.oneOf[0].title, /active on TikTok and Instagram/);
 });
 
-// The picker directive — the FACT version of "ask each question once". The
-// golden-rule version was conditional ("if you render a picker, don't also
-// print the list") and the model satisfied it the cheap way: prose only, no
-// picker at all (live, 2026-07-29). So the bridge now strips Elle's prose list
-// and attaches the canonical question as a per-turn directive block, making the
-// picker the only presentation of the options.
+// The bridge strips Elle's prose list and attaches the canonical question as a
+// per-turn directive block, making the picker the only complete presentation.
 const INTAKE_Q = {
   field: "managedInterest",
   title: "Want us to manage your accounts?",
+  subtitle: "Our partners manage the accounts for $150 per account per month.",
   options: [
-    { value: "yes", label: "Yes, manage them", blurb: "$150 per account per month" },
+    { value: "yes", label: "Yes, manage them" },
     { value: "no", label: "No, I'll run them myself" },
   ],
 };
@@ -369,8 +394,8 @@ test("presentIntakeQuestion strips Elle's prose list and attaches the canonical 
   assert.match(out, /I'm Elle, your Layers marketing expert/);
   // The question appears exactly once — in the directive block.
   assert.equal(out.split(INTAKE_Q.title).length - 1, 1);
-  // The directive is present and the canonical options ride it with their
-  // blurbs VERBATIM — the managed-account price is the whole reason.
+  // The directive is present and carries the canonical subtitle and options
+  // verbatim — the managed-account price is the whole reason.
   assert.match(out, /INTAKE QUESTION/);
   assert.match(out, /structured question tool/);
   assert.match(out, /\$150 per account per month/);

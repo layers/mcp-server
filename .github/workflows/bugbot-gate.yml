@@ -53,8 +53,7 @@ permissions:
 
 # NO concurrency block — deliberately. Cancelling a superseded run leaves a
 # CANCELLED check run of the REQUIRED context on the head, and the rules
-# engine holds the PR BLOCKED on it even when a newer run is green (observed
-# on #3101: 9+ min BLOCKED beside a passing latest run). Duplicate runs are
+# engine can hold the PR blocked beside a passing latest run. Duplicate runs are
 # cheap — evaluation is instant once Bugbot has attested — and every run
 # completing with a verdict beats one green run beside a poisoned ✗.
 
@@ -350,8 +349,8 @@ jobs:
             # /review-bugbot" — instead of a review object or a fresh
             # check-run, and its dedup then refuses `bugbot run` re-reviews
             # of the same patch. Without this branch that path deadlocks the
-            # gate (proven live on PR #4036, 2026-08-07: empty-commit head
-            # refreshes don't help either, since the patch id is unchanged).
+            # gate; empty-commit head refreshes do not help because the patch id
+            # is unchanged.
             # Accept the credit only when the comment is cursor[bot]-authored,
             # carries the marker, and was posted AFTER the head commit —
             # "current version" is Cursor's own head binding, and the
@@ -479,4 +478,3 @@ jobs:
             printf -- '- %s\n' "${passed[@]}"
           } >> "$GITHUB_STEP_SUMMARY"
           printf 'Bugbot Gate passed: %s\n' "${passed[*]}"
-

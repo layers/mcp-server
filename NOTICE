@@ -2,3 +2,7 @@ Layers MCP Server
 Copyright 2026 Layers AI, Inc.
 
 This product includes software developed by Layers AI, Inc.
+
+The initial MCP server setup was adapted from Supabase MCP
+(https://github.com/supabase/mcp), Copyright 2025 Supabase,
+licensed under the Apache License, Version 2.0.
