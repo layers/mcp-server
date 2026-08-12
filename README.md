@@ -88,6 +88,12 @@ tools remain available in keyless mode.
 `onboard_start` · `get_onboarding_status` · `onboard_claim_begin` ·
 `onboard_claim_verify` · `ask_elle`
 
+In a code workspace, `onboard_start` can reserve a protocol-v1 trial without a
+URL. That response is honestly limited to `awaiting_evidence`; the opaque
+reservation capability stays inside the server process. The source collector
+and evidence-submission step are not part of this package slice yet. Passing an
+explicit public product URL keeps the existing preview and claim flow working.
+
 ### Workspace API tools (52)
 
 ### Core

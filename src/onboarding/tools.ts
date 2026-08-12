@@ -12,6 +12,7 @@ import {
   rememberSession,
   rememberSessionClaim,
   rememberSessionLinks,
+  rememberReservation,
   rememberWorkspaceKey,
 } from "./session.js";
 import {
@@ -21,6 +22,7 @@ import {
 } from "./public-responses.js";
 
 const POW_ATTEMPT_LIMIT = 2 ** 26;
+const ONBOARDING_PROTOCOL_VERSION = 1 as const;
 const ONBOARD_START_SUPPORT_CODE = "ONBOARD_START_INTERNAL";
 const SAFE_ONBOARD_START_REQUEST_ID =
   /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|req_[A-Za-z0-9_-]{1,96})$/i;
@@ -30,7 +32,7 @@ interface ChallengeResponse {
   difficulty: number;
 }
 
-interface StartResponse {
+interface UrlStartResponse {
   trialHandle: string;
   previewUrl: string;
   claimUrl: string;
@@ -42,12 +44,31 @@ interface StartResponse {
   sessionHandle: string;
 }
 
-export interface OnboardStartResult {
+const evidenceStartResponseSchema = z
+  .object({
+    protocolVersion: z.literal(ONBOARDING_PROTOCOL_VERSION),
+    trialHandle: z.string().min(1),
+    reservationCapability: z.string().min(1).max(512),
+    expiresAt: z.string().datetime({ offset: true }),
+    state: z.literal("awaiting_evidence"),
+  })
+  .strict();
+
+export interface OnboardUrlStartResult {
   trialHandle: string;
   previewUrl: string;
   claimUrl: string;
   expiresAt: string;
 }
+
+export interface OnboardEvidenceStartResult {
+  protocolVersion: typeof ONBOARDING_PROTOCOL_VERSION;
+  trialHandle: string;
+  expiresAt: string;
+  state: "awaiting_evidence";
+}
+
+export type OnboardStartResult = OnboardUrlStartResult | OnboardEvidenceStartResult;
 
 const endpoint = (baseUrl: string, path: string): URL => new URL(path, baseUrl);
 
@@ -140,7 +161,7 @@ function countLeadingZeroBits(digest: Uint8Array): number {
 
 function solveProofOfWork(nonce: string, difficulty: number): string {
   if (!Number.isInteger(difficulty) || difficulty <= 0) {
-    throw new Error("invalid proof-of-work challenge");
+    throw new Error("Onboarding admission challenge was invalid");
   }
 
   for (let counter = 0; counter < POW_ATTEMPT_LIMIT; counter += 1) {
@@ -148,7 +169,7 @@ function solveProofOfWork(nonce: string, difficulty: number): string {
     const digest = createHash("sha256").update(nonce + solution, "utf8").digest();
     if (countLeadingZeroBits(digest) >= difficulty) return solution;
   }
-  throw new Error("proof-of-work too hard");
+  throw new Error("Onboarding admission could not be completed");
 }
 
 async function responseText(response: Response): Promise<string> {
@@ -213,7 +234,7 @@ function retryAfterText(response: Response): string {
 
 async function postStartWithTransportRetry(
   baseUrl: string,
-  body: Record<string, string>,
+  body: Record<string, string | number>,
 ): Promise<Response> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -230,7 +251,10 @@ async function postStartWithTransportRetry(
   throw new Error(redact(`Onboarding start request failed: ${errorMessage(lastError)}`));
 }
 
-export async function startOnboarding(baseUrl: string, url: string): Promise<OnboardStartResult> {
+export async function startOnboarding(
+  baseUrl: string,
+  url?: string,
+): Promise<OnboardStartResult> {
   let challengeResponse: Response;
   try {
     challengeResponse = await fetch(endpoint(baseUrl, "/api/onboard/agent/challenge"));
@@ -244,7 +268,7 @@ export async function startOnboarding(baseUrl: string, url: string): Promise<Onb
 
   const startRequestId = randomUUID();
   const startResponse = await postStartWithTransportRetry(baseUrl, {
-    url,
+    ...(url === undefined ? { protocolVersion: ONBOARDING_PROTOCOL_VERSION } : { url }),
     startRequestId,
     powNonce: challenge.nonce,
     powSolution: solveProofOfWork(challenge.nonce, challenge.difficulty),
@@ -267,7 +291,44 @@ export async function startOnboarding(baseUrl: string, url: string): Promise<Onb
     );
   }
 
-  const body = parseJson<StartResponse>(startText, "Onboarding start");
+  const untrustedBody = parseJson<unknown>(startText, "Onboarding start");
+  const record = asRecord(untrustedBody);
+  const isEvidenceResponse =
+    record !== null &&
+    ("protocolVersion" in record ||
+      "reservationCapability" in record ||
+      record.state === "awaiting_evidence");
+
+  if (isEvidenceResponse) {
+    const parsedBody = evidenceStartResponseSchema.safeParse(untrustedBody);
+    if (url !== undefined || !parsedBody.success) {
+      throw new Error("Onboarding start returned an invalid evidence reservation response");
+    }
+    const body = parsedBody.data;
+
+    rememberReservation({
+      protocolVersion: body.protocolVersion,
+      trialHandle: body.trialHandle,
+      reservationCapability: body.reservationCapability,
+      expiresAt: body.expiresAt,
+      state: body.state,
+    });
+
+    // The reservation capability is process-only. The later evidence tool will
+    // consume it from memory; the host agent only needs the public state.
+    return {
+      protocolVersion: body.protocolVersion,
+      trialHandle: body.trialHandle,
+      expiresAt: body.expiresAt,
+      state: body.state,
+    };
+  }
+
+  if (url === undefined) {
+    throw new Error("Onboarding start returned an invalid evidence reservation response");
+  }
+
+  const body = untrustedBody as Partial<UrlStartResponse>;
   if (
     typeof body.trialHandle !== "string" ||
     typeof body.previewUrl !== "string" ||
@@ -431,13 +492,14 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
       title: "Start Layers onboarding",
       annotations: WRITE,
       description:
-        "Start a keyless Layers workspace trial from a website or Apple App Store URL after solving the server proof-of-work challenge. Only those two link types are supported. Ask the human for their URL first, warmly and with examples (a website like yourbrand.com, or an Apple App Store link) — NEVER guess, default, or infer it (never use layers.ai/layers.com, your own domain, or an example URL).",
+        "Reserve a keyless Layers trial. When the host is already in a code workspace, call this with no URL; it returns awaiting_evidence and does not itself collect or send source. Outside a code workspace, ask once for the human's public product URL and pass it for compatibility. Never guess or substitute a URL. Transport admission work is handled internally.",
       inputSchema: {
         url: z
           .string()
           .url()
+          .optional()
           .describe(
-            "The human's own website or Apple App Store URL. Ask for it; never guess or default it.",
+            "Optional public product URL. Omit it in a code workspace; outside one, ask once and never guess or default it.",
           ),
       },
     },

@@ -13,6 +13,7 @@ const REFRESHED_ACCESS_TOKEN_A = "access_token_stale_refresh_secret_a";
 const TRIAL_HANDLE = "trial_test_123";
 const TRIAL_HANDLE_B = "trial_test_456";
 const CLAIM_TOKEN = "claim_test_456";
+const RESERVATION_CAPABILITY = "reservation_capability_live_secret_123";
 const PREVIEW_URL = "https://layers.test/p/preview_test_123";
 const CLAIM_URL = `https://layers.test/claim?token=${CLAIM_TOKEN}`;
 const EXPIRES_AT = "2026-07-22T12:00:00.000Z";
@@ -24,6 +25,14 @@ const START_RESPONSE = {
   expiresAt: EXPIRES_AT,
   session: { access_token: ACCESS_TOKEN, expires_in: 3600 },
   sessionHandle: SESSION_HANDLE,
+};
+
+const EVIDENCE_START_RESPONSE = {
+  protocolVersion: 1,
+  trialHandle: TRIAL_HANDLE,
+  reservationCapability: RESERVATION_CAPABILITY,
+  expiresAt: EXPIRES_AT,
+  state: "awaiting_evidence",
 };
 
 const STATUS_RESPONSE = {
@@ -135,6 +144,16 @@ test("keyless mode registers the onboarding tools AND the claimable workspace to
     assert.match(client.getInstructions(), /stateless/i);
     assert.match(client.getInstructions(), /six-digit code/i);
     assert.match(client.getInstructions(), /never invent/i);
+    assert.match(client.getInstructions(), /call onboard_start with no URL/i);
+    assert.match(client.getInstructions(), /only a reservation/i);
+
+    const startTool = tools.find((tool) => tool.name === "onboard_start");
+    assert.ok(startTool, "onboard_start must be registered");
+    assert.deepEqual(
+      startTool.inputSchema.required ?? [],
+      [],
+      "a code-workspace reservation must not require a URL",
+    );
   } finally {
     await client.close();
   }
@@ -202,6 +221,41 @@ test("onboard_start validates PoW and keeps session credentials out of its resul
           assert.equal(validPow(submitted, 8), true, "mock API must re-validate the PoW solution");
           assert.match(submitted.startRequestId, /^[0-9a-f-]{36}$/i);
           return { status: 202, json: START_RESPONSE };
+        },
+      }),
+    },
+  );
+});
+
+test("onboard_start reserves without a URL and keeps the reservation capability internal", async () => {
+  let submitted;
+
+  await withMockApi(
+    async (client) => {
+      const result = await callTool(client, "onboard_start", {});
+      assert.equal(result.isError, false, result.text);
+      assert.deepEqual(JSON.parse(result.text), {
+        protocolVersion: 1,
+        trialHandle: TRIAL_HANDLE,
+        expiresAt: EXPIRES_AT,
+        state: "awaiting_evidence",
+      });
+      assert.doesNotMatch(result.text, new RegExp(RESERVATION_CAPABILITY));
+      assert.doesNotMatch(result.text, /reservationCapability/);
+
+      assert.ok(submitted);
+      assert.equal("url" in submitted, false, "URL-free reservation must omit url");
+      assert.equal(submitted.protocolVersion, 1);
+      assert.equal(submitted.powNonce, "test_nonce");
+      assert.equal(validPow(submitted, 8), true, "mock API must re-validate the PoW solution");
+      assert.match(submitted.startRequestId, /^[0-9a-f-]{36}$/i);
+    },
+    {
+      apiKey: null,
+      handler: onboardingHandler({
+        "/api/onboard/agent/start": (_req, captured) => {
+          submitted = JSON.parse(captured.body);
+          return { status: 202, json: EVIDENCE_START_RESPONSE };
         },
       }),
     },

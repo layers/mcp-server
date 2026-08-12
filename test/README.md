@@ -10,7 +10,7 @@ Run with Node's built-in test runner (no test-framework dependency):
 npm test
 ```
 
-`pretest` builds first, then `node --test test/*.test.mjs` runs six suites.
+`pretest` builds first, then `node --test test/*.test.mjs` runs nine suites.
 The protocol-facing suites spawn the built server and drive it over stdio; the
 contract/onboarding suites also point it at a throwaway `127.0.0.1` mock. The
 bridge suite injects mock MCP clients and transports, so **no API key and no
@@ -32,12 +32,22 @@ outbound network are needed**. This is what CI runs.
   right MCP annotation hints: `readOnlyHint` on the 25 reads, `destructiveHint`
   on delete/archive/cancel, `idempotentHint` on PATCH/set-style writes.
 - **[`onboarding.test.mjs`](onboarding.test.mjs)** — keyless native onboarding,
-  session refresh/redaction, claim contracts, the cold-start CLI, all five
-  onboarding tool registrations plus the claimable workspace tool surface, and
-  graceful pre-session bridge failures.
+  URL-free and explicit-URL start request contracts, session
+  refresh/redaction, claim contracts, the cold-start CLI, all five onboarding
+  tool registrations plus the claimable workspace tool surface, and graceful
+  pre-session bridge failures.
+- **[`reservation.test.mjs`](reservation.test.mjs)** — direct protocol-v1
+  reservation state, including process-only capability retention, public result
+  projection, and redaction.
 - **[`bridge.test.mjs`](bridge.test.mjs)** — the Elle tool-name mappings,
   Streamable HTTP URL/auth construction, 401 refresh with a new token,
   bounded reconnects, and remote result/error redaction.
+- **[`bridged-reply.test.mjs`](bridged-reply.test.mjs)** — public Elle reply
+  projection, visible URL handling, onboarding/post-claim link attachment, and
+  canonical intake-question presentation.
+- **[`postclaim-routing.test.mjs`](postclaim-routing.test.mjs)** — claim-state
+  convergence, same-account routing, browser handoff, workspace-key retention,
+  and bounded full-Elle refresh/retry behavior.
 
 The tests assert literal counts (52 / 25 / 27) on purpose — adding or removing a
 tool fails the suite until the count is updated deliberately.
