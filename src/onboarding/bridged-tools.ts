@@ -19,19 +19,20 @@ const ASK_ELLE_FALLBACK =
   "Sorry — I didn't quite catch that. Could you say it once more?";
 const BROWSER_CONTINUITY_HANDOFF =
   "You're all set here. Log into your Layers workspace in the browser to keep going; I'll surface any workspace, preview, or account links I already have when they're useful.";
+const MAX_ELLE_ENVELOPE_BYTES = 1_048_576;
+const MAX_ELLE_REPLY_BYTES = 32_768;
+const ENVELOPE_MARKER =
+  /(?:systemInstruction|inputTokens|outputTokens|toolCalls|refresh[_-]?token|access[_-]?token|session[_-]?handle|\bAuthorization\b|\bBearer\s+)/i;
 
 /**
- * Elle's onboarding guide is hosted as an MCP agent-as-tool, so
- * `ask_onboardingGuide` returns Mastra's ENTIRE `generate()` envelope — every
- * step, the full system prompt, token usage, and raw request bodies — JSON
- * stringified into a single text block (tens of KB). Relaying that to the
- * driver is doubly bad: it blows the tool-result size limit (the driver spills
- * it to a file and shell-executes to parse it, surfacing a scary approval
- * prompt to the human) and it leaks Elle's system prompt into the transcript.
+ * The remote guide returns a JSON envelope whose public reply is the top-level
+ * `text` field. The rest of that envelope is service metadata and must never
+ * enter the host-agent transcript.
  *
  * The human only ever needs Elle's reply — the envelope's top-level `text`.
- * Pull just that out; on anything unexpected return null so the caller shows a
- * safe fallback rather than dumping the envelope.
+ * Pull just that out. A bounded plain-text reply remains supported for a server
+ * that deliberately returns prose, but structured, code-fenced, oversized, or
+ * envelope-like text fails closed.
  */
 export function extractElleReply(result: CallToolResult): string | null {
   const parts = Array.isArray(result.content) ? result.content : [];
@@ -40,17 +41,21 @@ export function extractElleReply(result: CallToolResult): string | null {
     const trimmed = part.text.trim();
     if (!trimmed) continue;
 
+    const bytes = Buffer.byteLength(part.text, "utf8");
+    if (bytes > MAX_ELLE_ENVELOPE_BYTES || trimmed.startsWith("```")) continue;
+
     if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
       try {
         const reply = readEnvelopeText(JSON.parse(trimmed));
         if (reply) return reply;
-        // Parsed as the envelope but no reply text — never fall back to the raw
-        // JSON, that is exactly the dump we are removing.
         continue;
       } catch {
-        // Not actually JSON; treat it as a plain-text reply.
+        // A structured-looking response that is not valid JSON is not prose.
+        continue;
       }
     }
+
+    if (bytes > MAX_ELLE_REPLY_BYTES || ENVELOPE_MARKER.test(trimmed)) continue;
     return part.text;
   }
   return null;
@@ -62,8 +67,8 @@ export function extractElleReply(result: CallToolResult): string | null {
  * Over MCP the reply renders in an external chat client with no site to
  * resolve relative paths against — a relative link is dead. Elle is prompted
  * to emit absolute URLs, but thread-memory mimicry of her earlier web-surface
- * replies keeps re-introducing root-relative and project-relative forms
- * (observed live 2026-07-22), so the bridge enforces them deterministically.
+ * replies can re-introduce root-relative and project-relative forms, so the
+ * bridge enforces them deterministically.
  * Root-relative links resolve against the session origin. Project-relative
  * links resolve only when the workspace URL exposes `/project/<id>`.
  */
@@ -91,9 +96,8 @@ export function absolutizeAppLinks(
 /**
  * Unwrap markdown links so the URL is visible text.
  *
- * The founder's terminal click-through (2026-07-22) showed why: the client
- * rendered `[Connect your accounts](https://…)` as colored-but-dead text — MCP
- * clients are plain-text surfaces with no guarantee of clickable links, so a
+ * Some clients render `[Connect your accounts](https://…)` as colored-but-dead
+ * text. MCP clients are plain-text surfaces with no guarantee of clickable links, so a
  * URL hidden behind link text is a button that cannot be pressed. Like
  * absolutizing above, this is enforced deterministically rather than by
  * prompt: `[text](https://url)` becomes `text (https://url)`, and a link whose
@@ -167,9 +171,9 @@ function isProjectRelativeTarget(target: string): boolean {
 }
 
 function readEnvelopeText(envelope: unknown): string | null {
-  if (!envelope || typeof envelope !== "object") return null;
+  if (!envelope || typeof envelope !== "object" || Array.isArray(envelope)) return null;
   const record = envelope as { text?: unknown; content?: unknown };
-  if (typeof record.text === "string" && record.text.trim()) return record.text;
+  if (typeof record.text === "string" && isBoundedReply(record.text)) return record.text;
   // Fallback: stitch assistant text parts if the aggregate `text` is empty.
   if (Array.isArray(record.content)) {
     const joined = record.content
@@ -183,22 +187,24 @@ function readEnvelopeText(envelope: unknown): string | null {
       .map((p) => p.text)
       .join("")
       .trim();
-    if (joined) return joined;
+    if (isBoundedReply(joined)) return joined;
   }
   return null;
+}
+
+function isBoundedReply(reply: string): boolean {
+  return (
+    reply.trim().length > 0 &&
+    Buffer.byteLength(reply, "utf8") <= MAX_ELLE_REPLY_BYTES &&
+    !ENVELOPE_MARKER.test(reply)
+  );
 }
 
 /**
  * Attach the onboarding links to the hand-off turn, deterministically.
  *
- * Elle is forbidden from writing URLs (she has none and would fabricate them),
- * so the relaying agent is supposed to supply them. Twice in live testing it
- * did not: it sent the claim link alone, once even labelling it "open it to
- * preview your workspace" — conflating the two. Instructions were added to the
- * flow, then promoted to golden rules; both were ignored. Meanwhile the
- * link-expansion rules enforced HERE held perfectly in the same runs. That is
- * the whole lesson: on the relay path, a rule the bridge applies is a fact and
- * a rule the prompt asks for is a preference.
+ * Elle is forbidden from constructing URLs, so the bridge attaches the known
+ * preview and claim destinations deterministically.
  *
  * Fires only on the hand-off turn — pre-claim, preview known, and Elle inviting
  * them to claim (which the guide's prompt makes her do exactly once, at
@@ -223,15 +229,8 @@ export function appendOnboardingLinks(
 /**
  * Attach the POST-claim destinations, deterministically.
  *
- * `appendOnboardingLinks` covers the hand-off turn and then stops firing the
- * moment a claim lands — so the very next turn, where Elle points at "your
- * accounts page" and "your preview page", went back to naming destinations in
- * prose with no address attached (observed live 2026-07-29). Same failure as
- * before, one turn later: a page the human is told to visit but cannot reach.
- *
- * The lesson from the pre-claim version applies unchanged — on the relay path a
- * rule the bridge APPLIES is a fact and a rule the prompt asks for is a
- * preference — so both links are enforced here rather than requested upstream.
+ * `appendOnboardingLinks` covers the pre-claim hand-off. This companion handles
+ * the post-claim preview and account destinations.
  *
  * Fires only when the reply actually raises the subject, so a turn about
  * something else does not collect a footer of links. Never duplicates a url the
@@ -278,11 +277,8 @@ export function appendPostclaimLinks(
  * Make sure the post-claim destinations are KNOWN before we try to attach them.
  *
  * `connectAccountsUrl` does not exist until the status route has seen a claimed
- * trial with a bound project — it is gated on exactly that. `previewUrl` has
- * been in the session since onboard_start, which is why the preview link
- * attached on the first post-claim turn and the connect link did not (observed
- * live 2026-07-29): the bridge had nothing to attach and correctly refused to
- * invent a URL.
+ * trial with a bound project. `previewUrl` is available from onboard_start;
+ * `connectAccountsUrl` is resolved only after project binding.
  *
  * So refresh once, on the first post-claim turn that still lacks it. Bounded by
  * the `connectAccountsUrl` check, so this is a single extra call across the whole
@@ -329,11 +325,7 @@ async function fetchPendingIntakeQuestion(baseUrl: string): Promise<IntakeQuesti
  * Recompose an intake turn so the PICKER is the only presentation of the
  * options.
  *
- * The first attempt at this was a golden rule — "if you render a picker, don't
- * also print the list" — and it failed exactly the way every prompt-only rule
- * in this flow has failed: the model took the cheap path and relayed prose with
- * no picker at all (live, 2026-07-29). A conditional rule is a preference. This
- * is the fact version: Elle's numbered list is STRIPPED from the relayed text,
+ * Elle's numbered list is stripped from the relayed text,
  * and the question rides a per-turn directive block carrying the canonical
  * title and options, so rendering the picker is the only way to present what
  * the reply no longer contains as prose.
@@ -417,7 +409,7 @@ async function elicitIntakeAnswer(
     const result = await server.server.elicitInput({
       // The question itself is the prompt header. The FIELD gets a short label —
       // repeating the question there renders it twice, once as the header and
-      // again beside the input (observed live 2026-07-29).
+      // again beside the input.
       message: question.title,
       requestedSchema: {
         type: "object",
@@ -430,7 +422,7 @@ async function elicitIntakeAnswer(
             // SDK marks for removal and, decisively, leaves OUT of the
             // SingleSelectEnumSchema union. A client validating against that
             // union does not see a select at all — it renders an unset scalar
-            // with only Accept/Decline and no way to choose (observed live).
+            // with only Accept/Decline and no way to choose.
             oneOf: question.options.map((o) => ({
               const: o.value,
               // The blurb rides the option title. A surface may render a

@@ -147,15 +147,15 @@ test("routes each tool to its documented method and path", async () => {
   });
 });
 
-test("renders the API error envelope as an isError result without leaking the key", async () => {
+test("renders only approved API error fields without leaking details or the key", async () => {
   const handler = () => ({
     status: 404,
     json: {
       error: {
         code: "NOT_FOUND",
-        message: "Project not found.",
+        message: "Project not found for lp_test_x.",
         requestId: "req_test123",
-        details: { projectId: "prj_x" },
+        details: { projectId: "prj_x", internalTrace: "trace_private" },
       },
     },
   });
@@ -167,7 +167,67 @@ test("renders the API error envelope as an isError result without leaking the ke
       assert.match(r.text, /NOT_FOUND/);
       assert.match(r.text, /req_test123/);
       assert.doesNotMatch(r.text, /lp_test_x/, "the bearer token must never appear in output");
+      assert.match(r.text, /\[redacted\]/);
+      assert.doesNotMatch(r.text, /details|projectId|prj_x|internalTrace|trace_private/);
     },
     { handler },
+  );
+});
+
+test("replaces 5xx messages and non-contract bodies with a generic error", async () => {
+  const bodies = [
+    {
+      status: 500,
+      json: {
+        error: {
+          code: "INTERNAL",
+          message: "database host and stack trace must stay private",
+          requestId: "req_server500",
+          details: { stack: "private stack" },
+        },
+      },
+    },
+    { status: 502, text: "upstream token=private and internal hostname" },
+  ];
+
+  await withMockApi(
+    async (client) => {
+      const serverError = await callTool(client, "list_projects");
+      assert.equal(serverError.isError, true);
+      assert.match(serverError.text, /Layers API 500 INTERNAL: Request failed\./);
+      assert.match(serverError.text, /requestId: req_server500/);
+      assert.doesNotMatch(serverError.text, /database|stack trace|private stack/);
+
+      const invalidEnvelope = await callTool(client, "list_projects");
+      assert.equal(invalidEnvelope.isError, true);
+      assert.equal(invalidEnvelope.text, "Layers API 502: Request failed.");
+      assert.doesNotMatch(invalidEnvelope.text, /upstream|token|hostname/);
+    },
+    {
+      handler: () => bodies.shift(),
+    },
+  );
+});
+
+test("drops malformed request ids rather than allowing multiline error injection", async () => {
+  await withMockApi(
+    async (client) => {
+      const result = await callTool(client, "list_projects");
+      assert.equal(result.isError, true);
+      assert.match(result.text, /Layers API 422 VALIDATION: Invalid request\./);
+      assert.doesNotMatch(result.text, /forged|requestId/);
+    },
+    {
+      handler: () => ({
+        status: 422,
+        json: {
+          error: {
+            code: "VALIDATION",
+            message: "Invalid request.",
+            requestId: "req_valid\nforged: value",
+          },
+        },
+      }),
+    },
   );
 });

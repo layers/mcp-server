@@ -14,6 +14,11 @@ import {
   rememberSessionLinks,
   rememberWorkspaceKey,
 } from "./session.js";
+import {
+  sanitizeClaimBegin,
+  sanitizeClaimVerify,
+  sanitizeOnboardingStatus,
+} from "./public-responses.js";
 
 const POW_ATTEMPT_LIMIT = 2 ** 26;
 const ONBOARD_START_SUPPORT_CODE = "ONBOARD_START_INTERNAL";
@@ -86,10 +91,7 @@ function rememberStatusMetadata(body: unknown): void {
 function rememberVerifiedClaim(body: unknown): void {
   const record = asRecord(body);
   if (record && isClaimContinuity(record.continuity)) {
-    // The verify response also carries organizationId — the org the workspace
-    // was claimed INTO. It used to be dropped on the floor, which is how a
-    // claimed user ended up unable to explain why the `layers` partner MCP
-    // could not see their brand-new project (it is keyed to a different org).
+    // Retain the claimed organization identity for post-claim routing.
     const organizationId =
       typeof record.organizationId === "string" && record.organizationId.length > 0
         ? record.organizationId
@@ -113,23 +115,9 @@ function rememberVerifiedClaim(body: unknown): void {
  *
  * The raw API response also carries plumbing and credentials — organizationId,
  * a Supabase session (access + refresh tokens for the claimed user), and the
- * minted workspace key. All of it is captured into process state by
- * rememberVerifiedClaim BEFORE this runs, and none of it belongs in the agent
- * transcript: the org id was being displayed to the human verbatim (live,
- * 2026-07-29), and the session tokens were only unreadable by luck of what the
- * model chose to quote. redact() covers the workspace key's secret; this stops
- * the rest at the source instead of trusting the relay's taste.
+ * minted workspace key. Process-only fields are captured before the response
+ * is projected through the explicit public contract.
  */
-function sanitizeClaimVerifyResult(body: unknown): unknown {
-  const record = asRecord(body);
-  if (!record) return body;
-  return {
-    status: record.status,
-    continuity: record.continuity,
-    ...(record.postclaimAssets !== undefined ? { postclaimAssets: record.postclaimAssets } : {}),
-  };
-}
-
 async function runTool(operation: () => Promise<unknown>): Promise<ToolResult> {
   try {
     return resultOk(await operation());
@@ -328,7 +316,9 @@ export async function getOnboardingStatus(baseUrl: string, trialHandle?: string)
     baseUrl,
     `/api/onboard/agent/trials/${encodeURIComponent(handle)}`,
   );
-  const body = await parseSuccess<unknown>(response, "Onboarding status");
+  const body = sanitizeOnboardingStatus(
+    await parseSuccess<unknown>(response, "Onboarding status"),
+  );
   rememberStatusMetadata(body);
   await ensureWorkspaceKey(baseUrl, handle, body);
   return body;
@@ -403,7 +393,7 @@ async function beginClaim(baseUrl: string, email: string, claimToken?: string): 
     await response.body?.cancel();
     throw new Error(`Onboarding claim is rate limited.${retryAfterText(response)}`);
   }
-  return parseSuccess<unknown>(response, "Onboarding claim begin");
+  return sanitizeClaimBegin(await parseSuccess<unknown>(response, "Onboarding claim begin"));
 }
 
 async function verifyClaim(
@@ -429,7 +419,7 @@ async function verifyClaim(
   // Capture FIRST (org id + workspace key into process state), then strip the
   // plumbing and credentials out of what the agent gets to see.
   rememberVerifiedClaim(body);
-  return sanitizeClaimVerifyResult(body);
+  return sanitizeClaimVerify(body);
 }
 
 export function registerOnboardingTools(server: McpServer, baseUrl: string): void {

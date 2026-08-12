@@ -35,7 +35,41 @@ const STATUS_RESPONSE = {
   claimUrl: CLAIM_URL,
   claimed: false,
   continuity: "browser",
+  brandPreview: {
+    appName: "Example",
+    appDescription: "A public product description.",
+    tagline: null,
+    iconUrl: null,
+    screenshots: [],
+    brandVoice: null,
+    primaryLanguage: "en",
+  },
   plan: { state: "ready", teaser: "A reveal-gated plan teaser" },
+  intake: {
+    docks: [
+      {
+        group: "baseline",
+        questions: [
+          {
+            field: "triedChannels",
+            group: "baseline",
+            select: "multiple",
+            title: "What have you tried?",
+            options: [{ value: "social", label: "Social" }],
+          },
+        ],
+      },
+    ],
+    remaining: [
+      {
+        field: "triedChannels",
+        group: "baseline",
+        select: "multiple",
+        title: "What have you tried?",
+        options: [{ value: "social", label: "Social" }],
+      },
+    ],
+  },
 };
 
 function countLeadingZeroBits(digest) {
@@ -181,7 +215,15 @@ test("status attaches bearer auth, refreshes once on 401, and retries with the n
 
       const result = await callTool(client, "get_onboarding_status");
       assert.equal(result.isError, false, result.text);
-      assert.deepEqual(JSON.parse(result.text), STATUS_RESPONSE, "status body must pass through verbatim");
+      assert.deepEqual(
+        JSON.parse(result.text),
+        STATUS_RESPONSE,
+        "status must contain only the explicit public projection",
+      );
+      assert.doesNotMatch(
+        result.text,
+        /internalDebug|sessionHandle|internalRunId|run_private|internalPrompt|prompt_private|internalSelector|selector_private/,
+      );
 
       const statuses = requests.filter(
         (request) => parseUrl(request).pathname === `/api/onboard/agent/trials/${TRIAL_HANDLE}`,
@@ -203,7 +245,30 @@ test("status attaches bearer auth, refreshes once on 401, and retries with the n
           statusCalls += 1;
           return statusCalls === 1
             ? { status: 401, json: { error: "expired" } }
-            : { status: 200, json: STATUS_RESPONSE };
+            : {
+                status: 200,
+                json: {
+                  ...STATUS_RESPONSE,
+                  internalDebug: { sessionHandle: "must-not-cross-the-public-contract" },
+                  plan: {
+                    ...STATUS_RESPONSE.plan,
+                    internalRunId: "run_private",
+                  },
+                  brandPreview: {
+                    ...STATUS_RESPONSE.brandPreview,
+                    internalPrompt: "prompt_private",
+                  },
+                  intake: {
+                    ...STATUS_RESPONSE.intake,
+                    docks: [
+                      {
+                        ...STATUS_RESPONSE.intake.docks[0],
+                        internalSelector: "selector_private",
+                      },
+                    ],
+                  },
+                },
+              };
         },
         "/api/onboard/agent/refresh": () => ({
           status: 200,
@@ -222,16 +287,16 @@ test("claim begin and verify mirror public tokenless contracts", async () => {
     message:
       "Your influencer, first video, and keyword research are generating. They can take a few minutes and will appear on your preview page when ready.",
   };
-  // What the API actually sends: conversation payload PLUS plumbing and
-  // credentials — the org id, the claimed user's Supabase session, and the
-  // minted workspace key. The tool result must carry ONLY the first part:
-  // the org id was displayed to the human verbatim (live, 2026-07-29), and
-  // the session tokens were one model-whim away from the transcript.
+  // The API response includes process-only claim state. The tool result must
+  // carry only the public claim projection.
   const verifyResponse = {
     status: "claimed",
     organizationId: "org_test_123",
     continuity: "browser",
-    postclaimAssets,
+    postclaimAssets: {
+      ...postclaimAssets,
+      internalAssetKey: "asset_private",
+    },
     session: {
       access_token: "claimed-user-access-token",
       refresh_token: "claimed-user-refresh-token",
@@ -259,6 +324,7 @@ test("claim begin and verify mirror public tokenless contracts", async () => {
       });
       assert.equal(begun.isError, false, begun.text);
       assert.deepEqual(JSON.parse(begun.text), { status: "otp_sent" });
+      assert.doesNotMatch(begun.text, /internalDeliveryId|delivery_private/);
 
       const verified = await callTool(client, "onboard_claim_verify", {
         email: "human@example.com",
@@ -272,6 +338,7 @@ test("claim begin and verify mirror public tokenless contracts", async () => {
       assert.doesNotMatch(verified.text, /org_test_123/);
       assert.doesNotMatch(verified.text, /TESTSECRET/);
       assert.doesNotMatch(verified.text, /apiKey/);
+      assert.doesNotMatch(verified.text, /internalAssetKey|asset_private/);
 
       const beginRequest = requests.find(
         (request) => parseUrl(request).pathname === "/api/onboard/claim/begin",
@@ -294,7 +361,10 @@ test("claim begin and verify mirror public tokenless contracts", async () => {
     {
       apiKey: null,
       handler: onboardingHandler({
-        "/api/onboard/claim/begin": () => ({ status: 200, json: { status: "otp_sent" } }),
+        "/api/onboard/claim/begin": () => ({
+          status: 200,
+          json: { status: "otp_sent", internalDeliveryId: "delivery_private" },
+        }),
         "/api/onboard/claim/verify": () => ({ status: 200, json: verifyResponse }),
       }),
     },
