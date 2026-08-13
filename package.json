@@ -45,11 +45,20 @@
     "access": "public"
   },
   "dependencies": {
+    "@layers/onboarding-contracts": "0.1.3",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@types/node": "^25.9.3",
     "typescript": "^6.0.3"
+  },
+  "optionalDependencies": {
+    "@layers/onboarding-collector-darwin-arm64": "0.1.3",
+    "@layers/onboarding-collector-darwin-x64": "0.1.3",
+    "@layers/onboarding-collector-linux-arm64": "0.1.3",
+    "@layers/onboarding-collector-linux-x64": "0.1.3",
+    "@layers/onboarding-collector-win32-arm64": "0.1.3",
+    "@layers/onboarding-collector-win32-x64": "0.1.3"
   }
 }
