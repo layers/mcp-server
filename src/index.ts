@@ -14,6 +14,7 @@ import {
   startOnboarding,
 } from "./onboarding/tools.js";
 import { registerBridgedOnboardingTools } from "./onboarding/bridged-tools.js";
+import { runSourceOnboardCli } from "./onboarding/launcher.js";
 import { getClaimedApiKey, redact } from "./onboarding/session.js";
 
 // The version clients see in server info. Read from package.json so a release
@@ -38,11 +39,17 @@ const flagValue = (name: string): string | undefined => {
 };
 
 const apiKey = flagValue("api-key") ?? process.env.LAYERS_API_KEY;
-const baseUrl = flagValue("base-url") ?? process.env.LAYERS_BASE_URL ?? "https://api.layers.com";
-const elleMcpBaseUrl = process.env.LAYERS_ELLE_MCP_URL ?? "https://elle.layers.com";
-const organization = flagValue("organization") ?? process.env.LAYERS_ORGANIZATION;
+const baseUrl =
+  flagValue("base-url") ??
+  process.env.LAYERS_BASE_URL ??
+  "https://api.layers.com";
+const elleMcpBaseUrl =
+  process.env.LAYERS_ELLE_MCP_URL ?? "https://elle.layers.com";
+const organization =
+  flagValue("organization") ?? process.env.LAYERS_ORGANIZATION;
 const readOnly =
-  argv.includes("--read-only") || ["1", "true"].includes(process.env.LAYERS_READ_ONLY ?? "");
+  argv.includes("--read-only") ||
+  ["1", "true"].includes(process.env.LAYERS_READ_ONLY ?? "");
 
 // Loaded once into the client's context at initialize — tells the agent what to
 // remember between calls (this server is stateless) and the shape of the workflow.
@@ -93,18 +100,53 @@ Post-claim:
 
 The post-claim payoff is the generated assets and the first experiment: the influencer, first video, and keyword research appear on the preview page when ready. Responses are the source of truth for every handle and ID. NEVER invent, normalize, or guess IDs.`;
 
-const sleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+const sleep = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
 
-async function runOnboardCli(): Promise<void> {
-  const url = argv[1];
-  if (!url || url.startsWith("--")) {
-    throw new Error("Usage: layers-mcp-server onboard <url>");
+const ONBOARD_HELP = `Usage:
+  layers-mcp-server onboard
+  layers-mcp-server onboard <public-url>
+
+Without a URL, inspect the current product workspace locally, show the bounded
+Layers consent proposal, and continue in this same process. The legacy URL form
+remains available when no supported local workspace exists.
+
+Options:
+  --base-url <url>  Override the Layers API base URL
+  --help            Show this help`;
+
+const MAIN_HELP = `Usage:
+  layers-mcp-server onboard [<public-url>] [--base-url <url>]
+  layers-mcp-server [--api-key <key>] [--organization <id>] [--read-only]
+
+Run "layers-mcp-server onboard --help" for the same-session onboarding flow.`;
+
+function onboardPositionalArguments(): string[] {
+  const result: string[] = [];
+  for (let index = 1; index < argv.length; index += 1) {
+    const value = argv[index]!;
+    if (value === "--base-url") {
+      if (!argv[index + 1] || argv[index + 1]!.startsWith("--")) {
+        throw new Error("--base-url requires a URL");
+      }
+      index += 1;
+      continue;
+    }
+    if (value === "--help" || value === "-h") continue;
+    if (value.startsWith("--"))
+      throw new Error(`Unknown onboard option: ${value}`);
+    result.push(value);
   }
+  return result;
+}
 
+async function runLegacyOnboardCli(url: string): Promise<void> {
   console.log(redact("Starting keyless Layers onboarding..."));
   const started = await startOnboarding(baseUrl, url);
   if ("state" in started) {
-    throw new Error("URL-based onboarding returned an incompatible reservation response");
+    throw new Error(
+      "URL-based onboarding returned an incompatible reservation response",
+    );
   }
   console.log(redact("Onboarding started; waiting for the preview..."));
 
@@ -117,8 +159,10 @@ async function runOnboardCli(): Promise<void> {
     }
 
     const record = status as Record<string, unknown>;
-    const buildState = typeof record.buildState === "string" ? record.buildState : "unknown";
-    const planState = typeof record.planState === "string" ? record.planState : "unknown";
+    const buildState =
+      typeof record.buildState === "string" ? record.buildState : "unknown";
+    const planState =
+      typeof record.planState === "string" ? record.planState : "unknown";
     const progress = `build: ${buildState}; plan: ${planState}`;
     if (progress !== lastProgress) {
       console.log(redact(progress));
@@ -135,12 +179,17 @@ async function runOnboardCli(): Promise<void> {
   console.log(redact(`previewUrl: ${started.previewUrl}`));
   console.log(redact(`claimUrl: ${started.claimUrl}`));
   console.log(
-    redact("to claim: reconnect with onboard_claim_begin/verify or open the claim URL"),
+    redact(
+      "to claim: reconnect with onboard_claim_begin/verify or open the claim URL",
+    ),
   );
 }
 
 async function runLegacyServer(key: string): Promise<void> {
-  const server = new McpServer({ name: "layers", version: SERVER_VERSION }, { instructions: INSTRUCTIONS });
+  const server = new McpServer(
+    { name: "layers", version: SERVER_VERSION },
+    { instructions: INSTRUCTIONS },
+  );
   const client = new LayersClient(key, baseUrl, organization);
 
   registerCoreTools(server, client, readOnly);
@@ -179,7 +228,11 @@ async function runOnboardingServer(): Promise<void> {
   // This is what closes the gap where a freshly-onboarded user reached for a
   // Layers tool and got 404 "Project not found" — the key they were implicitly
   // using belonged to a different organization entirely.
-  const claimedClient = new LayersClient(getClaimedApiKey, baseUrl, organization);
+  const claimedClient = new LayersClient(
+    getClaimedApiKey,
+    baseUrl,
+    organization,
+  );
   registerCoreTools(server, claimedClient, readOnly);
   registerCreativeTools(server, claimedClient, readOnly);
   registerDistributionTools(server, claimedClient, readOnly);
@@ -215,11 +268,23 @@ async function runOnboardingServer(): Promise<void> {
   );
 }
 
-if (argv[0] === "onboard") {
+if (argv[0] === "--help" || argv[0] === "-h") {
+  console.log(MAIN_HELP);
+} else if (argv[0] === "onboard") {
   try {
-    await runOnboardCli();
+    if (argv.includes("--help") || argv.includes("-h")) {
+      console.log(ONBOARD_HELP);
+    } else {
+      const positionals = onboardPositionalArguments();
+      if (positionals.length > 1) throw new Error(ONBOARD_HELP);
+      if (positionals[0]) await runLegacyOnboardCli(positionals[0]);
+      else
+        await runSourceOnboardCli({ baseUrl, launcherVersion: SERVER_VERSION });
+    }
   } catch (error) {
-    console.error(redact(error instanceof Error ? error.message : String(error)));
+    console.error(
+      redact(error instanceof Error ? error.message : String(error)),
+    );
     process.exitCode = 1;
   }
 } else if (apiKey) {
