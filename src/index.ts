@@ -140,6 +140,18 @@ function onboardPositionalArguments(): string[] {
   return result;
 }
 
+function legacyOnboardUrl(value: string): string {
+  try {
+    const parsed = new URL(value);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      throw new Error("unsupported protocol");
+    }
+  } catch {
+    throw new Error("The public product URL must be an absolute HTTP(S) URL");
+  }
+  return value;
+}
+
 async function runLegacyOnboardCli(url: string): Promise<void> {
   console.log(redact("Starting keyless Layers onboarding..."));
   const started = await startOnboarding(baseUrl, url);
@@ -277,7 +289,8 @@ if (argv[0] === "--help" || argv[0] === "-h") {
     } else {
       const positionals = onboardPositionalArguments();
       if (positionals.length > 1) throw new Error(ONBOARD_HELP);
-      if (positionals[0]) await runLegacyOnboardCli(positionals[0]);
+      if (positionals[0])
+        await runLegacyOnboardCli(legacyOnboardUrl(positionals[0]));
       else
         await runSourceOnboardCli({ baseUrl, launcherVersion: SERVER_VERSION });
     }
