@@ -447,7 +447,12 @@ export async function waitForPreviewAndClaim(
       }
       // Once a private claim attempt exists, publish its safe browser URL
       // before any deadline path can dispose the process-only session.
-      if (finishAwaitingClaimIfExpired()) return;
+      if (
+        progress.state !== "claimed" &&
+        finishAwaitingClaimIfExpired()
+      ) {
+        return;
+      }
 
       if (claimSession) {
         let exchange: Awaited<ReturnType<SourceClaimSession["exchange"]>>;

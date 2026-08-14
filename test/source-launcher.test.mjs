@@ -932,6 +932,71 @@ test("late claim setup surfaces its safe URL before awaiting-claim completion", 
   assert.equal(exchangeRequests, 0);
 });
 
+test("claimed progress gets its final exchange after the local deadline", async () => {
+  const reservationExpiresAt = "2100-08-14T01:00:00.000Z";
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let exchangeRequests = 0;
+  let postclaimRequests = 0;
+  const claimedProgress = OnboardAgentProgressResponseSchema.parse({
+    ...PROGRESS_RESPONSE,
+    state: "claimed",
+    stageLabel: "Workspace claimed",
+    completedMilestones: [
+      ...PROGRESS_RESPONSE.completedMilestones,
+      "claimed",
+    ],
+  });
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(claimedProgress, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      return Response.json(
+        { ...CLAIM_ATTEMPT_RESPONSE, expiresAt: "2000-01-01T00:00:00.000Z" },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      exchangeRequests += 1;
+      return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/postclaim")) {
+      postclaimRequests += 1;
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await waitForPreviewAndClaim(
+      "https://api.layers.test",
+      new AbortController().signal,
+      reservationExpiresAt,
+      (event) => events.push(event),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const safeProgressIndex = events.findIndex(
+    (event) =>
+      event.type === "progress" &&
+      event.progress.claimUrl === ATTEMPT_CLAIM_URL,
+  );
+  const completionIndex = events.findIndex(
+    (event) => event.type === "complete" && event.state === "claimed",
+  );
+  assert.ok(safeProgressIndex >= 0);
+  assert.ok(completionIndex > safeProgressIndex);
+  assert.deepEqual(events[completionIndex].postclaim, POSTCLAIM_RESPONSE);
+  assert.equal(exchangeRequests, 1);
+  assert.equal(postclaimRequests, 1);
+});
+
 test("claim setup exhaustion fails without claiming a handoff was exposed", async () => {
   const reservationExpiresAt = new Date(Date.now() + 1_000).toISOString();
   rememberLauncherReservation(reservationExpiresAt);
