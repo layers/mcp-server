@@ -34,6 +34,8 @@ import {
   OnboardingEvidenceEnvelopeSchema,
 } from "@layers/onboarding-contracts";
 
+import { waitForPreviewAndClaim } from "../dist/onboarding/launcher.js";
+import { rememberReservation } from "../dist/onboarding/session.js";
 import { SERVER } from "./helpers.mjs";
 
 const execFileAsync = promisify(execFile);
@@ -870,3 +872,105 @@ test(
     }
   },
 );
+
+function rememberLauncherReservation(expiresAt) {
+  rememberReservation({
+    protocolVersion: 1,
+    trialHandle: TRIAL_HANDLE,
+    reservationCapability: RESERVATION_CAPABILITY,
+    expiresAt,
+    state: "awaiting_evidence",
+  });
+}
+
+test("late claim setup surfaces its safe URL before awaiting-claim completion", async () => {
+  const reservationExpiresAt = "2100-08-14T01:00:00.000Z";
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let exchangeRequests = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      return Response.json(
+        { ...CLAIM_ATTEMPT_RESPONSE, expiresAt: "2000-01-01T00:00:00.000Z" },
+        { status: 202 },
+      );
+    }
+    exchangeRequests += 1;
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await waitForPreviewAndClaim(
+      "https://api.layers.test",
+      new AbortController().signal,
+      reservationExpiresAt,
+      (event) => events.push(event),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const safeProgressIndex = events.findIndex(
+    (event) =>
+      event.type === "progress" &&
+      event.progress.claimUrl === ATTEMPT_CLAIM_URL,
+  );
+  const completionIndex = events.findIndex(
+    (event) =>
+      event.type === "complete" && event.state === "awaiting_claim",
+  );
+  assert.ok(safeProgressIndex >= 0);
+  assert.ok(completionIndex > safeProgressIndex);
+  assert.equal(events[completionIndex].previewUrl, PREVIEW_URL);
+  assert.equal(events[completionIndex].postclaim, null);
+  assert.equal(exchangeRequests, 0);
+});
+
+test("claim setup exhaustion fails without claiming a handoff was exposed", async () => {
+  const reservationExpiresAt = new Date(Date.now() + 1_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let claimAttemptRequests = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      claimAttemptRequests += 1;
+      return Response.json(
+        { error: "claim setup is busy" },
+        { status: 429, headers: { "retry-after": "0" } },
+      );
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await assert.rejects(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      (error) => error?.status === 429 && error?.retryable === true,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(claimAttemptRequests, 1);
+  assert.equal(
+    events.some((event) => event.type === "complete"),
+    false,
+  );
+});

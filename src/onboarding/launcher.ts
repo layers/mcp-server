@@ -316,10 +316,11 @@ async function collectApproval(
   }
 }
 
-async function waitForPreviewAndClaim(
+export async function waitForPreviewAndClaim(
   baseUrl: string,
   signal: AbortSignal,
   reservationExpiresAt: string,
+  emitEvent: (event: LauncherEvent) => void = emit,
 ): Promise<void> {
   const reservationDeadline = Date.parse(reservationExpiresAt);
   if (!Number.isFinite(reservationDeadline)) {
@@ -334,7 +335,7 @@ async function waitForPreviewAndClaim(
     if (!latestPreviewUrl) {
       throw new Error("Claim handoff is missing its preview URL");
     }
-    emit({
+    emitEvent({
       type: "complete",
       previewUrl: latestPreviewUrl,
       state: "awaiting_claim",
@@ -390,39 +391,32 @@ async function waitForPreviewAndClaim(
           Date.now() + CLAIM_WAIT_MS,
           reservationDeadline,
         );
-        if (finishAwaitingClaimIfExpired()) return;
-        try {
-          claimSession = await createSourceClaimSession(
-            baseUrl,
-            signal,
-            async (error) => {
-              if (
-                claimDeadline === undefined ||
-                Date.now() >= claimDeadline
-              ) {
-                return false;
-              }
-              const delayMs = Math.min(
-                10_000,
-                Math.max(
-                  PROGRESS_POLL_MS,
-                  (error.retryAfterSeconds ?? 0) * 1000,
-                ),
-              );
-              await delay(boundedRetryDelay(delayMs), signal);
-              return Date.now() < claimDeadline;
-            },
+        if (Date.now() >= claimDeadline) {
+          throw new SourceOnboardingError(
+            "Layers claim continuity setup expired",
           );
-        } catch (error) {
-          if (
-            error instanceof SourceOnboardingError &&
-            error.retryable &&
-            finishAwaitingClaimIfExpired()
-          ) {
-            return;
-          }
-          throw error;
         }
+        claimSession = await createSourceClaimSession(
+          baseUrl,
+          signal,
+          async (error) => {
+            if (
+              claimDeadline === undefined ||
+              Date.now() >= claimDeadline
+            ) {
+              return false;
+            }
+            const delayMs = Math.min(
+              10_000,
+              Math.max(
+                PROGRESS_POLL_MS,
+                (error.retryAfterSeconds ?? 0) * 1000,
+              ),
+            );
+            await delay(boundedRetryDelay(delayMs), signal);
+            return Date.now() < claimDeadline;
+          },
+        );
         const attemptExpiresAt = Date.parse(claimSession.expiresAt);
         if (!Number.isFinite(attemptExpiresAt)) {
           throw new Error("Layers returned an invalid claim-attempt expiry");
@@ -431,7 +425,6 @@ async function waitForPreviewAndClaim(
           claimDeadline,
           attemptExpiresAt,
         );
-        if (finishAwaitingClaimIfExpired()) return;
       }
 
       if (progress.state === "claimed" && !claimSession) {
@@ -449,9 +442,12 @@ async function waitForPreviewAndClaim(
       };
       const fingerprint = JSON.stringify(safeProgress);
       if (fingerprint !== previous) {
-        emit({ type: "progress", progress: safeProgress });
+        emitEvent({ type: "progress", progress: safeProgress });
         previous = fingerprint;
       }
+      // Once a private claim attempt exists, publish its safe browser URL
+      // before any deadline path can dispose the process-only session.
+      if (finishAwaitingClaimIfExpired()) return;
 
       if (claimSession) {
         let exchange: Awaited<ReturnType<SourceClaimSession["exchange"]>>;
@@ -478,7 +474,7 @@ async function waitForPreviewAndClaim(
           if (!latestPreviewUrl) {
             throw new Error("Claimed workspace is missing its preview URL");
           }
-          emit({
+          emitEvent({
             type: "complete",
             previewUrl: latestPreviewUrl,
             state: "claimed",
