@@ -436,9 +436,12 @@ export async function waitForPreviewAndClaim(
       // The progress projection contains the portable legacy claim URL. The
       // same-session command exposes only the attempt-bound URL created with
       // this process's private PKCE transport capability.
+      const safeClaimUrl =
+        progress.claimReady && claimSession ? claimSession.claimUrl : null;
       const safeProgress = {
         ...progress,
-        claimUrl: claimSession?.claimUrl ?? null,
+        claimReady: safeClaimUrl !== null,
+        claimUrl: safeClaimUrl,
       };
       const fingerprint = JSON.stringify(safeProgress);
       if (fingerprint !== previous) {

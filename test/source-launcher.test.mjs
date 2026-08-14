@@ -117,6 +117,18 @@ const PROGRESS_RESPONSE = OnboardAgentProgressResponseSchema.parse({
   updatedAt: UPDATED_AT,
 });
 
+const CLAIMED_PROGRESS_RESPONSE = OnboardAgentProgressResponseSchema.parse({
+  ...PROGRESS_RESPONSE,
+  state: "claimed",
+  stageLabel: "Connected to Layers",
+  completedMilestones: [
+    ...PROGRESS_RESPONSE.completedMilestones,
+    "claimed",
+  ],
+  claimReady: false,
+  claimUrl: null,
+});
+
 const CLAIM_ATTEMPT_RESPONSE = OnboardAgentClaimAttemptResponseSchema.parse({
   protocolVersion: 1,
   trialHandle: TRIAL_HANDLE,
@@ -273,7 +285,13 @@ async function createMockApi(temporaryRoot) {
         return;
       }
       if (request.method === "GET" && pathname === progressPath) {
-        respondJson(response, 200, PROGRESS_RESPONSE);
+        respondJson(
+          response,
+          200,
+          exchangeCount === 0
+            ? PROGRESS_RESPONSE
+            : CLAIMED_PROGRESS_RESPONSE,
+        );
         return;
       }
       if (request.method === "POST" && pathname === claimAttemptsPath) {
@@ -598,6 +616,26 @@ test(
       );
       assert.equal(progressEvent.progress.claimUrl, ATTEMPT_CLAIM_URL);
       assert.notEqual(progressEvent.progress.claimUrl, LEGACY_CLAIM_URL);
+      assert.deepEqual(
+        OnboardAgentProgressResponseSchema.parse(progressEvent.progress),
+        {
+          ...PROGRESS_RESPONSE,
+          claimUrl: ATTEMPT_CLAIM_URL,
+        },
+      );
+
+      const claimedProgressEvent = await nextEvent(
+        run,
+        (event) =>
+          event.type === "progress" && event.progress?.state === "claimed",
+        "schema-valid claimed progress",
+      );
+      assert.deepEqual(
+        OnboardAgentProgressResponseSchema.parse(
+          claimedProgressEvent.progress,
+        ),
+        CLAIMED_PROGRESS_RESPONSE,
+      );
 
       const completeEvent = await nextEvent(
         run,
