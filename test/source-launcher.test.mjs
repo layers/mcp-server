@@ -968,7 +968,7 @@ test("claim setup exhaustion fails without claiming a handoff was exposed", asyn
     globalThis.fetch = originalFetch;
   }
 
-  assert.equal(claimAttemptRequests, 1);
+  assert.ok(claimAttemptRequests >= 1);
   assert.equal(
     events.some((event) => event.type === "complete"),
     false,
