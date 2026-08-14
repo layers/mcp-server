@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
+import { readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
@@ -155,8 +156,9 @@ const POSTCLAIM_RESPONSE = OnboardAgentPostclaimResponseSchema.parse({
   updatedAt: UPDATED_AT,
 });
 
-function respondJson(response, status, body) {
+function respondJson(response, status, body, headers = {}) {
   response.writeHead(status, {
+    ...headers,
     "cache-control": "no-store",
     "content-type": "application/json",
   });
@@ -173,10 +175,11 @@ function requestsAt(requests, pathname) {
   return requests.filter((request) => request.pathname === pathname);
 }
 
-async function createMockApi() {
+async function createMockApi(temporaryRoot) {
   const requests = [];
   const unexpectedRequests = [];
   let exchangeCount = 0;
+  let claimAttemptCount = 0;
 
   const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
     ":trialHandle",
@@ -242,6 +245,19 @@ async function createMockApi() {
         return;
       }
       if (request.method === "POST" && pathname === evidencePath) {
+        const liveCollectorStages = readdirSync(temporaryRoot, {
+          withFileTypes: true,
+        })
+          .filter(
+            (entry) =>
+              entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+          )
+          .map((entry) => entry.name);
+        assert.deepEqual(
+          liveCollectorStages,
+          [],
+          "collector cleanup must finish before evidence leaves the host",
+        );
         respondJson(
           response,
           202,
@@ -259,6 +275,13 @@ async function createMockApi() {
         return;
       }
       if (request.method === "POST" && pathname === claimAttemptsPath) {
+        claimAttemptCount += 1;
+        if (claimAttemptCount === 1) {
+          respondJson(response, 429, { error: "claim setup is busy" }, {
+            "retry-after": "0",
+          });
+          return;
+        }
         respondJson(response, 202, CLAIM_ATTEMPT_RESPONSE);
         return;
       }
@@ -469,7 +492,7 @@ test(
     let run;
     try {
       const workspace = await createSingleProductGitFixture(temporaryRoot);
-      api = await createMockApi();
+      api = await createMockApi(temporaryRoot);
       run = spawnLauncher(workspace, api.baseUrl, temporaryRoot);
 
       const initialInspectionEvent = await nextEvent(
@@ -733,7 +756,7 @@ test(
           TRIAL_HANDLE,
         );
       const claimRequests = requestsAt(api.requests, claimAttemptsPath);
-      assert.equal(claimRequests.length, 1);
+      assert.equal(claimRequests.length, 2);
       const claimHeaders = OnboardAgentClaimTransportHeadersSchema.parse({
         reservationCapability: requestHeader(
           claimRequests[0],
@@ -750,6 +773,13 @@ test(
       );
       const claimBody = OnboardAgentClaimAttemptRequestSchema.parse(
         JSON.parse(claimRequests[0].body),
+      );
+      assert.equal(claimRequests[1].method, claimRequests[0].method);
+      assert.equal(claimRequests[1].body, claimRequests[0].body);
+      assert.deepEqual(
+        [...new Headers(claimRequests[1].headers).entries()],
+        [...new Headers(claimRequests[0].headers).entries()],
+        "claim setup retry must preserve the exact private request",
       );
 
       const exchangePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.claimAttemptExchange

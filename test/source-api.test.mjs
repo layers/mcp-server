@@ -371,6 +371,53 @@ test("claim creation replays one HTTP 5xx with the identical idempotent request"
   }
 });
 
+test("opt-in claim setup retries retain one exact request across exhausted 5xx and 429", async () => {
+  rememberActiveReservation();
+  const originalFetch = globalThis.fetch;
+  const requests = [];
+  const retryStatuses = [];
+  let session;
+
+  globalThis.fetch = async (input, init = {}) => {
+    const request = captureRequest(input, init);
+    requests.push(request);
+    if (requests.length <= 2) {
+      return jsonResponse({ error: "temporary setup outage" }, 503);
+    }
+    if (requests.length === 3) {
+      return jsonResponse({ error: "slow down" }, 429, {
+        "retry-after": "0",
+      });
+    }
+    return jsonResponse(CLAIM_ATTEMPT_RESPONSE, 202);
+  };
+
+  try {
+    session = await createSourceClaimSession(
+      BASE_URL,
+      undefined,
+      async (error) => {
+        retryStatuses.push(error.status);
+        return true;
+      },
+    );
+    assert.deepEqual(retryStatuses, [503, 429]);
+    assert.equal(requests.length, 4);
+    for (const request of requests.slice(1)) {
+      assert.equal(request.url, requests[0].url);
+      assert.equal(request.method, requests[0].method);
+      assert.equal(request.body, requests[0].body);
+      assert.deepEqual(
+        [...request.headers.entries()],
+        [...requests[0].headers.entries()],
+      );
+    }
+  } finally {
+    session?.dispose();
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test("HTTP 429 remains caller-visible without replay or secret disclosure", async () => {
   rememberActiveReservation();
   const originalFetch = globalThis.fetch;

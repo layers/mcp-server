@@ -378,8 +378,10 @@ async function createClaimAttemptWithTransportRetry(
   url: URL,
   init: RequestInit,
   signal?: AbortSignal,
+  retrySetup?: (error: SourceOnboardingError) => Promise<boolean>,
 ): Promise<unknown> {
-  for (let attempt = 0; attempt < 2; attempt += 1) {
+  let immediateReplayAvailable = true;
+  for (;;) {
     try {
       return await requestJson(
         url,
@@ -389,16 +391,17 @@ async function createClaimAttemptWithTransportRetry(
         signal,
       );
     } catch (error) {
-      if (attempt === 0 && isClaimAttemptReplayable(error)) continue;
+      if (!(error instanceof SourceOnboardingError) || !error.retryable) {
+        throw error;
+      }
+      if (immediateReplayAvailable && isClaimAttemptReplayable(error)) {
+        immediateReplayAvailable = false;
+        continue;
+      }
+      if (retrySetup && (await retrySetup(error))) continue;
       throw error;
     }
   }
-  throw new SourceOnboardingError(
-    "Layers claim continuity setup is temporarily unreachable",
-    undefined,
-    undefined,
-    true,
-  );
 }
 
 class ProcessPrivateSourceClaimSession implements SourceClaimSession {
@@ -608,6 +611,7 @@ class ProcessPrivateSourceClaimSession implements SourceClaimSession {
 export async function createSourceClaimSession(
   baseUrl: string,
   signal?: AbortSignal,
+  retrySetup?: (error: SourceOnboardingError) => Promise<boolean>,
 ): Promise<SourceClaimSession> {
   throwIfCallerAborted(signal);
   const reservation = activeReservation();
@@ -664,6 +668,7 @@ export async function createSourceClaimSession(
         body: JSON.stringify(parsedRequest.data),
       },
       signal,
+      retrySetup,
     );
     const parsedResponse =
       OnboardAgentClaimAttemptResponseSchema.safeParse(responseBody);

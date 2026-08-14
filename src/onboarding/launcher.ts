@@ -319,7 +319,12 @@ async function collectApproval(
 async function waitForPreviewAndClaim(
   baseUrl: string,
   signal: AbortSignal,
+  reservationExpiresAt: string,
 ): Promise<void> {
+  const reservationDeadline = Date.parse(reservationExpiresAt);
+  if (!Number.isFinite(reservationDeadline)) {
+    throw new Error("Layers returned an invalid reservation expiry");
+  }
   let previous = "";
   let claimDeadline: number | undefined;
   let latestPreviewUrl: string | undefined;
@@ -381,15 +386,52 @@ async function waitForPreviewAndClaim(
         progress.previewReady &&
         progress.previewUrl
       ) {
-        claimSession = await createSourceClaimSession(baseUrl, signal);
+        claimDeadline ??= Math.min(
+          Date.now() + CLAIM_WAIT_MS,
+          reservationDeadline,
+        );
+        if (finishAwaitingClaimIfExpired()) return;
+        try {
+          claimSession = await createSourceClaimSession(
+            baseUrl,
+            signal,
+            async (error) => {
+              if (
+                claimDeadline === undefined ||
+                Date.now() >= claimDeadline
+              ) {
+                return false;
+              }
+              const delayMs = Math.min(
+                10_000,
+                Math.max(
+                  PROGRESS_POLL_MS,
+                  (error.retryAfterSeconds ?? 0) * 1000,
+                ),
+              );
+              await delay(boundedRetryDelay(delayMs), signal);
+              return Date.now() < claimDeadline;
+            },
+          );
+        } catch (error) {
+          if (
+            error instanceof SourceOnboardingError &&
+            error.retryable &&
+            finishAwaitingClaimIfExpired()
+          ) {
+            return;
+          }
+          throw error;
+        }
         const attemptExpiresAt = Date.parse(claimSession.expiresAt);
         if (!Number.isFinite(attemptExpiresAt)) {
           throw new Error("Layers returned an invalid claim-attempt expiry");
         }
         claimDeadline = Math.min(
-          Date.now() + CLAIM_WAIT_MS,
+          claimDeadline,
           attemptExpiresAt,
         );
+        if (finishAwaitingClaimIfExpired()) return;
       }
 
       if (progress.state === "claimed" && !claimSession) {
@@ -471,6 +513,11 @@ async function approveAndUpload(
   signal: AbortSignal,
 ): Promise<void> {
   const envelope = await collectApproval(collector, lines, inspection);
+  // The collector's absolute deadline may expire while an upload is in flight.
+  // Finish its private cleanup before starting the network request so a
+  // successful evidence submission can never lose the later claim handoff to
+  // an already-expired local collector session.
+  await collector.complete();
   emit({
     type: "status",
     stage: "upload",
@@ -549,14 +596,17 @@ export async function runSourceOnboardCli(input: {
       lifecycle.signal,
     );
     submitted = true;
-    await collector.complete();
     collector = undefined;
     emit({
       type: "status",
       stage: "preview",
       message: "Building the Layers preview.",
     });
-    await waitForPreviewAndClaim(input.baseUrl, lifecycle.signal);
+    await waitForPreviewAndClaim(
+      input.baseUrl,
+      lifecycle.signal,
+      reservation.expiresAt,
+    );
   } catch (error) {
     if (collector) {
       if (submitted) collector.abort();
