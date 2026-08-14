@@ -10,7 +10,7 @@ Run with Node's built-in test runner (no test-framework dependency):
 npm test
 ```
 
-`pretest` builds first, then `node --test test/*.test.mjs` runs nine suites.
+`pretest` builds first, then `node --test test/*.test.mjs` runs twelve suites.
 The protocol-facing suites spawn the built server and drive it over stdio; the
 contract/onboarding suites also point it at a throwaway `127.0.0.1` mock. The
 bridge suite injects mock MCP clients and transports, so **no API key and no
@@ -48,6 +48,15 @@ outbound network are needed**. This is what CI runs.
 - **[`postclaim-routing.test.mjs`](postclaim-routing.test.mjs)** — claim-state
   convergence, same-account routing, browser handoff, workspace-key retention,
   and bounded full-Elle refresh/retry behavior.
+- **[`collector-host.test.mjs`](collector-host.test.mjs)** — pinned native
+  package/manifest/policy/binary identity, private transport framing, collector
+  state ordering, and staged-executable cleanup.
+- **[`source-api.test.mjs`](source-api.test.mjs)** — capability-gated evidence
+  upload, attempt-bound PKCE exchange, safe post-claim read, idempotent replay,
+  abort handling, and secret non-disclosure.
+- **[`source-launcher.test.mjs`](source-launcher.test.mjs)** — the one-shot
+  workspace inspection, exact consent approval, upload, preview, browser claim,
+  and same-process post-claim terminal projection.
 
 The tests assert literal counts (52 / 25 / 27) on purpose — adding or removing a
 tool fails the suite until the count is updated deliberately.

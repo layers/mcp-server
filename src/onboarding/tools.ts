@@ -1,5 +1,12 @@
 import { createHash, randomUUID } from "node:crypto";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  ONBOARDING_PROTOCOL_VERSION,
+  ONBOARD_AGENT_PUBLIC_ROUTE_PATHS,
+  OnboardAgentChallengeResponseSchema,
+  OnboardAgentEvidenceStartRequestSchema,
+  OnboardAgentEvidenceStartResponseSchema,
+} from "@layers/onboarding-contracts";
 import { z } from "zod";
 import type { ToolResult } from "../api.js";
 import { READ_ONLY, WRITE } from "../api.js";
@@ -22,14 +29,46 @@ import {
 } from "./public-responses.js";
 
 const POW_ATTEMPT_LIMIT = 2 ** 26;
-const ONBOARDING_PROTOCOL_VERSION = 1 as const;
+const ONBOARD_START_REQUEST_TIMEOUT_MS = 15_000;
 const ONBOARD_START_SUPPORT_CODE = "ONBOARD_START_INTERNAL";
 const SAFE_ONBOARD_START_REQUEST_ID =
   /^(?:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|req_[A-Za-z0-9_-]{1,96})$/i;
 
-interface ChallengeResponse {
-  nonce: string;
-  difficulty: number;
+interface RequestAbortScope {
+  signal: AbortSignal;
+  dispose: () => void;
+}
+
+function interruptedError(): Error {
+  return new Error("Onboarding interrupted");
+}
+
+function throwIfCallerAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw interruptedError();
+}
+
+function requestAbortScope(callerSignal?: AbortSignal): RequestAbortScope {
+  const controller = new AbortController();
+  const onCallerAbort = (): void => controller.abort();
+  callerSignal?.addEventListener("abort", onCallerAbort, { once: true });
+  if (callerSignal?.aborted) controller.abort();
+
+  const timeout = setTimeout(
+    () => controller.abort(),
+    ONBOARD_START_REQUEST_TIMEOUT_MS,
+  );
+  timeout.unref();
+  let disposed = false;
+
+  return {
+    signal: controller.signal,
+    dispose: () => {
+      if (disposed) return;
+      disposed = true;
+      clearTimeout(timeout);
+      callerSignal?.removeEventListener("abort", onCallerAbort);
+    },
+  };
 }
 
 interface UrlStartResponse {
@@ -43,16 +82,6 @@ interface UrlStartResponse {
   };
   sessionHandle: string;
 }
-
-const evidenceStartResponseSchema = z
-  .object({
-    protocolVersion: z.literal(ONBOARDING_PROTOCOL_VERSION),
-    trialHandle: z.string().min(1),
-    reservationCapability: z.string().min(1).max(512),
-    expiresAt: z.string().datetime({ offset: true }),
-    state: z.literal("awaiting_evidence"),
-  })
-  .strict();
 
 export interface OnboardUrlStartResult {
   trialHandle: string;
@@ -68,7 +97,8 @@ export interface OnboardEvidenceStartResult {
   state: "awaiting_evidence";
 }
 
-export type OnboardStartResult = OnboardUrlStartResult | OnboardEvidenceStartResult;
+export type OnboardStartResult =
+  OnboardUrlStartResult | OnboardEvidenceStartResult;
 
 const endpoint = (baseUrl: string, path: string): URL => new URL(path, baseUrl);
 
@@ -85,10 +115,15 @@ const errorMessage = (error: unknown): string =>
   redact(error instanceof Error ? error.message : String(error));
 
 function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  return value && typeof value === "object"
+    ? (value as Record<string, unknown>)
+    : null;
 }
 
-function optionalString(record: Record<string, unknown>, key: string): string | undefined {
+function optionalString(
+  record: Record<string, unknown>,
+  key: string,
+): string | undefined {
   const value = record[key];
   return typeof value === "string" && value.length > 0 ? value : undefined;
 }
@@ -114,7 +149,8 @@ function rememberVerifiedClaim(body: unknown): void {
   if (record && isClaimContinuity(record.continuity)) {
     // Retain the claimed organization identity for post-claim routing.
     const organizationId =
-      typeof record.organizationId === "string" && record.organizationId.length > 0
+      typeof record.organizationId === "string" &&
+      record.organizationId.length > 0
         ? record.organizationId
         : undefined;
     // The workspace key for the org just created. Returned exactly once by
@@ -123,7 +159,9 @@ function rememberVerifiedClaim(body: unknown): void {
     // and a claim without a key is still a good claim.
     const claimApiKey = asRecord(record.apiKey);
     const apiKeySecret =
-      claimApiKey && typeof claimApiKey.secret === "string" && claimApiKey.secret.length > 0
+      claimApiKey &&
+      typeof claimApiKey.secret === "string" &&
+      claimApiKey.secret.length > 0
         ? claimApiKey.secret
         : undefined;
     rememberSessionClaim(record.continuity, organizationId, apiKeySecret);
@@ -166,7 +204,9 @@ function solveProofOfWork(nonce: string, difficulty: number): string {
 
   for (let counter = 0; counter < POW_ATTEMPT_LIMIT; counter += 1) {
     const solution = String(counter);
-    const digest = createHash("sha256").update(nonce + solution, "utf8").digest();
+    const digest = createHash("sha256")
+      .update(nonce + solution, "utf8")
+      .digest();
     if (countLeadingZeroBits(digest) >= difficulty) return solution;
   }
   throw new Error("Onboarding admission could not be completed");
@@ -217,7 +257,10 @@ function parseJson<T>(text: string, context: string): T {
   }
 }
 
-async function parseSuccess<T>(response: Response, context: string): Promise<T> {
+async function parseSuccess<T>(
+  response: Response,
+  context: string,
+): Promise<T> {
   const text = await responseText(response);
   if (!response.ok) {
     throw new Error(
@@ -229,51 +272,132 @@ async function parseSuccess<T>(response: Response, context: string): Promise<T> 
 
 function retryAfterText(response: Response): string {
   const seconds = response.headers.get("retry-after");
-  return seconds ? ` Retry after ${seconds} seconds.` : " Wait before retrying.";
+  return seconds
+    ? ` Retry after ${seconds} seconds.`
+    : " Wait before retrying.";
+}
+
+async function requestChallenge(baseUrl: string, callerSignal?: AbortSignal) {
+  throwIfCallerAborted(callerSignal);
+  const requestAbort = requestAbortScope(callerSignal);
+  try {
+    let response: Response;
+    try {
+      response = await fetch(
+        endpoint(baseUrl, ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.challenge),
+        { signal: requestAbort.signal },
+      );
+    } catch (error) {
+      if (callerSignal?.aborted) throw interruptedError();
+      throw new Error(
+        redact(`Onboarding challenge request failed: ${errorMessage(error)}`),
+      );
+    }
+    if (response.status !== 200) {
+      await response.body?.cancel();
+      throw new Error(`Onboarding challenge failed (${response.status})`);
+    }
+    const challengeResult = OnboardAgentChallengeResponseSchema.safeParse(
+      await parseSuccess<unknown>(response, "Onboarding challenge"),
+    );
+    throwIfCallerAborted(callerSignal);
+    if (!challengeResult.success) {
+      throw new Error("Onboarding challenge returned an invalid response");
+    }
+    return challengeResult.data;
+  } catch (error) {
+    if (callerSignal?.aborted) throw interruptedError();
+    throw error;
+  } finally {
+    requestAbort.dispose();
+  }
+}
+
+interface PendingStartResponse {
+  response: Response;
+  text: string;
 }
 
 async function postStartWithTransportRetry(
   baseUrl: string,
   body: Record<string, string | number>,
-): Promise<Response> {
+  internalProbeToken?: string,
+  callerSignal?: AbortSignal,
+): Promise<PendingStartResponse> {
   let lastError: unknown;
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    throwIfCallerAborted(callerSignal);
+    const requestAbort = requestAbortScope(callerSignal);
     try {
-      return await fetch(endpoint(baseUrl, "/api/onboard/agent/start"), {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      const response = await fetch(
+        endpoint(baseUrl, ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.start),
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...(internalProbeToken
+              ? { "x-layers-onboard-internal-probe": internalProbeToken }
+              : {}),
+          },
+          body: JSON.stringify(body),
+          signal: requestAbort.signal,
+        },
+      );
+      throwIfCallerAborted(callerSignal);
+      const text = await responseText(response);
+      throwIfCallerAborted(callerSignal);
+      return { response, text };
     } catch (error) {
+      if (callerSignal?.aborted) throw interruptedError();
       lastError = error;
+    } finally {
+      requestAbort.dispose();
     }
   }
-  throw new Error(redact(`Onboarding start request failed: ${errorMessage(lastError)}`));
+  throw new Error(
+    redact(`Onboarding start request failed: ${errorMessage(lastError)}`),
+  );
 }
 
 export async function startOnboarding(
   baseUrl: string,
   url?: string,
+  options: { internalProbeToken?: string; signal?: AbortSignal } = {},
 ): Promise<OnboardStartResult> {
-  let challengeResponse: Response;
-  try {
-    challengeResponse = await fetch(endpoint(baseUrl, "/api/onboard/agent/challenge"));
-  } catch (error) {
-    throw new Error(redact(`Onboarding challenge request failed: ${errorMessage(error)}`));
+  throwIfCallerAborted(options.signal);
+  if (
+    options.internalProbeToken !== undefined &&
+    (options.internalProbeToken.length === 0 ||
+      options.internalProbeToken.length > 512)
+  ) {
+    throw new Error("Onboarding internal probe configuration is invalid");
   }
-  const challenge = await parseSuccess<ChallengeResponse>(challengeResponse, "Onboarding challenge");
-  if (typeof challenge.nonce !== "string" || challenge.nonce.length === 0) {
-    throw new Error("Onboarding challenge returned an invalid nonce");
-  }
+  const challenge = await requestChallenge(baseUrl, options.signal);
 
   const startRequestId = randomUUID();
-  const startResponse = await postStartWithTransportRetry(baseUrl, {
-    ...(url === undefined ? { protocolVersion: ONBOARDING_PROTOCOL_VERSION } : { url }),
-    startRequestId,
-    powNonce: challenge.nonce,
-    powSolution: solveProofOfWork(challenge.nonce, challenge.difficulty),
-  });
-  const startText = await responseText(startResponse);
+  const startBody =
+    url === undefined
+      ? OnboardAgentEvidenceStartRequestSchema.parse({
+          protocolVersion: ONBOARDING_PROTOCOL_VERSION,
+          startRequestId,
+          powNonce: challenge.nonce,
+          powSolution: solveProofOfWork(challenge.nonce, challenge.difficulty),
+        })
+      : {
+          url,
+          startRequestId,
+          powNonce: challenge.nonce,
+          powSolution: solveProofOfWork(challenge.nonce, challenge.difficulty),
+        };
+  throwIfCallerAborted(options.signal);
+  const pendingStartResponse = await postStartWithTransportRetry(
+    baseUrl,
+    startBody,
+    options.internalProbeToken,
+    options.signal,
+  );
+  const startResponse = pendingStartResponse.response;
+  const startText = pendingStartResponse.text;
 
   if (startResponse.status === 409) {
     throw new Error(
@@ -281,7 +405,9 @@ export async function startOnboarding(
     );
   }
   if (startResponse.status === 429) {
-    throw new Error(`Onboarding is rate limited.${retryAfterText(startResponse)}`);
+    throw new Error(
+      `Onboarding is rate limited.${retryAfterText(startResponse)}`,
+    );
   }
   if (startResponse.status !== 202) {
     const supportError = supportedStartError(startResponse, startText);
@@ -300,9 +426,12 @@ export async function startOnboarding(
       record.state === "awaiting_evidence");
 
   if (isEvidenceResponse) {
-    const parsedBody = evidenceStartResponseSchema.safeParse(untrustedBody);
+    const parsedBody =
+      OnboardAgentEvidenceStartResponseSchema.safeParse(untrustedBody);
     if (url !== undefined || !parsedBody.success) {
-      throw new Error("Onboarding start returned an invalid evidence reservation response");
+      throw new Error(
+        "Onboarding start returned an invalid evidence reservation response",
+      );
     }
     const body = parsedBody.data;
 
@@ -325,7 +454,9 @@ export async function startOnboarding(
   }
 
   if (url === undefined) {
-    throw new Error("Onboarding start returned an invalid evidence reservation response");
+    throw new Error(
+      "Onboarding start returned an invalid evidence reservation response",
+    );
   }
 
   const body = untrustedBody as Partial<UrlStartResponse>;
@@ -349,7 +480,8 @@ export async function startOnboarding(
   } catch {
     throw new Error("Onboarding start returned an invalid claim URL");
   }
-  if (!claimToken) throw new Error("Onboarding start returned a claim URL without a token");
+  if (!claimToken)
+    throw new Error("Onboarding start returned a claim URL without a token");
 
   rememberSession({
     accessToken: body.session.access_token,
@@ -369,7 +501,10 @@ export async function startOnboarding(
   };
 }
 
-export async function getOnboardingStatus(baseUrl: string, trialHandle?: string): Promise<unknown> {
+export async function getOnboardingStatus(
+  baseUrl: string,
+  trialHandle?: string,
+): Promise<unknown> {
   const session = getSession();
   if (!session) throw new Error("run onboard_start first");
   const handle = trialHandle ?? session.trialHandle;
@@ -421,9 +556,12 @@ async function ensureWorkspaceKey(
       return;
     }
     const body = asRecord(await response.json());
-    const secret = body && typeof body.secret === "string" ? body.secret : undefined;
+    const secret =
+      body && typeof body.secret === "string" ? body.secret : undefined;
     const organizationId =
-      body && typeof body.organizationId === "string" ? body.organizationId : undefined;
+      body && typeof body.organizationId === "string"
+        ? body.organizationId
+        : undefined;
     if (secret) rememberWorkspaceKey(secret, organizationId);
   } catch {
     // Never surface or log the error — this path holds a credential, and a
@@ -431,7 +569,11 @@ async function ensureWorkspaceKey(
   }
 }
 
-async function beginClaim(baseUrl: string, email: string, claimToken?: string): Promise<unknown> {
+async function beginClaim(
+  baseUrl: string,
+  email: string,
+  claimToken?: string,
+): Promise<unknown> {
   const token = claimToken ?? getSession()?.claimToken;
   if (!token) throw new Error("provide claimToken or run onboard_start first");
 
@@ -443,18 +585,26 @@ async function beginClaim(baseUrl: string, email: string, claimToken?: string): 
       body: JSON.stringify({ claimToken: token, email }),
     });
   } catch (error) {
-    throw new Error(redact(`Onboarding claim request failed: ${errorMessage(error)}`));
+    throw new Error(
+      redact(`Onboarding claim request failed: ${errorMessage(error)}`),
+    );
   }
 
   if (response.status === 409) {
     await response.body?.cancel();
-    throw new Error("Onboarding preview still building — wait and retry onboard_claim_begin.");
+    throw new Error(
+      "Onboarding preview still building — wait and retry onboard_claim_begin.",
+    );
   }
   if (response.status === 429) {
     await response.body?.cancel();
-    throw new Error(`Onboarding claim is rate limited.${retryAfterText(response)}`);
+    throw new Error(
+      `Onboarding claim is rate limited.${retryAfterText(response)}`,
+    );
   }
-  return sanitizeClaimBegin(await parseSuccess<unknown>(response, "Onboarding claim begin"));
+  return sanitizeClaimBegin(
+    await parseSuccess<unknown>(response, "Onboarding claim begin"),
+  );
 }
 
 async function verifyClaim(
@@ -474,7 +624,9 @@ async function verifyClaim(
       body: JSON.stringify({ claimToken: token, email, code }),
     });
   } catch (error) {
-    throw new Error(redact(`Onboarding claim verification failed: ${errorMessage(error)}`));
+    throw new Error(
+      redact(`Onboarding claim verification failed: ${errorMessage(error)}`),
+    );
   }
   const body = await parseSuccess<unknown>(response, "Onboarding claim verify");
   // Validate what the agent will receive before mutating local claim state. A
@@ -485,7 +637,10 @@ async function verifyClaim(
   return publicBody;
 }
 
-export function registerOnboardingTools(server: McpServer, baseUrl: string): void {
+export function registerOnboardingTools(
+  server: McpServer,
+  baseUrl: string,
+): void {
   server.registerTool(
     "onboard_start",
     {
@@ -517,10 +672,13 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
         trialHandle: z
           .string()
           .optional()
-          .describe("Trial handle from onboard_start; defaults to the process-held trial"),
+          .describe(
+            "Trial handle from onboard_start; defaults to the process-held trial",
+          ),
       },
     },
-    async ({ trialHandle }) => runTool(() => getOnboardingStatus(baseUrl, trialHandle)),
+    async ({ trialHandle }) =>
+      runTool(() => getOnboardingStatus(baseUrl, trialHandle)),
   );
 
   server.registerTool(
@@ -540,10 +698,13 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
         claimToken: z
           .string()
           .optional()
-          .describe("Claim token from claimUrl; defaults to the process-held token"),
+          .describe(
+            "Claim token from claimUrl; defaults to the process-held token",
+          ),
       },
     },
-    async ({ email, claimToken }) => runTool(() => beginClaim(baseUrl, email, claimToken)),
+    async ({ email, claimToken }) =>
+      runTool(() => beginClaim(baseUrl, email, claimToken)),
   );
 
   server.registerTool(
@@ -554,12 +715,19 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
       description:
         "Verify the six-digit code from the human's inbox and claim the Layers workspace without returning credentials. Successful responses include postclaimAssets with generationStatus, postclaimState, estimatedDuration, and message; relay postclaimAssets.message verbatim when present. The assets are generating — the influencer, first video, and keyword research — it can take a few minutes, and the preview page is where they appear when ready. The response carries no preview URL, so use the previewUrl already held or returned by get_onboarding_status. After a same-account success, continue through ask_elle immediately instead of closing with congratulations.",
       inputSchema: {
-        email: z.string().email().describe("The same email used with onboard_claim_begin"),
-        code: z.string().describe("Six-digit code read by the human from their inbox"),
+        email: z
+          .string()
+          .email()
+          .describe("The same email used with onboard_claim_begin"),
+        code: z
+          .string()
+          .describe("Six-digit code read by the human from their inbox"),
         claimToken: z
           .string()
           .optional()
-          .describe("Claim token from claimUrl; defaults to the process-held token"),
+          .describe(
+            "Claim token from claimUrl; defaults to the process-held token",
+          ),
       },
     },
     async ({ email, code, claimToken }) =>

@@ -5,15 +5,21 @@ token is stored anywhere — see the security model below.
 
 ## Cutting a release
 
-1. Bump the version and commit it on `main`:
+1. Bump the version on a feature branch without creating a tag:
    ```bash
-   npm version patch   # or: minor / major  (updates package.json + package-lock)
-   git push origin main
+   npm version patch --no-git-tag-version   # or: minor / major
+   git add package.json package-lock.json
+   git commit -m "chore(release): bump mcp server"
    ```
-   `npm version` also creates the matching `vX.Y.Z` tag locally.
-2. Push the tag:
+   Open a pull request and merge it through the required CI and BugBot checks.
+   Direct pushes to `main` are intentionally blocked.
+2. From a clean checkout of the merged `main`, create and push the exact version
+   tag:
    ```bash
-   git push origin "v$(node -p "require('./package.json').version")"
+   git pull --ff-only origin main
+   MCP_VERSION="$(node -p "require('./package.json').version")"
+   git tag "v${MCP_VERSION}"
+   git push origin "refs/tags/v${MCP_VERSION}"
    ```
 3. The **Release** workflow runs, waits for approval on the `npm-publish`
    environment, then publishes with provenance. Consumers on

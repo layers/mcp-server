@@ -17,6 +17,32 @@ const RESERVATION_CAPABILITY = "reservation_capability_live_secret_123";
 const PREVIEW_URL = "https://layers.test/p/preview_test_123";
 const CLAIM_URL = `https://layers.test/claim?token=${CLAIM_TOKEN}`;
 const EXPIRES_AT = "2026-07-22T12:00:00.000Z";
+const CLI_ENV_SCRUB = [
+  "LAYERS_API_KEY",
+  "LAYERS_BASE_URL",
+  "LAYERS_ELLE_MCP_URL",
+  "LAYERS_ONBOARD_INTERNAL_PROBE_TOKEN",
+  "LAYERS_ORGANIZATION",
+  "LAYERS_READ_ONLY",
+];
+const MAIN_HELP_OUTPUT = `Usage:
+  layers-mcp-server onboard [<public-url>] [--base-url <url>]
+  layers-mcp-server [--api-key <key>] [--organization <id>] [--read-only]
+
+Run "layers-mcp-server onboard --help" for the same-session onboarding flow.
+`;
+const ONBOARD_HELP_OUTPUT = `Usage:
+  layers-mcp-server onboard
+  layers-mcp-server onboard <public-url>
+
+Without a URL, inspect the current product workspace locally, show the bounded
+Layers consent proposal, and continue in this same process. The legacy URL form
+remains available when no supported local workspace exists.
+
+Options:
+  --base-url <url>  Override the Layers API base URL
+  --help            Show this help
+`;
 
 const START_RESPONSE = {
   trialHandle: TRIAL_HANDLE,
@@ -835,18 +861,100 @@ test("unsupported start failure bodies retain the status and byte-count fallback
   }
 });
 
-test("the onboard CLI fails closed before session-bearing status can reach output", async () => {
+test("top-level and onboard help are exact and have no API or collector activity", async () => {
   await withMockApi(
-    async (_client, _requests, baseUrl) => {
+    async (_client, requests, baseUrl) => {
+      const cases = [
+        {
+          label: "top-level help",
+          args: ["--help", "--base-url", baseUrl],
+          stdout: MAIN_HELP_OUTPUT,
+        },
+        {
+          label: "onboard help",
+          args: ["onboard", "--help", "--base-url", baseUrl],
+          stdout: ONBOARD_HELP_OUTPUT,
+        },
+      ];
+
+      for (const helpCase of cases) {
+        const result = await spawnServer(helpCase.args, {
+          scrub: CLI_ENV_SCRUB,
+        });
+        assert.equal(result.code, 0, helpCase.label);
+        assert.equal(result.signal, null, helpCase.label);
+        assert.equal(result.stdout, helpCase.stdout, helpCase.label);
+        assert.equal(result.stderr, "", helpCase.label);
+      }
+
+      assert.deepEqual(
+        requests,
+        [],
+        "help must exit before API preflight or collector bootstrap",
+      );
+    },
+    {
+      apiKey: null,
+      handler: () => ({ status: 500, json: { error: "help contacted API" } }),
+    },
+  );
+});
+
+test("malformed or multiple onboard positionals fail before network activity", async () => {
+  await withMockApi(
+    async (_client, requests, baseUrl) => {
+      const malformed = await spawnServer(
+        ["onboard", "not a public URL", "--base-url", baseUrl],
+        { scrub: CLI_ENV_SCRUB },
+      );
+      assert.equal(malformed.code, 1);
+      assert.equal(malformed.stdout, "");
+      assert.equal(
+        malformed.stderr,
+        "The public product URL must be an absolute HTTP(S) URL\n",
+      );
+      assert.deepEqual(
+        requests,
+        [],
+        "a malformed public-URL positional must fail before challenge",
+      );
+
+      const multiple = await spawnServer(
+        [
+          "onboard",
+          "https://one.example.com",
+          "https://two.example.com",
+          "--base-url",
+          baseUrl,
+        ],
+        { scrub: CLI_ENV_SCRUB },
+      );
+      assert.equal(multiple.code, 1);
+      assert.equal(multiple.stdout, "");
+      assert.equal(multiple.stderr, ONBOARD_HELP_OUTPUT);
+      assert.deepEqual(
+        requests,
+        [],
+        "multiple positionals must fail before challenge",
+      );
+    },
+    {
+      apiKey: null,
+      handler: () => ({
+        status: 500,
+        json: { error: "invalid CLI contacted API" },
+      }),
+    },
+  );
+});
+
+test("the explicit-URL onboard CLI stays on the legacy rail and fails closed", async () => {
+  await withMockApi(
+    async (_client, requests, baseUrl) => {
       const result = await spawnServer(
         ["onboard", "https://example.com", "--base-url", baseUrl],
         {
-          scrub: [
-            "LAYERS_API_KEY",
-            "LAYERS_BASE_URL",
-            "LAYERS_ORGANIZATION",
-            "LAYERS_READ_ONLY",
-          ],
+          scrub: CLI_ENV_SCRUB,
         },
       );
       assert.equal(result.code, 1);
@@ -857,6 +965,20 @@ test("the onboard CLI fails closed before session-bearing status can reach outpu
       assert.match(result.stderr, /Onboarding status returned an invalid public response/);
       assert.doesNotMatch(result.stdout + result.stderr, new RegExp(ACCESS_TOKEN));
       assert.doesNotMatch(result.stdout + result.stderr, new RegExp(SESSION_HANDLE));
+
+      const paths = requests.map((request) => parseUrl(request).pathname);
+      assert.deepEqual(paths, [
+        "/api/onboard/agent/challenge",
+        "/api/onboard/agent/start",
+        `/api/onboard/agent/trials/${TRIAL_HANDLE}`,
+      ]);
+      for (const path of paths) {
+        assert.doesNotMatch(
+          path,
+          /\/capabilities$|\/evidence$|\/claim-attempts(?:\/|$)|\/exchange$|\/postclaim$/u,
+          "explicit-URL compatibility must not enter source onboarding",
+        );
+      }
     },
     {
       apiKey: null,

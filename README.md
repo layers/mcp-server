@@ -7,9 +7,35 @@ any MCP client.
 
 > Tool coverage tracks the Layers API reference.
 
-## Install
+## One-paste onboarding
 
-For keyless onboarding, start the connector without an API key:
+Run this from the product repository in the same Codex or Claude shell session:
+
+```sh
+npx --yes @layers/mcp-server@latest onboard
+```
+
+The command checks server compatibility before reading the workspace, runs the
+checksum-verified native collector locally, shows the exact bounded source-data
+proposal, and waits for explicit approval before sending evidence. It then
+surfaces the preview and attempt-bound browser claim URL and returns the safe
+post-claim workspace projection to the same process when the browser claim
+finishes within its bounded window. Reservation, transport, PKCE verifier,
+post-claim capability, full evidence-envelope, and transient excerpt values
+never enter terminal output; the bounded consent projection does.
+
+For ordinary public callers, a server that has not opened source admission stops
+the command before local inspection. An operator-only environment token can
+authorize a closed internal probe. The older public-URL compatibility form
+remains available:
+
+```sh
+npx --yes @layers/mcp-server@latest onboard https://example.com
+```
+
+## Install as an MCP server
+
+To expose the persistent Layers MCP tools without an existing API key:
 
 ```sh
 claude mcp add layers -- npx -y @layers/mcp-server@latest
@@ -83,16 +109,17 @@ The tool surface depends on how the server starts:
 `--read-only` hides workspace write tools (marked W below). The five onboarding
 tools remain available in keyless mode.
 
-### Keyless onboarding
+### Keyless onboarding tools
 
 `onboard_start` · `get_onboarding_status` · `onboard_claim_begin` ·
 `onboard_claim_verify` · `ask_elle`
 
-In a code workspace, `onboard_start` can reserve a protocol-v1 trial without a
-URL. That response is honestly limited to `awaiting_evidence`; the opaque
-reservation capability stays inside the server process. The source collector
-and evidence-submission step are not part of this package slice yet. Passing an
-explicit public product URL keeps the existing preview and claim flow working.
+`onboard_start` without a URL remains a reservation-only MCP tool. Its result is
+honestly limited to `awaiting_evidence`, and its opaque capability stays inside
+the server process. The full local inspection, consent, evidence, preview,
+browser claim, and same-process return path belongs to the one-shot
+`layers-mcp-server onboard` command above. Passing an explicit public product
+URL to the MCP tool keeps the existing preview and claim flow working.
 
 ### Workspace API tools (52)
 
@@ -162,11 +189,16 @@ npm run build                 # tsc -> dist/
 # wire the local build into Claude Code:
 claude mcp add layers -- node $(pwd)/dist/index.js --api-key lp_YOUR_KEY
 
+# exercise the same-session command from a product workspace:
+(cd /path/to/product && node /path/to/mcp-server/dist/index.js onboard)
+
 # or explore interactively with the MCP inspector:
 npx @modelcontextprotocol/inspector node dist/index.js --api-key lp_test_dummy
 ```
 
-stdout is the JSON-RPC channel — all logging goes to stderr.
+In MCP-server mode, stdout is the JSON-RPC channel and all logging goes to
+stderr. The one-shot onboarding CLI emits its documented JSONL events on stdout;
+the legacy URL form emits its compatibility output there.
 
 ## Testing
 
