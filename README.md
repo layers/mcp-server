@@ -27,10 +27,15 @@ never enter terminal output; the bounded consent projection does.
 ### Claude Code process control
 
 The command stays alive across scope review, human approval, preview creation,
-and claim. In Claude Code, run it as a native background Bash task so later tool
-calls can read its JSONL and answer its stdin. Do not put `&`, `nohup`, or a
-foreground `wait` around the command; those do not give Claude a controllable
-task handle.
+and claim. Each local source-inspection generation has a fixed 15-minute
+privacy lifetime. If that lifetime ends during scope review or consent, the
+command clears the expired local artifact and emits
+`input_required: resume_inspection`; `resume` performs a fresh inspection with
+fresh opaque IDs and requires a fresh proposal and approval. An expired
+proposal can never authorize an upload. In Claude Code, run the command as a
+native background Bash task so later tool calls can read its JSONL and answer
+its stdin. Do not put `&`, `nohup`, or a foreground `wait` around the command;
+those do not give Claude a controllable task handle.
 
 1. In a short foreground Bash call, create the private input pipe and retain the
    absolute directory printed by the last line:
@@ -54,17 +59,21 @@ task handle.
    The shell command itself stays in the foreground of the background task.
    Claude Code returns a task ID instead of blocking the conversation.
 
-3. Use `TaskOutput` on that task ID to read new JSONL. Send each advertised
-   response from a separate short Bash call, for example:
+3. Use `TaskOutput` on that task ID with `block: true` and a timeout no longer
+   than 15 seconds to read new JSONL. Send each advertised response from a
+   separate short Bash call, for example:
 
    ```sh
    printf '%s\n' 'prepare' > '/absolute/layers-onboard.ABC123/input'
    ```
 
-   Read `TaskOutput` again after every response. Relay the complete consent
-   proposal and wait for the human's explicit approval before writing the
-   advertised `approve <displayEventId> <sha256>` command. Keep the task alive
-   until a terminal `complete` event or an error.
+   Read `TaskOutput` again after every response. Print the complete
+   `consent_proposal.canonicalProjection` verbatim, along with its display ID,
+   display time, projection hash, and exact advertised approval command. End
+   the turn and wait for the human's explicit approval before writing that
+   command. If `resume_inspection` appears, send only its advertised `resume`
+   or `cancel` command; a resumed inspection requires a new proposal and new
+   approval. Keep the task alive until a terminal `complete` or `error` event.
 
 For ordinary public callers, a server that has not opened source admission stops
 the command before local inspection. An operator-only environment token can

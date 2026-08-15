@@ -138,6 +138,8 @@ type CleanupResult = Extract<
 >["cleanup"];
 
 export interface OnboardingCollectorSession {
+  readonly deadlineAtMs: number;
+  waitForTermination(): Promise<OnboardingCollectorTermination>;
   inspect(input?: {
     root?: string;
     selectedCandidateId?: string;
@@ -152,6 +154,17 @@ export interface OnboardingCollectorSession {
   complete(): Promise<CleanupResult>;
   cancel(): Promise<CleanupResult>;
   abort(): void;
+}
+
+export interface OnboardingCollectorTermination {
+  reason: "expired" | "failed";
+  error: OnboardingCollectorHostError;
+  /**
+   * Resolves after the staged binary and every collector-owned buffer have
+   * been released. A clean idle expiry returns the collector's bounded cleanup
+   * receipt; any termination without a native cleanup receipt returns null.
+   */
+  cleanup: Promise<CleanupResult | null>;
 }
 
 export interface OpenOnboardingCollectorOptions {
@@ -181,6 +194,7 @@ interface FrameWaiter {
   resolve: (frame: unknown) => void;
   reject: (error: Error) => void;
   timeout: NodeJS.Timeout;
+  deadlineAtMs?: number;
 }
 
 interface EndWaiter {
@@ -762,18 +776,36 @@ class BoundedJsonlReader {
     stream.once("close", () => this.#finish());
   }
 
-  next(timeoutMs: number): Promise<unknown> {
+  next(timeoutMs: number, deadlineAtMs?: number): Promise<unknown> {
     if (this.#failure) return Promise.reject(this.#failure);
     if (this.#ended || this.#waiter) return Promise.reject(protocolError());
+    const now = Date.now();
+    if (
+      deadlineAtMs !== undefined &&
+      (!Number.isFinite(deadlineAtMs) || now >= deadlineAtMs)
+    ) {
+      const error = timeoutError();
+      this.#fail(error);
+      return Promise.reject(error);
+    }
+    const effectiveTimeoutMs =
+      deadlineAtMs === undefined
+        ? timeoutMs
+        : Math.min(timeoutMs, deadlineAtMs - now);
     return new Promise<unknown>((resolveFrame, rejectFrame) => {
       const timeout = setTimeout(() => {
         this.#waiter = undefined;
         const error = timeoutError();
         rejectFrame(error);
         this.#fail(error);
-      }, timeoutMs);
+      }, effectiveTimeoutMs);
       timeout.unref?.();
-      this.#waiter = { resolve: resolveFrame, reject: rejectFrame, timeout };
+      this.#waiter = {
+        resolve: resolveFrame,
+        reject: rejectFrame,
+        timeout,
+        ...(deadlineAtMs !== undefined ? { deadlineAtMs } : {}),
+      };
     });
   }
 
@@ -829,6 +861,14 @@ class BoundedJsonlReader {
       this.#fail(protocolError());
       return;
     }
+    if (
+      this.#waiter.deadlineAtMs !== undefined &&
+      Date.now() >= this.#waiter.deadlineAtMs
+    ) {
+      if (this.#wipeChunks) bytes.fill(0);
+      this.#fail(timeoutError());
+      return;
+    }
     if (this.#buffer.byteLength + bytes.byteLength > this.#maxFrameBytes + 1) {
       if (this.#wipeChunks) bytes.fill(0);
       this.#fail(protocolError());
@@ -855,17 +895,43 @@ class BoundedJsonlReader {
       clearTimeout(waiter.timeout);
       try {
         if (raw[raw.byteLength - 1] === 0x0d) throw protocolError();
+        // Private response frames can contain bounded excerpts. Re-check the
+        // absolute generation deadline immediately before decoding so a host
+        // that resumes after suspend clears bytes instead of materializing a
+        // stale excerpt-bearing body.
+        if (
+          waiter.deadlineAtMs !== undefined &&
+          Date.now() >= waiter.deadlineAtMs
+        ) {
+          throw timeoutError();
+        }
         const text = new TextDecoder("utf-8", { fatal: true }).decode(raw);
+        if (
+          waiter.deadlineAtMs !== undefined &&
+          Date.now() >= waiter.deadlineAtMs
+        ) {
+          throw timeoutError();
+        }
         const frame = JSON.parse(text) as unknown;
+        if (
+          waiter.deadlineAtMs !== undefined &&
+          Date.now() >= waiter.deadlineAtMs
+        ) {
+          throw timeoutError();
+        }
         if (!asRecord(frame)) throw protocolError();
         // The collector protocol is serialized: one request permits exactly
         // one frame on this stream. Even an unterminated suffix is therefore
         // unsolicited output, not a legitimate partial next response.
         if (this.#buffer.byteLength !== 0) throw protocolError();
         waiter.resolve(frame);
-      } catch {
-        waiter.reject(protocolError());
-        this.#fail(protocolError());
+      } catch (error) {
+        const safeError =
+          error instanceof OnboardingCollectorHostError
+            ? error
+            : protocolError();
+        waiter.reject(safeError);
+        this.#fail(safeError);
         return;
       } finally {
         raw.fill(0);
@@ -1114,11 +1180,22 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   readonly #launchDirectory: string;
   readonly #signal: AbortSignal | undefined;
   readonly #abortListener: (() => void) | undefined;
+  readonly #deadlineAtMs: number;
   readonly #deadlineTimer: NodeJS.Timeout;
+  readonly #termination: Promise<OnboardingCollectorTermination>;
+  readonly #resolveTermination: (
+    termination: OnboardingCollectorTermination,
+  ) => void;
   #state:
-    "opened" | "inspected" | "prepared" | "closing" | "closed" | "failed" =
-    "opened";
+    | "opened"
+    | "inspected"
+    | "prepared"
+    | "closing"
+    | "closed"
+    | "expired"
+    | "failed" = "opened";
   #operationActive = false;
+  #terminationPublished = false;
   #latestInspection: InspectionResponse | undefined;
   #latestPrepared: OnboardingPreparedCodebaseArtifact | undefined;
 
@@ -1134,6 +1211,16 @@ class NativeCollectorSession implements OnboardingCollectorSession {
     this.#privateFrames = privateFrames;
     this.#launchDirectory = launchDirectory;
     this.#signal = options.signal;
+    let resolveTermination:
+      | ((termination: OnboardingCollectorTermination) => void)
+      | undefined;
+    this.#termination = new Promise<OnboardingCollectorTermination>(
+      (resolveValue) => {
+        resolveTermination = resolveValue;
+      },
+    );
+    this.#resolveTermination = (termination) =>
+      resolveTermination?.(termination);
     this.#abortListener = options.signal
       ? () => {
           this.abort();
@@ -1141,16 +1228,31 @@ class NativeCollectorSession implements OnboardingCollectorSession {
       : undefined;
     const requestedDeadline = options.deadlineAtMs ?? Number.POSITIVE_INFINITY;
     const deadlineAt = Math.min(Date.now() + SESSION_MAX_MS, requestedDeadline);
+    this.#deadlineAtMs = deadlineAt;
     const remaining = Math.max(0, deadlineAt - Date.now());
     this.#deadlineTimer = setTimeout(() => {
       if (
         !this.#operationActive &&
         this.#state !== "closing" &&
-        this.#state !== "closed"
+        this.#state !== "closed" &&
+        this.#state !== "expired" &&
+        this.#state !== "failed"
       ) {
-        void this.cancel().catch(() => this.#fail(timeoutError()));
+        const error = timeoutError();
+        const cleanup = this.cancel().then(
+          (result) => {
+            this.#state = "expired";
+            return result;
+          },
+          async () => {
+            this.#state = "expired";
+            await this.#runtime.hardStop();
+            return null;
+          },
+        );
+        this.#publishTermination({ reason: "expired", error, cleanup });
       } else {
-        this.#fail(timeoutError());
+        this.#fail(timeoutError(), "expired");
       }
     }, remaining);
     this.#deadlineTimer.unref?.();
@@ -1169,18 +1271,39 @@ class NativeCollectorSession implements OnboardingCollectorSession {
       if (
         this.#state !== "closing" &&
         this.#state !== "closed" &&
+        this.#state !== "expired" &&
         this.#state !== "failed"
       ) {
         this.#state = "failed";
         this.#latestPrepared = undefined;
+        this.#latestInspection = undefined;
         this.#clearLifecycleHooks();
-        void runtime.releaseAfterCleanExit().catch(() => undefined);
+        const cleanup = runtime
+          .releaseAfterCleanExit()
+          .then(() => null as CleanupResult | null);
+        this.#publishTermination({
+          reason: "failed",
+          error: failedError(),
+          cleanup,
+        });
       }
     });
   }
 
+  waitForTermination(): Promise<OnboardingCollectorTermination> {
+    return this.#termination;
+  }
+
+  get deadlineAtMs(): number {
+    return this.#deadlineAtMs;
+  }
+
   transportFailed(error: Error): void {
-    this.#fail(error);
+    const expired =
+      error instanceof OnboardingCollectorHostError &&
+      error.supportCode === "ONBOARD_COLLECTOR_TIMEOUT" &&
+      Date.now() >= this.#deadlineAtMs;
+    this.#fail(error, expired ? "expired" : "failed");
   }
 
   async inspect(
@@ -1190,6 +1313,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
     } = {},
   ): Promise<InspectionResponse> {
     return await this.#exclusive(async () => {
+      this.#requireBeforeDeadline();
       this.#requireState("opened");
       const root = resolve(this.#launchDirectory, input.root ?? ".");
       const request = OnboardingCollectorRequestSchema.parse({
@@ -1211,6 +1335,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
 
   async select(selectedCandidateId: string): Promise<InspectionResponse> {
     return await this.#exclusive(async () => {
+      this.#requireBeforeDeadline();
       this.#requireState("inspected");
       const request = OnboardingCollectorRequestSchema.parse({
         type: "select",
@@ -1231,6 +1356,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
     selectedTargetIds: string[];
   }): Promise<InspectionResponse> {
     return await this.#exclusive(async () => {
+      this.#requireBeforeDeadline();
       this.#requireOneOfStates("inspected", "prepared");
       // A displayed proposal may be corrected. Its private artifact is no
       // longer eligible for approval once a reinspection starts; retain only
@@ -1252,6 +1378,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
 
   async prepare(): Promise<OnboardingPreparedCodebaseArtifact> {
     return await this.#exclusive(async () => {
+      this.#requireBeforeDeadline();
       this.#requireOneOfStates("inspected", "prepared");
       if (this.#latestInspection?.projection.status !== "ready") {
         throw protocolError();
@@ -1262,13 +1389,20 @@ class NativeCollectorSession implements OnboardingCollectorSession {
       const request = OnboardingCollectorRequestSchema.parse({
         type: "prepare",
       });
-      const publicFrame = this.#publicFrames.next(PREPARE_TIMEOUT_MS);
-      const privateFrame = this.#privateFrames.next(PREPARE_TIMEOUT_MS);
+      const publicFrame = this.#publicFrames.next(
+        PREPARE_TIMEOUT_MS,
+        this.#deadlineAtMs,
+      );
+      const privateFrame = this.#privateFrames.next(
+        PREPARE_TIMEOUT_MS,
+        this.#deadlineAtMs,
+      );
       const [, publicValue, privateValue] = await Promise.all([
         this.#send(request),
         publicFrame,
         privateFrame,
       ]);
+      this.#requireBeforeDeadline();
       const publicResponse =
         OnboardingCollectorResponseSchema.parse(publicValue);
       const privateResponse: OnboardingCollectorPrivateResponse =
@@ -1289,6 +1423,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   }
 
   async complete(): Promise<CleanupResult> {
+    this.#requireBeforeDeadline();
     this.#requireState("prepared");
     return await this.#cleanup("complete");
   }
@@ -1305,7 +1440,12 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   }
 
   abort(): void {
-    if (this.#state === "closed" || this.#state === "failed") return;
+    if (
+      this.#state === "closed" ||
+      this.#state === "expired" ||
+      this.#state === "failed"
+    )
+      return;
     this.#fail(failedError());
   }
 
@@ -1313,7 +1453,10 @@ class NativeCollectorSession implements OnboardingCollectorSession {
     request: OnboardingCollectorRequest,
     timeoutMs: number,
   ): Promise<InspectionResponse> {
-    const responseFrame = this.#publicFrames.next(timeoutMs);
+    const responseFrame = this.#publicFrames.next(
+      timeoutMs,
+      this.#deadlineAtMs,
+    );
     const [, value] = await Promise.all([this.#send(request), responseFrame]);
     const response = OnboardingCollectorResponseSchema.parse(value);
     this.#publicFrames.assertOpen();
@@ -1387,6 +1530,13 @@ class NativeCollectorSession implements OnboardingCollectorSession {
     if (this.#state !== first && this.#state !== second) throw protocolError();
   }
 
+  #requireBeforeDeadline(): void {
+    if (Date.now() < this.#deadlineAtMs) return;
+    const error = timeoutError();
+    this.#fail(error, "expired");
+    throw error;
+  }
+
   async #exclusive<T>(operation: () => Promise<T>): Promise<T> {
     if (this.#operationActive) throw protocolError();
     this.#operationActive = true;
@@ -1396,21 +1546,46 @@ class NativeCollectorSession implements OnboardingCollectorSession {
     } catch (error) {
       const safeError =
         error instanceof OnboardingCollectorHostError ? error : protocolError();
+      this.#fail(safeError);
       await this.#runtime.hardStop().catch(() => undefined);
-      this.#state = "failed";
-      this.#clearLifecycleHooks();
       throw safeError;
     } finally {
       this.#operationActive = false;
     }
   }
 
-  #fail(error: Error): void {
-    if (this.#state === "closed" || this.#state === "failed") return;
-    this.#state = "failed";
+  #fail(
+    error: Error,
+    reason: OnboardingCollectorTermination["reason"] = "failed",
+  ): void {
+    if (
+      this.#state === "closed" ||
+      this.#state === "expired" ||
+      this.#state === "failed"
+    )
+      return;
+    this.#state = reason === "expired" ? "expired" : "failed";
     this.#latestPrepared = undefined;
+    this.#latestInspection = undefined;
     this.#clearLifecycleHooks();
     this.#runtime.fail(error);
+    const safeError =
+      error instanceof OnboardingCollectorHostError ? error : failedError();
+    this.#publishTermination({
+      reason,
+      error: safeError,
+      cleanup: this.#runtime
+        .hardStop()
+        .then(() => null as CleanupResult | null),
+    });
+  }
+
+  #publishTermination(termination: OnboardingCollectorTermination): void {
+    if (this.#terminationPublished) return;
+    this.#terminationPublished = true;
+    this.#latestPrepared = undefined;
+    this.#latestInspection = undefined;
+    this.#resolveTermination(termination);
   }
 
   #clearLifecycleHooks(): void {

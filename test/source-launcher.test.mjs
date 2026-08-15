@@ -5,10 +5,11 @@ import { readdirSync } from "node:fs";
 import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import http from "node:http";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import test from "node:test";
 import { promisify } from "node:util";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 import {
   ONBOARDING_CAPABILITY_READINESS_CHECK_IDS,
@@ -39,6 +40,7 @@ import { rememberReservation } from "../dist/onboarding/session.js";
 import { SERVER } from "./helpers.mjs";
 
 const execFileAsync = promisify(execFile);
+const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const REQUEST_TIMEOUT_MS = 45_000;
 const STAGE_PREFIX = "layers-onboarding-collector-";
 
@@ -189,7 +191,10 @@ function requestsAt(requests, pathname) {
   return requests.filter((request) => request.pathname === pathname);
 }
 
-async function createMockApi(temporaryRoot) {
+async function createMockApi(
+  temporaryRoot,
+  { startResponse = START_RESPONSE } = {},
+) {
   const requests = [];
   const unexpectedRequests = [];
   let exchangeCount = 0;
@@ -255,7 +260,7 @@ async function createMockApi(temporaryRoot) {
         request.method === "POST" &&
         pathname === ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.start
       ) {
-        respondJson(response, 202, START_RESPONSE);
+        respondJson(response, 202, startResponse);
         return;
       }
       if (request.method === "POST" && pathname === evidencePath) {
@@ -412,13 +417,19 @@ async function createSingleProductGitFixture(root) {
   return workspace;
 }
 
-function spawnLauncher(workspace, baseUrl, temporaryRoot) {
+function spawnLauncher(
+  workspace,
+  baseUrl,
+  temporaryRoot,
+  { argv = [SERVER, "onboard", "--base-url", baseUrl], extraEnv = {} } = {},
+) {
   const env = {
     ...process.env,
     LAYERS_ONBOARD_INTERNAL_PROBE_TOKEN: INTERNAL_PROBE_TOKEN,
     TMPDIR: temporaryRoot,
     TMP: temporaryRoot,
     TEMP: temporaryRoot,
+    ...extraEnv,
   };
   for (const name of [
     "LAYERS_API_KEY",
@@ -431,7 +442,7 @@ function spawnLauncher(workspace, baseUrl, temporaryRoot) {
 
   const child = spawn(
     process.execPath,
-    [SERVER, "onboard", "--base-url", baseUrl],
+    argv,
     { cwd: workspace, env, stdio: ["pipe", "pipe", "pipe"] },
   );
   child.stdout.setEncoding("utf8");
@@ -464,6 +475,110 @@ function spawnLauncher(workspace, baseUrl, temporaryRoot) {
       return stderr;
     },
   };
+}
+
+async function writeExpiryDriver(temporaryRoot) {
+  const driverPath = join(temporaryRoot, "source-launcher-expiry-driver.mjs");
+  const launcherUrl = pathToFileURL(
+    join(PROJECT_ROOT, "dist", "onboarding", "launcher.js"),
+  ).href;
+  const collectorHostUrl = pathToFileURL(
+    join(PROJECT_ROOT, "dist", "onboarding", "collector-host.js"),
+  ).href;
+  const source = [
+    `import { runSourceOnboardCli } from ${JSON.stringify(launcherUrl)};`,
+    `import { OnboardingCollectorHostError, openOnboardingCollector } from ${JSON.stringify(collectorHostUrl)};`,
+    "",
+    "const baseUrl = process.argv[2];",
+    "const supportCode = process.env.LAYERS_TEST_COLLECTOR_SUPPORT_CODE;",
+    "const supportFailureGeneration = Number.parseInt(process.env.LAYERS_TEST_COLLECTOR_FAIL_GENERATION ?? '1', 10);",
+    "const expiringGenerations = Number.parseInt(process.env.LAYERS_TEST_EXPIRING_GENERATIONS ?? '0', 10);",
+    "const generationMs = Number.parseInt(process.env.LAYERS_TEST_GENERATION_MS ?? '5000', 10);",
+    "const cleanupUnproved = process.env.LAYERS_TEST_CLEANUP_UNPROVED === '1';",
+    "let generation = 0;",
+    "",
+    "function withTermination(session, transform) {",
+    "  return {",
+    "    get deadlineAtMs() { return session.deadlineAtMs; },",
+    "    waitForTermination: async () => transform(await session.waitForTermination()),",
+    "    inspect: session.inspect.bind(session),",
+    "    select: session.select.bind(session),",
+    "    reinspect: session.reinspect.bind(session),",
+    "    prepare: session.prepare.bind(session),",
+    "    complete: session.complete.bind(session),",
+    "    cancel: session.cancel.bind(session),",
+    "    abort: session.abort.bind(session),",
+    "  };",
+    "}",
+    "",
+    "const openCollector = async (options) => {",
+    "  generation += 1;",
+    "  if (supportCode && generation === supportFailureGeneration) {",
+    "    if (supportCode === 'ONBOARD_COLLECTOR_TIMEOUT') {",
+    "      return await openOnboardingCollector({ ...options, deadlineAtMs: Date.now() - 1 });",
+    "    }",
+    "    throw new OnboardingCollectorHostError(supportCode, 'Injected bounded collector failure.');",
+    "  }",
+    "  const expires = generation <= expiringGenerations;",
+    "  const session = await openOnboardingCollector({",
+    "    ...options,",
+    "    ...(expires ? { deadlineAtMs: Date.now() + generationMs } : {}),",
+    "  });",
+    "  if (!cleanupUnproved || generation !== 1) return session;",
+    "  return withTermination(session, (termination) => ({",
+    "    ...termination,",
+    "    cleanup: termination.cleanup.then(() => null),",
+    "  }));",
+    "};",
+    "",
+    "try {",
+    "  await runSourceOnboardCli(",
+    "    { baseUrl, launcherVersion: '1.2.3' },",
+    "    { openCollector },",
+    "  );",
+    "} catch (error) {",
+    "  console.error(error instanceof Error ? error.message : String(error));",
+    "  process.exitCode = 1;",
+    "}",
+    "",
+  ].join("\n");
+  await writeFile(driverPath, source, { mode: 0o600 });
+  return driverPath;
+}
+
+function parseOutputEvents(stdout) {
+  return stdout
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+function assertSingleTerminalError(run, expected) {
+  const events = parseOutputEvents(run.stdout);
+  const terminal = events.filter((event) => event.type === "error");
+  assert.deepEqual(terminal, [
+    {
+      type: "error",
+      stage: "review_scope",
+      evidenceSubmitted: false,
+      ...expected,
+    },
+  ]);
+  assert.equal(events.some((event) => event.type === "complete"), false);
+  const combinedOutput = `${run.stdout}\n${run.stderr}`;
+  for (const [label, secret] of [
+    ["reservation capability", RESERVATION_CAPABILITY],
+    ["internal probe", INTERNAL_PROBE_TOKEN],
+    ["source body", SOURCE_BODY_SENTINEL],
+    ["source secret", SOURCE_SECRET_SENTINEL],
+  ]) {
+    assert.equal(
+      combinedOutput.includes(secret),
+      false,
+      `terminal output disclosed ${label}`,
+    );
+  }
 }
 
 async function withTimeout(promise, label, timeoutMs = REQUEST_TIMEOUT_MS) {
@@ -904,6 +1019,683 @@ test(
       ) {
         run.child.kill();
         await withTimeout(run.exit, "launcher cleanup", 5_000).catch(() => {});
+      }
+      await api?.close();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "expires review and approval generations, rejects stale commands, and resumes the same reservation with fresh consent",
+  { timeout: 90_000 },
+  async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "layers-source-resume-test-"),
+    );
+    let api;
+    let run;
+    try {
+      const workspace = await createSingleProductGitFixture(temporaryRoot);
+      const driverPath = await writeExpiryDriver(temporaryRoot);
+      api = await createMockApi(temporaryRoot);
+      run = spawnLauncher(workspace, api.baseUrl, temporaryRoot, {
+        argv: [driverPath, api.baseUrl],
+        extraEnv: {
+          LAYERS_TEST_EXPIRING_GENERATIONS: "2",
+          LAYERS_TEST_GENERATION_MS: "5000",
+        },
+      });
+
+      const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
+        ":trialHandle",
+        TRIAL_HANDLE,
+      );
+      const startPath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.start;
+      const pathIds = (inspection) =>
+        inspection.consentPathItems.map((item) => item.pathId).sort();
+
+      const firstInspection = (
+        await nextEvent(
+          run,
+          (event) => event.type === "inspection",
+          "first inspection",
+        )
+      ).inspection;
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "review_scope",
+        "first review prompt",
+      );
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+
+      assert.deepEqual(
+        await nextEvent(
+          run,
+          (event) => event.stage === "source_review_expired",
+          "first generation expiry",
+        ),
+        {
+          type: "status",
+          stage: "source_review_expired",
+          message:
+            "The prior local inspection expired and was cleared. No evidence was sent.",
+        },
+      );
+      assert.deepEqual(
+        (await readdir(temporaryRoot, { withFileTypes: true }))
+          .filter(
+            (entry) =>
+              entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+          )
+          .map((entry) => entry.name),
+        [],
+      );
+      const firstResumePrompt = await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "resume_inspection",
+        "first resume prompt",
+      );
+      assert.deepEqual(firstResumePrompt.commands, ["resume", "cancel"]);
+
+      await writeCommand(run, "prepare");
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "resume_inspection",
+        "resume prompt after stale prepare",
+      );
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      assert.equal(requestsAt(api.requests, startPath).length, 1);
+      await writeCommand(run, "resume");
+
+      const secondInspection = (
+        await nextEvent(
+          run,
+          (event) => event.type === "inspection",
+          "fresh inspection after review expiry",
+        )
+      ).inspection;
+      assert.notDeepEqual(pathIds(secondInspection), pathIds(firstInspection));
+      assert.equal(
+        secondInspection.selectedCandidateId,
+        firstInspection.selectedCandidateId,
+      );
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "review_scope",
+        "second review prompt",
+      );
+      await writeCommand(run, "prepare");
+
+      const expiredProposal = await nextEvent(
+        run,
+        (event) => event.type === "consent_proposal",
+        "proposal that will expire",
+      );
+      const staleApproval =
+        `approve ${expiredProposal.displayEventId} ${expiredProposal.canonicalProjectionSha256}`;
+      const secondApprovalPrompt = await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "approve_consent",
+        "approval prompt that will expire",
+      );
+      assert.equal(secondApprovalPrompt.commands[0], staleApproval);
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+
+      await nextEvent(
+        run,
+        (event) => event.stage === "source_review_expired",
+        "approval generation expiry",
+      );
+      assert.deepEqual(
+        (await readdir(temporaryRoot, { withFileTypes: true }))
+          .filter(
+            (entry) =>
+              entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+          )
+          .map((entry) => entry.name),
+        [],
+      );
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "resume_inspection",
+        "resume prompt after approval expiry",
+      );
+      await writeCommand(run, staleApproval);
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "resume_inspection",
+        "resume prompt after stale approval",
+      );
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      assert.equal(requestsAt(api.requests, startPath).length, 1);
+      await writeCommand(run, "resume");
+
+      const thirdInspection = (
+        await nextEvent(
+          run,
+          (event) => event.type === "inspection",
+          "fresh inspection after approval expiry",
+        )
+      ).inspection;
+      assert.notDeepEqual(pathIds(thirdInspection), pathIds(secondInspection));
+      assert.equal(
+        thirdInspection.selectedCandidateId,
+        secondInspection.selectedCandidateId,
+      );
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "review_scope",
+        "third review prompt",
+      );
+      await writeCommand(run, "prepare");
+
+      const freshProposal = await nextEvent(
+        run,
+        (event) => event.type === "consent_proposal",
+        "fresh proposal",
+      );
+      assert.notEqual(freshProposal.displayEventId, expiredProposal.displayEventId);
+      assert.notEqual(
+        freshProposal.canonicalProjectionSha256,
+        expiredProposal.canonicalProjectionSha256,
+      );
+      const freshApproval =
+        `approve ${freshProposal.displayEventId} ${freshProposal.canonicalProjectionSha256}`;
+      assert.notEqual(freshApproval, staleApproval);
+      const freshApprovalPrompt = await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "approve_consent",
+        "fresh approval prompt",
+      );
+      assert.equal(freshApprovalPrompt.commands[0], freshApproval);
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      await writeCommand(run, freshApproval, true);
+
+      await nextEvent(
+        run,
+        (event) => event.type === "complete" && event.state === "claimed",
+        "claimed completion after fresh approval",
+      );
+      assert.deepEqual(await withTimeout(run.exit, "resumed launcher exit"), {
+        code: 0,
+        signal: null,
+      });
+
+      const outputEvents = parseOutputEvents(run.stdout);
+      assert.equal(
+        outputEvents.filter(
+          (event) =>
+            event.type === "status" &&
+            event.stage === "source_review_expired",
+        ).length,
+        2,
+      );
+      assert.equal(
+        outputEvents.filter(
+          (event) =>
+            event.type === "input_required" &&
+            event.operation === "resume_inspection",
+        ).length,
+        4,
+      );
+      assert.equal(requestsAt(api.requests, startPath).length, 1);
+      const evidenceRequests = requestsAt(api.requests, evidencePath);
+      assert.equal(evidenceRequests.length, 1);
+      const envelope = OnboardingEvidenceEnvelopeSchema.parse(
+        JSON.parse(evidenceRequests[0].body),
+      );
+      assert.deepEqual(
+        envelope.consentProposal,
+        JSON.parse(freshProposal.canonicalProjection),
+      );
+      assert.equal(
+        envelope.consentDisplay.displayEventId,
+        freshProposal.displayEventId,
+      );
+      assert.notEqual(
+        envelope.consentDisplay.displayEventId,
+        expiredProposal.displayEventId,
+      );
+      assert.equal(outputEvents.some((event) => event.type === "error"), false);
+    } finally {
+      run?.lines.close();
+      run?.child.stdin.destroy();
+      if (
+        run &&
+        run.child.exitCode === null &&
+        run.child.signalCode === null
+      ) {
+        run.child.kill();
+        await withTimeout(run.exit, "resume test cleanup", 5_000).catch(
+          () => {},
+        );
+      }
+      await api?.close();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "emits one nonretryable reservation-expired event without opening a collector or submitting evidence",
+  { timeout: 15_000 },
+  async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "layers-source-reservation-expired-test-"),
+    );
+    let api;
+    let run;
+    try {
+      const workspace = await createSingleProductGitFixture(temporaryRoot);
+      const driverPath = await writeExpiryDriver(temporaryRoot);
+      const startResponse = OnboardAgentEvidenceStartResponseSchema.parse({
+        ...START_RESPONSE,
+        expiresAt: new Date(Date.now() - 1_000).toISOString(),
+      });
+      api = await createMockApi(temporaryRoot, { startResponse });
+      run = spawnLauncher(workspace, api.baseUrl, temporaryRoot, {
+        argv: [driverPath, api.baseUrl],
+      });
+
+      const terminal = await nextEvent(
+        run,
+        (event) => event.type === "error",
+        "reservation expiry",
+      );
+      assert.deepEqual(terminal, {
+        type: "error",
+        stage: "review_scope",
+        code: "ONBOARD_RESERVATION_EXPIRED",
+        retryable: false,
+        evidenceSubmitted: false,
+        message: "The source reservation expired; no evidence was sent.",
+      });
+      assert.deepEqual(
+        await withTimeout(run.exit, "reservation-expired launcher exit"),
+        { code: 1, signal: null },
+      );
+      assertSingleTerminalError(run, {
+        code: "ONBOARD_RESERVATION_EXPIRED",
+        retryable: false,
+        message: "The source reservation expired; no evidence was sent.",
+      });
+
+      const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
+        ":trialHandle",
+        TRIAL_HANDLE,
+      );
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      assert.deepEqual(
+        (await readdir(temporaryRoot, { withFileTypes: true }))
+          .filter(
+            (entry) =>
+              entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+          )
+          .map((entry) => entry.name),
+        [],
+      );
+    } finally {
+      run?.lines.close();
+      run?.child.stdin.destroy();
+      if (
+        run &&
+        run.child.exitCode === null &&
+        run.child.signalCode === null
+      ) {
+        run.child.kill();
+        await withTimeout(run.exit, "reservation expiry cleanup", 5_000).catch(
+          () => {},
+        );
+      }
+      await api?.close();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
+  "validates expiry cleanup before terminal reservation classification",
+  { timeout: 30_000 },
+  async (testContext) => {
+    const cases = [
+      {
+        name: "proved cleanup",
+        cleanupUnproved: false,
+        expected: {
+          code: "ONBOARD_RESERVATION_EXPIRED",
+          retryable: false,
+          message: "The source reservation expired; no evidence was sent.",
+        },
+      },
+      {
+        name: "unproved cleanup",
+        cleanupUnproved: true,
+        expected: {
+          code: "ONBOARD_COLLECTOR_FAILED",
+          retryable: false,
+          message: "Local source review could not continue; no evidence was sent.",
+        },
+      },
+    ];
+
+    for (const scenario of cases) {
+      await testContext.test(scenario.name, { timeout: 15_000 }, async () => {
+        const temporaryRoot = await mkdtemp(
+          join(tmpdir(), "layers-source-deadline-cleanup-test-"),
+        );
+        let api;
+        let run;
+        try {
+          const workspace = await createSingleProductGitFixture(temporaryRoot);
+          const driverPath = await writeExpiryDriver(temporaryRoot);
+          const startResponse = OnboardAgentEvidenceStartResponseSchema.parse({
+            ...START_RESPONSE,
+            expiresAt: new Date(Date.now() + 5_000).toISOString(),
+          });
+          api = await createMockApi(temporaryRoot, { startResponse });
+          run = spawnLauncher(workspace, api.baseUrl, temporaryRoot, {
+            argv: [driverPath, api.baseUrl],
+            extraEnv: {
+              ...(scenario.cleanupUnproved
+                ? { LAYERS_TEST_CLEANUP_UNPROVED: "1" }
+                : {}),
+            },
+          });
+
+          await nextEvent(
+            run,
+            (event) => event.type === "inspection",
+            `${scenario.name} inspection`,
+          );
+          await nextEvent(
+            run,
+            (event) =>
+              event.type === "input_required" &&
+              event.operation === "review_scope",
+            `${scenario.name} review prompt`,
+          );
+          const terminal = await nextEvent(
+            run,
+            (event) => event.type === "error",
+            `${scenario.name} terminal event`,
+          );
+          assert.deepEqual(terminal, {
+            type: "error",
+            stage: "review_scope",
+            evidenceSubmitted: false,
+            ...scenario.expected,
+          });
+          assert.deepEqual(
+            await withTimeout(run.exit, `${scenario.name} launcher exit`),
+            { code: 1, signal: null },
+          );
+          assertSingleTerminalError(run, scenario.expected);
+
+          const events = parseOutputEvents(run.stdout);
+          assert.equal(
+            events.some((event) => event.stage === "source_review_expired"),
+            false,
+          );
+          assert.equal(
+            events.some(
+              (event) =>
+                event.type === "input_required" &&
+                event.operation === "resume_inspection",
+            ),
+            false,
+          );
+          const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
+            ":trialHandle",
+            TRIAL_HANDLE,
+          );
+          assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+          assert.deepEqual(
+            (await readdir(temporaryRoot, { withFileTypes: true }))
+              .filter(
+                (entry) =>
+                  entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+              )
+              .map((entry) => entry.name),
+            [],
+          );
+        } finally {
+          run?.lines.close();
+          run?.child.stdin.destroy();
+          if (
+            run &&
+            run.child.exitCode === null &&
+            run.child.signalCode === null
+          ) {
+            run.child.kill();
+            await withTimeout(
+              run.exit,
+              `${scenario.name} cleanup`,
+              5_000,
+            ).catch(() => {});
+          }
+          await api?.close();
+          await rm(temporaryRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  },
+);
+
+test(
+  "preserves fresh-inspection support codes and only marks an actual timeout retryable",
+  { timeout: 60_000 },
+  async (testContext) => {
+    const cases = [
+      ["ONBOARD_COLLECTOR_TIMEOUT", true],
+      ["ONBOARD_COLLECTOR_INTEGRITY", false],
+      ["ONBOARD_COLLECTOR_PROTOCOL", false],
+      ["ONBOARD_COLLECTOR_FAILED", false],
+    ];
+
+    for (const [supportCode, retryable] of cases) {
+      await testContext.test(supportCode, { timeout: 20_000 }, async () => {
+        const temporaryRoot = await mkdtemp(
+          join(tmpdir(), "layers-source-support-code-test-"),
+        );
+        let api;
+        let run;
+        try {
+          const workspace = await createSingleProductGitFixture(temporaryRoot);
+          const driverPath = await writeExpiryDriver(temporaryRoot);
+          api = await createMockApi(temporaryRoot);
+          run = spawnLauncher(workspace, api.baseUrl, temporaryRoot, {
+            argv: [driverPath, api.baseUrl],
+            extraEnv: {
+              LAYERS_TEST_COLLECTOR_SUPPORT_CODE: supportCode,
+              LAYERS_TEST_COLLECTOR_FAIL_GENERATION: "2",
+              LAYERS_TEST_EXPIRING_GENERATIONS: "1",
+              LAYERS_TEST_GENERATION_MS: "4000",
+            },
+          });
+
+          await nextEvent(
+            run,
+            (event) => event.type === "inspection",
+            `${supportCode} first inspection`,
+          );
+          await nextEvent(
+            run,
+            (event) =>
+              event.type === "input_required" &&
+              event.operation === "review_scope",
+            `${supportCode} first review prompt`,
+          );
+          await nextEvent(
+            run,
+            (event) => event.stage === "source_review_expired",
+            `${supportCode} first generation expiry`,
+          );
+          await nextEvent(
+            run,
+            (event) =>
+              event.type === "input_required" &&
+              event.operation === "resume_inspection",
+            `${supportCode} resume prompt`,
+          );
+          await writeCommand(run, "resume");
+
+          const terminal = await nextEvent(
+            run,
+            (event) => event.type === "error",
+            `${supportCode} terminal event`,
+          );
+          assert.deepEqual(terminal, {
+            type: "error",
+            stage: "review_scope",
+            code: supportCode,
+            retryable,
+            evidenceSubmitted: false,
+            message: "Local source review could not continue; no evidence was sent.",
+          });
+          assert.deepEqual(
+            await withTimeout(run.exit, `${supportCode} launcher exit`),
+            { code: 1, signal: null },
+          );
+          assertSingleTerminalError(run, {
+            code: supportCode,
+            retryable,
+            message: "Local source review could not continue; no evidence was sent.",
+          });
+
+          assert.equal(
+            requestsAt(
+              api.requests,
+              ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.start,
+            ).length,
+            1,
+          );
+          const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
+            ":trialHandle",
+            TRIAL_HANDLE,
+          );
+          assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+          assert.deepEqual(
+            (await readdir(temporaryRoot, { withFileTypes: true }))
+              .filter(
+                (entry) =>
+                  entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+              )
+              .map((entry) => entry.name),
+            [],
+          );
+        } finally {
+          run?.lines.close();
+          run?.child.stdin.destroy();
+          if (
+            run &&
+            run.child.exitCode === null &&
+            run.child.signalCode === null
+          ) {
+            run.child.kill();
+            await withTimeout(run.exit, `${supportCode} cleanup`, 5_000).catch(
+              () => {},
+            );
+          }
+          await api?.close();
+          await rm(temporaryRoot, { recursive: true, force: true });
+        }
+      });
+    }
+  },
+);
+
+test(
+  "maps a real unsupported workspace to one nonretryable terminal event after cleanup",
+  { timeout: 15_000 },
+  async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "layers-source-unsupported-test-"),
+    );
+    let api;
+    let run;
+    try {
+      const workspace = join(temporaryRoot, "unsupported-workspace");
+      await mkdir(workspace, { recursive: true, mode: 0o755 });
+      const driverPath = await writeExpiryDriver(temporaryRoot);
+      api = await createMockApi(temporaryRoot);
+      run = spawnLauncher(workspace, api.baseUrl, temporaryRoot, {
+        argv: [driverPath, api.baseUrl],
+      });
+
+      const inspection = await nextEvent(
+        run,
+        (event) => event.type === "inspection",
+        "unsupported workspace inspection",
+      );
+      assert.equal(inspection.inspection.status, "needs_url");
+      const terminal = await nextEvent(
+        run,
+        (event) => event.type === "error",
+        "unsupported workspace terminal event",
+      );
+      const expected = {
+        code: "ONBOARD_COLLECTOR_UNSUPPORTED",
+        retryable: false,
+        message:
+          "This folder does not contain a supported product workspace; no evidence was sent.",
+      };
+      assert.deepEqual(terminal, {
+        type: "error",
+        stage: "review_scope",
+        evidenceSubmitted: false,
+        ...expected,
+      });
+      assert.deepEqual(
+        await withTimeout(run.exit, "unsupported workspace launcher exit"),
+        { code: 1, signal: null },
+      );
+      assertSingleTerminalError(run, expected);
+
+      const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
+        ":trialHandle",
+        TRIAL_HANDLE,
+      );
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      assert.deepEqual(
+        (await readdir(temporaryRoot, { withFileTypes: true }))
+          .filter(
+            (entry) =>
+              entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+          )
+          .map((entry) => entry.name),
+        [],
+      );
+    } finally {
+      run?.lines.close();
+      run?.child.stdin.destroy();
+      if (
+        run &&
+        run.child.exitCode === null &&
+        run.child.signalCode === null
+      ) {
+        run.child.kill();
+        await withTimeout(run.exit, "unsupported workspace cleanup", 5_000).catch(
+          () => {},
+        );
       }
       await api?.close();
       await rm(temporaryRoot, { recursive: true, force: true });

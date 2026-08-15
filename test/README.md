@@ -50,13 +50,18 @@ outbound network are needed**. This is what CI runs.
   and bounded full-Elle refresh/retry behavior.
 - **[`collector-host.test.mjs`](collector-host.test.mjs)** — pinned native
   package/manifest/policy/binary identity, private transport framing, collector
-  state ordering, and staged-executable cleanup.
+  state ordering, absolute generation expiry, exact idle-expiry cleanup receipts,
+  fatal active-operation expiry, and staged-executable/private-buffer cleanup
+  before later body access.
 - **[`source-api.test.mjs`](source-api.test.mjs)** — capability-gated evidence
   upload, attempt-bound PKCE exchange, safe post-claim read, idempotent replay,
   abort handling, and secret non-disclosure.
 - **[`source-launcher.test.mjs`](source-launcher.test.mjs)** — the one-shot
   workspace inspection, exact consent approval, upload, preview, browser claim,
-  and same-process post-claim terminal projection.
+  and same-process post-claim terminal projection; generation-expiry resume keeps
+  one reservation but requires fresh inspection and exact consent, rejects stale
+  commands across epochs, submits no evidence before approval, and preserves
+  fail-closed reservation/collector support-code terminal events.
 
 The tests assert literal counts (52 / 25 / 27) on purpose — adding or removing a
 tool fails the suite until the count is updated deliberately.

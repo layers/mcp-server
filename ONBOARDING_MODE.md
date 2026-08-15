@@ -47,6 +47,19 @@ foreground Bash tool call are not equivalent control surfaces. The exact
 mode-0700 directory, mode-0600 FIFO, background-task, and response commands are
 documented in [README.md](README.md#claude-code-process-control).
 
+Each local collector generation has a fixed 15-minute wall-clock lifetime from
+open. The lifetime does not pause or renew while a person reviews scope or the
+consent proposal. On expiry, the host clears the native artifact and all
+launcher references to the inspection, prepared envelope, display identifiers,
+and proposal hash before emitting `status: source_review_expired` and
+`input_required: resume_inspection`. A literal `resume` opens a fresh collector
+generation under the same unexpired reservation, repeats inspection with fresh
+opaque IDs, and requires a new `prepare`, proposal, and exact approval. Commands
+from an expired generation are discarded. If cleanup cannot be proven or the
+reservation itself expires, the launcher emits one source-free terminal JSONL
+`error` with `evidenceSubmitted: false` and exits nonzero. This local expiry
+path never submits evidence.
+
 The compatibility command `layers-mcp-server onboard <public-url>` retains the
 older URL-first behavior. It does not invoke the local collector.
 
