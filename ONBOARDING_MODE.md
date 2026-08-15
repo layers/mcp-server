@@ -40,6 +40,13 @@ organization/project/generation projection, never an API key or browser session.
 An unfinished browser claim terminates honestly as `awaiting_claim` without a
 post-claim projection.
 
+The host must keep this one process alive across the human turns that answer its
+JSONL `input_required` events. Claude Code must use its native background Bash
+task plus `TaskOutput`; shell `&`, `nohup`, or a `wait` inside an ordinary
+foreground Bash tool call are not equivalent control surfaces. The exact
+mode-0700 directory, mode-0600 FIFO, background-task, and response commands are
+documented in [README.md](README.md#claude-code-process-control).
+
 The compatibility command `layers-mcp-server onboard <public-url>` retains the
 older URL-first behavior. It does not invoke the local collector.
 
