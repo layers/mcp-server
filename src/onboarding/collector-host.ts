@@ -1443,7 +1443,6 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   abort(): void {
     if (
       this.#state === "closed" ||
-      this.#state === "closing" ||
       this.#state === "expired" ||
       this.#state === "failed"
     )
@@ -1562,9 +1561,9 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   ): void {
     if (
       this.#state === "closed" ||
-      this.#state === "closing" ||
       this.#state === "expired" ||
-      this.#state === "failed"
+      this.#state === "failed" ||
+      (this.#state === "closing" && this.#terminationPublished)
     )
       return;
     this.#state = reason === "expired" ? "expired" : "failed";

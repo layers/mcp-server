@@ -527,6 +527,54 @@ test(
   },
 );
 
+test(
+  "publishes failed termination when abort races ordinary cleanup",
+  { timeout: 15_000 },
+  async () => {
+    const outerTmp = await mkdtemp(
+      join(tmpdir(), "layers-collector-cleanup-failure-test-"),
+    );
+    const savedTmp = new Map(
+      ["TMPDIR", "TMP", "TEMP"].map((name) => [name, process.env[name]]),
+    );
+    for (const name of savedTmp.keys()) process.env[name] = outerTmp;
+
+    let session;
+    try {
+      const workspace = await createWorkspace(outerTmp);
+      session = await openOnboardingCollector({
+        deadlineAtMs: Date.now() + 120_000,
+      });
+      await inspectReady(session, workspace);
+      await session.prepare();
+
+      const completion = session.complete();
+      session.abort();
+      const termination = await session.waitForTermination();
+      assert.equal(termination.reason, "failed");
+      assert.equal(
+        termination.error.supportCode,
+        "ONBOARD_COLLECTOR_FAILED",
+      );
+      assert.equal(await termination.cleanup, null);
+      await completion.catch(() => undefined);
+      await waitForStageCleanup(outerTmp);
+      session = undefined;
+    } finally {
+      try {
+        session?.abort();
+        await waitForStageCleanup(outerTmp);
+      } finally {
+        for (const [name, value] of savedTmp) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        await rm(outerTmp, { recursive: true, force: true });
+      }
+    }
+  },
+);
+
 test("enforces serialized, bounded JSONL framing on a temporary host copy", async () => {
   const copyRoot = await mkdtemp(join(tmpdir(), "layers-collector-reader-test-"));
   try {
