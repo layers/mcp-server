@@ -1312,6 +1312,129 @@ test(
 );
 
 test(
+  "preserves the consent stage when the reservation expires during resume wait",
+  { timeout: 20_000 },
+  async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "layers-source-approval-reservation-expiry-test-"),
+    );
+    let api;
+    let run;
+    try {
+      const workspace = await createSingleProductGitFixture(temporaryRoot);
+      const driverPath = await writeExpiryDriver(temporaryRoot);
+      const startResponse = OnboardAgentEvidenceStartResponseSchema.parse({
+        ...START_RESPONSE,
+        expiresAt: new Date(Date.now() + 7_000).toISOString(),
+      });
+      api = await createMockApi(temporaryRoot, { startResponse });
+      run = spawnLauncher(workspace, api.baseUrl, temporaryRoot, {
+        argv: [driverPath, api.baseUrl],
+        extraEnv: {
+          LAYERS_TEST_EXPIRING_GENERATIONS: "1",
+          LAYERS_TEST_GENERATION_MS: "2500",
+        },
+      });
+
+      await nextEvent(
+        run,
+        (event) => event.type === "inspection",
+        "approval reservation expiry inspection",
+      );
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "review_scope",
+        "approval reservation expiry review prompt",
+      );
+      await writeCommand(run, "prepare");
+      await nextEvent(
+        run,
+        (event) => event.type === "consent_proposal",
+        "approval reservation expiry proposal",
+      );
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "approve_consent",
+        "approval reservation expiry consent prompt",
+      );
+      await nextEvent(
+        run,
+        (event) => event.stage === "source_review_expired",
+        "approval generation expiry",
+      );
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "resume_inspection",
+        "approval reservation expiry resume prompt",
+      );
+
+      const terminal = await nextEvent(
+        run,
+        (event) => event.type === "error",
+        "approval reservation expiry terminal event",
+      );
+      const expected = {
+        stage: "approve_consent",
+        code: "ONBOARD_RESERVATION_EXPIRED",
+        retryable: false,
+        message: "The source reservation expired; no evidence was sent.",
+      };
+      assert.deepEqual(terminal, {
+        type: "error",
+        evidenceSubmitted: false,
+        ...expected,
+      });
+      assert.deepEqual(
+        await withTimeout(
+          run.exit,
+          "approval reservation expiry launcher exit",
+        ),
+        { code: 1, signal: null },
+      );
+      assertSingleTerminalError(run, expected);
+
+      const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
+        ":trialHandle",
+        TRIAL_HANDLE,
+      );
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      assert.deepEqual(
+        (await readdir(temporaryRoot, { withFileTypes: true }))
+          .filter(
+            (entry) =>
+              entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+          )
+          .map((entry) => entry.name),
+        [],
+      );
+    } finally {
+      run?.lines.close();
+      run?.child.stdin.destroy();
+      if (
+        run &&
+        run.child.exitCode === null &&
+        run.child.signalCode === null
+      ) {
+        run.child.kill();
+        await withTimeout(
+          run.exit,
+          "approval reservation expiry cleanup",
+          5_000,
+        ).catch(() => {});
+      }
+      await api?.close();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+test(
   "emits one nonretryable reservation-expired event without opening a collector or submitting evidence",
   { timeout: 15_000 },
   async () => {

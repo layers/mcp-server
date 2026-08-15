@@ -822,6 +822,7 @@ async function approveAndUpload(
 async function waitForInspectionResume(
   lines: InputLines,
   reservationDeadlineAtMs: number,
+  stage: "review_scope" | "approve_consent",
 ): Promise<void> {
   emit({
     type: "status",
@@ -837,7 +838,7 @@ async function waitForInspectionResume(
     });
     const command = await lines.nextBefore(reservationDeadlineAtMs);
     if (command === null) {
-      throw reservationExpiredError("review_scope");
+      throw reservationExpiredError(stage);
     }
     if (command === "cancel") throw new Error("Onboarding canceled");
     if (command === "resume") return;
@@ -976,7 +977,11 @@ export async function runSourceOnboardCli(input: {
             if (Date.now() >= reservationDeadlineAtMs) {
               throw reservationExpiredError(stage);
             }
-            await waitForInspectionResume(lines, reservationDeadlineAtMs);
+            await waitForInspectionResume(
+              lines,
+              reservationDeadlineAtMs,
+              stage,
+            );
             continue;
           }
           throw terminalReviewError(stage, hostError ?? termination.error);
