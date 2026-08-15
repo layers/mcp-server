@@ -61,6 +61,9 @@ const ATTEMPT_CLAIM_URL =
 const ATTEMPT_EXPIRES_AT = "2100-08-14T00:15:00.000Z";
 const CAPABILITY_EXPIRES_AT = "2100-08-14T00:30:00.000Z";
 const UPDATED_AT = "2026-08-13T22:00:00.000Z";
+const RESERVATION_EXPIRES_AT = new Date(
+  Date.now() + 7 * 24 * 60 * 60 * 1000,
+).toISOString();
 
 const CAPABILITY_MANIFEST = OnboardingClosedCapabilityManifestSchema.parse({
   schemaVersion: 1,
@@ -90,7 +93,7 @@ const START_RESPONSE = OnboardAgentEvidenceStartResponseSchema.parse({
   protocolVersion: 1,
   trialHandle: TRIAL_HANDLE,
   reservationCapability: RESERVATION_CAPABILITY,
-  expiresAt: "2100-08-14T01:00:00.000Z",
+  expiresAt: RESERVATION_EXPIRES_AT,
   state: "awaiting_evidence",
 });
 
