@@ -450,6 +450,10 @@ test(
       assert.equal(termination.reason, "expired");
       assert.equal(termination.error.supportCode, "ONBOARD_COLLECTOR_TIMEOUT");
 
+      // Graceful expiry enters closing before publishing termination. A signal
+      // delivered after the event must not clobber its native cleanup receipt.
+      session.abort();
+
       // A caller can observe expiry before graceful native cancellation has
       // finished. A late operation must not replace that in-flight cleanup
       // with a hard stop or erase its exact receipt.

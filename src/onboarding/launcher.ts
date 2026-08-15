@@ -308,10 +308,12 @@ function reservationExpiredError(
   });
 }
 
-function unsupportedWorkspaceError(): SourceReviewTerminalError {
+function unsupportedWorkspaceError(
+  stage: "review_scope" | "approve_consent" = "review_scope",
+): SourceReviewTerminalError {
   return new SourceReviewTerminalError({
     type: "error",
-    stage: "review_scope",
+    stage,
     code: "ONBOARD_COLLECTOR_UNSUPPORTED",
     retryable: false,
     evidenceSubmitted: false,
@@ -362,6 +364,7 @@ async function applyScopeCommand(
   scope: ScopeState,
   inspection: OnboardingSourceInspection,
   command: string,
+  stage: "review_scope" | "approve_consent",
 ): Promise<OnboardingSourceInspection | null> {
   const [operation, identifier, ...extra] = command.split(/\s+/u);
   if (!identifier || extra.length > 0) return null;
@@ -394,11 +397,19 @@ async function applyScopeCommand(
     scope.excludedTargetIds.delete(identifier);
   } else return null;
 
-  const response = await session.reinspect({
-    excludedPathIds: sorted(scope.excludedPathIds),
-    excludedTargetIds: sorted(scope.excludedTargetIds),
-    selectedTargetIds: sorted(scope.selectedTargetIds),
-  });
+  let response: Awaited<ReturnType<OnboardingCollectorSession["reinspect"]>>;
+  try {
+    response = await session.reinspect({
+      excludedPathIds: sorted(scope.excludedPathIds),
+      excludedTargetIds: sorted(scope.excludedTargetIds),
+      selectedTargetIds: sorted(scope.selectedTargetIds),
+    });
+  } catch (error) {
+    if (error instanceof OnboardingCollectorHostError) {
+      throw new CollectorReviewOperationError(error, stage);
+    }
+    throw error;
+  }
   return response.projection;
 }
 
@@ -406,12 +417,13 @@ async function resolveInspection(
   session: OnboardingCollectorSession,
   lines: InputLines,
   initial: OnboardingSourceInspection,
+  stage: "review_scope" | "approve_consent" = "review_scope",
 ): Promise<OnboardingSourceInspection> {
   let inspection = initial;
   while (true) {
     emit({ type: "inspection", inspection });
     if (inspection.status === "needs_url") {
-      throw unsupportedWorkspaceError();
+      throw unsupportedWorkspaceError(stage);
     }
     if (inspection.status === "needs_product_selection") {
       emit({
@@ -422,12 +434,19 @@ async function resolveInspection(
       const command = await nextCollectorCommand(
         lines,
         session,
-        "review_scope",
+        stage,
       );
       if (command === "cancel") throw new Error("Onboarding canceled");
       const match = /^select\s+(\S+)$/u.exec(command);
       if (!match) continue;
-      inspection = (await session.select(match[1]!)).projection;
+      try {
+        inspection = (await session.select(match[1]!)).projection;
+      } catch (error) {
+        if (error instanceof OnboardingCollectorHostError) {
+          throw new CollectorReviewOperationError(error, stage);
+        }
+        throw error;
+      }
       continue;
     }
     return inspection;
@@ -481,6 +500,7 @@ async function collectApproval(
         scope,
         inspection,
         command,
+        "review_scope",
       );
       if (nextInspection) {
         inspection = await resolveInspection(session, lines, nextInspection);
@@ -564,9 +584,15 @@ async function collectApproval(
       scope,
       inspection,
       command,
+      "approve_consent",
     );
     if (!nextInspection) continue;
-    inspection = await resolveInspection(session, lines, nextInspection);
+    inspection = await resolveInspection(
+      session,
+      lines,
+      nextInspection,
+      "approve_consent",
+    );
   }
 }
 

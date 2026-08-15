@@ -498,15 +498,16 @@ async function writeExpiryDriver(temporaryRoot) {
     "const expiringGenerations = Number.parseInt(process.env.LAYERS_TEST_EXPIRING_GENERATIONS ?? '0', 10);",
     "const generationMs = Number.parseInt(process.env.LAYERS_TEST_GENERATION_MS ?? '5000', 10);",
     "const cleanupUnproved = process.env.LAYERS_TEST_CLEANUP_UNPROVED === '1';",
+    "const reinspectSupportCode = process.env.LAYERS_TEST_REINSPECT_SUPPORT_CODE;",
     "let generation = 0;",
     "",
-    "function withTermination(session, transform) {",
+    "function wrapSession(session, { transformTermination = (value) => value, reinspect = session.reinspect.bind(session) } = {}) {",
     "  return {",
     "    get deadlineAtMs() { return session.deadlineAtMs; },",
-    "    waitForTermination: async () => transform(await session.waitForTermination()),",
+    "    waitForTermination: async () => transformTermination(await session.waitForTermination()),",
     "    inspect: session.inspect.bind(session),",
     "    select: session.select.bind(session),",
-    "    reinspect: session.reinspect.bind(session),",
+    "    reinspect,",
     "    prepare: session.prepare.bind(session),",
     "    complete: session.complete.bind(session),",
     "    cancel: session.cancel.bind(session),",
@@ -527,11 +528,22 @@ async function writeExpiryDriver(temporaryRoot) {
     "    ...options,",
     "    ...(expires ? { deadlineAtMs: Date.now() + generationMs } : {}),",
     "  });",
+    "  if (reinspectSupportCode && generation === 1) {",
+    "    return wrapSession(session, {",
+    "      reinspect: async () => {",
+    "        const error = new OnboardingCollectorHostError(reinspectSupportCode, 'Injected bounded reinspection failure.');",
+    "        session.abort();",
+    "        throw error;",
+    "      },",
+    "    });",
+    "  }",
     "  if (!cleanupUnproved || generation !== 1) return session;",
-    "  return withTermination(session, (termination) => ({",
-    "    ...termination,",
-    "    cleanup: termination.cleanup.then(() => null),",
-    "  }));",
+    "  return wrapSession(session, {",
+    "    transformTermination: (termination) => ({",
+    "      ...termination,",
+    "      cleanup: termination.cleanup.then(() => null),",
+    "    }),",
+    "  });",
     "};",
     "",
     "try {",
@@ -558,14 +570,15 @@ function parseOutputEvents(stdout) {
 }
 
 function assertSingleTerminalError(run, expected) {
+  const { stage = "review_scope", ...expectedFields } = expected;
   const events = parseOutputEvents(run.stdout);
   const terminal = events.filter((event) => event.type === "error");
   assert.deepEqual(terminal, [
     {
       type: "error",
-      stage: "review_scope",
+      stage,
       evidenceSubmitted: false,
-      ...expected,
+      ...expectedFields,
     },
   ]);
   assert.equal(events.some((event) => event.type === "complete"), false);
@@ -1499,6 +1512,118 @@ test(
           await rm(temporaryRoot, { recursive: true, force: true });
         }
       });
+    }
+  },
+);
+
+test(
+  "classifies an approval-time reinspection failure at the consent stage",
+  { timeout: 20_000 },
+  async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "layers-source-approval-reinspect-test-"),
+    );
+    let api;
+    let run;
+    try {
+      const workspace = await createSingleProductGitFixture(temporaryRoot);
+      const driverPath = await writeExpiryDriver(temporaryRoot);
+      api = await createMockApi(temporaryRoot);
+      run = spawnLauncher(workspace, api.baseUrl, temporaryRoot, {
+        argv: [driverPath, api.baseUrl],
+        extraEnv: {
+          LAYERS_TEST_REINSPECT_SUPPORT_CODE: "ONBOARD_COLLECTOR_PROTOCOL",
+        },
+      });
+
+      const inspection = (
+        await nextEvent(
+          run,
+          (event) => event.type === "inspection",
+          "approval reinspection initial scope",
+        )
+      ).inspection;
+      const includedPath = inspection.consentPathItems.find(
+        (item) => item.included,
+      );
+      assert.ok(includedPath, "fixture must expose an included consent path");
+
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "review_scope",
+        "approval reinspection review prompt",
+      );
+      await writeCommand(run, "prepare");
+      await nextEvent(
+        run,
+        (event) => event.type === "consent_proposal",
+        "approval reinspection consent proposal",
+      );
+      await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "approve_consent",
+        "approval reinspection consent prompt",
+      );
+
+      const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
+        ":trialHandle",
+        TRIAL_HANDLE,
+      );
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      await writeCommand(run, `exclude-path ${includedPath.pathId}`);
+
+      const terminal = await nextEvent(
+        run,
+        (event) => event.type === "error",
+        "approval reinspection terminal event",
+      );
+      const expected = {
+        stage: "approve_consent",
+        code: "ONBOARD_COLLECTOR_FAILED",
+        retryable: false,
+        message: "Local source review could not continue; no evidence was sent.",
+      };
+      assert.deepEqual(terminal, {
+        type: "error",
+        evidenceSubmitted: false,
+        ...expected,
+      });
+      assert.deepEqual(
+        await withTimeout(run.exit, "approval reinspection launcher exit"),
+        { code: 1, signal: null },
+      );
+      assertSingleTerminalError(run, expected);
+      assert.equal(requestsAt(api.requests, evidencePath).length, 0);
+      assert.deepEqual(
+        (await readdir(temporaryRoot, { withFileTypes: true }))
+          .filter(
+            (entry) =>
+              entry.isDirectory() && entry.name.startsWith(STAGE_PREFIX),
+          )
+          .map((entry) => entry.name),
+        [],
+      );
+    } finally {
+      run?.lines.close();
+      run?.child.stdin.destroy();
+      if (
+        run &&
+        run.child.exitCode === null &&
+        run.child.signalCode === null
+      ) {
+        run.child.kill();
+        await withTimeout(
+          run.exit,
+          "approval reinspection cleanup",
+          5_000,
+        ).catch(() => {});
+      }
+      await api?.close();
+      await rm(temporaryRoot, { recursive: true, force: true });
     }
   },
 );
