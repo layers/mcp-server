@@ -1431,6 +1431,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   async cancel(): Promise<CleanupResult> {
     if (
       this.#state === "closed" ||
+      this.#state === "expired" ||
       this.#state === "failed" ||
       this.#state === "closing"
     ) {
@@ -1442,6 +1443,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   abort(): void {
     if (
       this.#state === "closed" ||
+      this.#state === "closing" ||
       this.#state === "expired" ||
       this.#state === "failed"
     )
@@ -1560,6 +1562,7 @@ class NativeCollectorSession implements OnboardingCollectorSession {
   ): void {
     if (
       this.#state === "closed" ||
+      this.#state === "closing" ||
       this.#state === "expired" ||
       this.#state === "failed"
     )

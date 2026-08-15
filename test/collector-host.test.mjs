@@ -449,6 +449,11 @@ test(
       const termination = await session.waitForTermination();
       assert.equal(termination.reason, "expired");
       assert.equal(termination.error.supportCode, "ONBOARD_COLLECTOR_TIMEOUT");
+
+      // A caller can observe expiry before graceful native cancellation has
+      // finished. A late operation must not replace that in-flight cleanup
+      // with a hard stop or erase its exact receipt.
+      await assert.rejects(session.complete(), assertTimeoutError);
       assert.deepEqual(await termination.cleanup, {
         bufferCount: projection.excerptSummary.count,
         bufferBytes: projection.excerptSummary.totalBytes,
@@ -459,6 +464,7 @@ test(
         session.prepare(),
         (error) => error?.supportCode === "ONBOARD_COLLECTOR_TIMEOUT",
       );
+      await assert.rejects(session.cancel(), assertProtocolError);
       session = undefined;
     } finally {
       try {
