@@ -12,6 +12,7 @@ import {
   OnboardingCollectorHostError,
   openOnboardingCollector,
   type OnboardingCollectorSession,
+  type OnboardingCollectorTermination,
 } from "./collector-host.js";
 import {
   SourceOnboardingError,
@@ -41,7 +42,11 @@ type LauncherEvent =
   | { type: "inspection"; inspection: OnboardingSourceInspection }
   | {
       type: "input_required";
-      operation: "select_product" | "review_scope" | "approve_consent";
+      operation:
+        | "select_product"
+        | "review_scope"
+        | "approve_consent"
+        | "resume_inspection";
       commands: string[];
     }
   | {
@@ -66,6 +71,14 @@ type LauncherEvent =
       previewUrl: string;
       state: "awaiting_claim";
       postclaim: null;
+    }
+  | {
+      type: "error";
+      stage: "review_scope" | "approve_consent";
+      code: string;
+      retryable: boolean;
+      evidenceSubmitted: false;
+      message: string;
     };
 
 function emit(event: LauncherEvent): void {
@@ -98,16 +111,246 @@ class InputLines {
     crlfDelay: Infinity,
     terminal: false,
   });
-  readonly #iterator = this.#reader[Symbol.asyncIterator]();
+  #closed = false;
+  #epoch = 0;
+  #sequence = 0;
+  #lastConsumedSequence = 0;
+  #waiter:
+    | {
+        epoch: number;
+        deadlineAtMs: number;
+        resolve: (value: string | null) => void;
+        reject: (error: Error) => void;
+        timeout?: NodeJS.Timeout;
+      }
+    | undefined;
 
-  async next(): Promise<string> {
-    const result = await this.#iterator.next();
-    if (result.done) throw new Error("Onboarding input closed before approval");
-    return result.value.trim();
+  constructor() {
+    this.#reader.on("line", (value) => {
+      const line = {
+        value,
+        receivedAtMs: Date.now(),
+        sequence: ++this.#sequence,
+      };
+      const waiter = this.#waiter;
+      if (!waiter || waiter.epoch !== this.#epoch) {
+        // Input is valid only as a reply to the currently advertised prompt.
+        // Buffering an unsolicited line could replay a stale prepare or approve
+        // command into a later collector generation.
+        return;
+      }
+      // Receipt time and use time are both fenced. After host suspend, a line
+      // buffered by the terminal cannot revive an expired collector generation.
+      if (
+        line.receivedAtMs >= waiter.deadlineAtMs ||
+        Date.now() >= waiter.deadlineAtMs
+      ) {
+        return;
+      }
+      if (line.sequence <= this.#lastConsumedSequence) return;
+      this.#lastConsumedSequence = line.sequence;
+      this.#settle(waiter.epoch, line.value.trim());
+    });
+    this.#reader.once("close", () => {
+      this.#closed = true;
+      const waiter = this.#waiter;
+      if (!waiter) return;
+      this.#waiter = undefined;
+      if (waiter.timeout) clearTimeout(waiter.timeout);
+      waiter.reject(new Error("Onboarding input closed before approval"));
+    });
+  }
+
+  async nextForCollector(
+    session: OnboardingCollectorSession,
+  ): Promise<string> {
+    const epoch = this.#arm(session.deadlineAtMs);
+    session.waitForTermination().then((termination) => {
+      const waiter = this.#waiter;
+      if (!waiter || waiter.epoch !== epoch) return;
+      this.#waiter = undefined;
+      if (waiter.timeout) clearTimeout(waiter.timeout);
+      waiter.reject(new CollectorGenerationEnded(termination));
+    });
+    const value = await this.#wait(epoch);
+    if (value === null) throw new Error("Onboarding input expired");
+    return value;
+  }
+
+  async nextBefore(deadlineAtMs: number): Promise<string | null> {
+    if (deadlineAtMs <= Date.now()) return null;
+    const epoch = this.#arm(deadlineAtMs, true);
+    return await this.#wait(epoch);
+  }
+
+  #arm(deadlineAtMs: number, resolveOnDeadline = false): number {
+    if (this.#closed) throw new Error("Onboarding input closed before approval");
+    if (this.#waiter) {
+      throw new Error("Onboarding input already has an active prompt");
+    }
+    const epoch = ++this.#epoch;
+    let resolveWaiter: ((value: string | null) => void) | undefined;
+    let rejectWaiter: ((error: Error) => void) | undefined;
+    const promise = new Promise<string | null>((resolve, reject) => {
+      resolveWaiter = resolve;
+      rejectWaiter = reject;
+    });
+    const waiter = {
+      epoch,
+      deadlineAtMs,
+      resolve: (value: string | null) => resolveWaiter?.(value),
+      reject: (error: Error) => rejectWaiter?.(error),
+      ...(resolveOnDeadline
+        ? {
+            timeout: setTimeout(
+              () => this.#settle(epoch, null),
+              Math.max(0, deadlineAtMs - Date.now()),
+            ),
+          }
+        : {}),
+    };
+    waiter.timeout?.unref?.();
+    this.#waiter = waiter;
+    this.#promptPromises.set(epoch, promise);
+    return epoch;
+  }
+
+  readonly #promptPromises = new Map<number, Promise<string | null>>();
+
+  async #wait(epoch: number): Promise<string | null> {
+    const promise = this.#promptPromises.get(epoch);
+    if (!promise) throw new Error("Onboarding input prompt is unavailable");
+    try {
+      return await promise;
+    } finally {
+      this.#promptPromises.delete(epoch);
+    }
+  }
+
+  #settle(epoch: number, value: string | null): void {
+    const waiter = this.#waiter;
+    if (!waiter || waiter.epoch !== epoch) return;
+    this.#waiter = undefined;
+    if (waiter.timeout) clearTimeout(waiter.timeout);
+    waiter.resolve(value);
   }
 
   close(): void {
     this.#reader.close();
+  }
+}
+
+class CollectorGenerationEnded extends Error {
+  readonly termination: OnboardingCollectorTermination;
+  readonly stage: "review_scope" | "approve_consent";
+
+  constructor(
+    termination: OnboardingCollectorTermination,
+    stage: "review_scope" | "approve_consent" = "review_scope",
+  ) {
+    super(termination.error.message);
+    this.name = "CollectorGenerationEnded";
+    this.termination = termination;
+    this.stage = stage;
+  }
+}
+
+class SourceReviewTerminalError extends Error {
+  readonly event: Extract<LauncherEvent, { type: "error" }>;
+
+  constructor(event: Extract<LauncherEvent, { type: "error" }>) {
+    super(event.message);
+    this.name = "SourceReviewTerminalError";
+    this.event = event;
+  }
+}
+
+class CollectorReviewOperationError extends Error {
+  readonly cause: OnboardingCollectorHostError;
+  readonly stage: "review_scope" | "approve_consent";
+
+  constructor(
+    cause: OnboardingCollectorHostError,
+    stage: "review_scope" | "approve_consent",
+  ) {
+    super(cause.message);
+    this.name = "CollectorReviewOperationError";
+    this.cause = cause;
+    this.stage = stage;
+  }
+}
+
+function terminalReviewError(
+  stage: "review_scope" | "approve_consent",
+  error: unknown,
+): SourceReviewTerminalError {
+  const hostError =
+    error instanceof CollectorReviewOperationError
+      ? error.cause
+      : error instanceof OnboardingCollectorHostError
+        ? error
+        : undefined;
+  return new SourceReviewTerminalError({
+    type: "error",
+    stage,
+    code: hostError?.supportCode ?? "ONBOARD_COLLECTOR_FAILED",
+    retryable: hostError?.supportCode === "ONBOARD_COLLECTOR_TIMEOUT",
+    evidenceSubmitted: false,
+    message: "Local source review could not continue; no evidence was sent.",
+  });
+}
+
+function reservationExpiredError(
+  stage: "review_scope" | "approve_consent",
+): SourceReviewTerminalError {
+  return new SourceReviewTerminalError({
+    type: "error",
+    stage,
+    code: "ONBOARD_RESERVATION_EXPIRED",
+    retryable: false,
+    evidenceSubmitted: false,
+    message: "The source reservation expired; no evidence was sent.",
+  });
+}
+
+function unsupportedWorkspaceError(
+  stage: "review_scope" | "approve_consent" = "review_scope",
+): SourceReviewTerminalError {
+  return new SourceReviewTerminalError({
+    type: "error",
+    stage,
+    code: "ONBOARD_COLLECTOR_UNSUPPORTED",
+    retryable: false,
+    evidenceSubmitted: false,
+    message:
+      "This folder does not contain a supported product workspace; no evidence was sent.",
+  });
+}
+
+function collectorCleanupFailedError(
+  stage: "review_scope" | "approve_consent",
+): SourceReviewTerminalError {
+  return terminalReviewError(
+    stage,
+    new OnboardingCollectorHostError(
+      "ONBOARD_COLLECTOR_FAILED",
+      "The local onboarding collector could not prove cleanup.",
+    ),
+  );
+}
+
+async function nextCollectorCommand(
+  lines: InputLines,
+  session: OnboardingCollectorSession,
+  stage: "review_scope" | "approve_consent",
+): Promise<string> {
+  try {
+    return await lines.nextForCollector(session);
+  } catch (error) {
+    if (error instanceof CollectorGenerationEnded) {
+      throw new CollectorGenerationEnded(error.termination, stage);
+    }
+    throw error;
   }
 }
 
@@ -126,6 +369,7 @@ async function applyScopeCommand(
   scope: ScopeState,
   inspection: OnboardingSourceInspection,
   command: string,
+  stage: "review_scope" | "approve_consent",
 ): Promise<OnboardingSourceInspection | null> {
   const [operation, identifier, ...extra] = command.split(/\s+/u);
   if (!identifier || extra.length > 0) return null;
@@ -158,11 +402,19 @@ async function applyScopeCommand(
     scope.excludedTargetIds.delete(identifier);
   } else return null;
 
-  const response = await session.reinspect({
-    excludedPathIds: sorted(scope.excludedPathIds),
-    excludedTargetIds: sorted(scope.excludedTargetIds),
-    selectedTargetIds: sorted(scope.selectedTargetIds),
-  });
+  let response: Awaited<ReturnType<OnboardingCollectorSession["reinspect"]>>;
+  try {
+    response = await session.reinspect({
+      excludedPathIds: sorted(scope.excludedPathIds),
+      excludedTargetIds: sorted(scope.excludedTargetIds),
+      selectedTargetIds: sorted(scope.selectedTargetIds),
+    });
+  } catch (error) {
+    if (error instanceof OnboardingCollectorHostError) {
+      throw new CollectorReviewOperationError(error, stage);
+    }
+    throw error;
+  }
   return response.projection;
 }
 
@@ -170,14 +422,13 @@ async function resolveInspection(
   session: OnboardingCollectorSession,
   lines: InputLines,
   initial: OnboardingSourceInspection,
+  stage: "review_scope" | "approve_consent" = "review_scope",
 ): Promise<OnboardingSourceInspection> {
   let inspection = initial;
   while (true) {
     emit({ type: "inspection", inspection });
     if (inspection.status === "needs_url") {
-      throw new Error(
-        "This folder does not contain a supported product workspace",
-      );
+      throw unsupportedWorkspaceError(stage);
     }
     if (inspection.status === "needs_product_selection") {
       emit({
@@ -185,11 +436,22 @@ async function resolveInspection(
         operation: "select_product",
         commands: ["select <candidateId>", "cancel"],
       });
-      const command = await lines.next();
+      const command = await nextCollectorCommand(
+        lines,
+        session,
+        stage,
+      );
       if (command === "cancel") throw new Error("Onboarding canceled");
       const match = /^select\s+(\S+)$/u.exec(command);
       if (!match) continue;
-      inspection = (await session.select(match[1]!)).projection;
+      try {
+        inspection = (await session.select(match[1]!)).projection;
+      } catch (error) {
+        if (error instanceof OnboardingCollectorHostError) {
+          throw new CollectorReviewOperationError(error, stage);
+        }
+        throw error;
+      }
       continue;
     }
     return inspection;
@@ -232,13 +494,18 @@ async function collectApproval(
           "cancel",
         ],
       });
-      const command = await lines.next();
+      const command = await nextCollectorCommand(
+        lines,
+        session,
+        "review_scope",
+      );
       if (command === "cancel") throw new Error("Onboarding canceled");
       const nextInspection = await applyScopeCommand(
         session,
         scope,
         inspection,
         command,
+        "review_scope",
       );
       if (nextInspection) {
         inspection = await resolveInspection(session, lines, nextInspection);
@@ -246,7 +513,15 @@ async function collectApproval(
       }
       if (command !== "prepare") continue;
 
-      const prepared = await session.prepare();
+      let prepared: Awaited<ReturnType<OnboardingCollectorSession["prepare"]>>;
+      try {
+        prepared = await session.prepare();
+      } catch (error) {
+        if (error instanceof OnboardingCollectorHostError) {
+          throw new CollectorReviewOperationError(error, "review_scope");
+        }
+        throw error;
+      }
       draft = prepareOnboardingCodebaseConsentDraft({
         prepared,
         receiptId: randomUUID(),
@@ -281,7 +556,11 @@ async function collectApproval(
         "cancel",
       ],
     });
-    const command = await lines.next();
+    const command = await nextCollectorCommand(
+      lines,
+      session,
+      "approve_consent",
+    );
     if (command === "cancel") throw new Error("Onboarding canceled");
     if (
       command === `approve ${displayEventId} ${draft.canonicalProjectionSha256}`
@@ -310,9 +589,15 @@ async function collectApproval(
       scope,
       inspection,
       command,
+      "approve_consent",
     );
     if (!nextInspection) continue;
-    inspection = await resolveInspection(session, lines, nextInspection);
+    inspection = await resolveInspection(
+      session,
+      lines,
+      nextInspection,
+      "approve_consent",
+    );
   }
 }
 
@@ -521,7 +806,14 @@ async function approveAndUpload(
   // Finish its private cleanup before starting the network request so a
   // successful evidence submission can never lose the later claim handoff to
   // an already-expired local collector session.
-  await collector.complete();
+  try {
+    await collector.complete();
+  } catch (error) {
+    if (error instanceof OnboardingCollectorHostError) {
+      throw new CollectorReviewOperationError(error, "approve_consent");
+    }
+    throw error;
+  }
   emit({
     type: "status",
     stage: "upload",
@@ -532,10 +824,57 @@ async function approveAndUpload(
   // the private evidence envelope before the longer preview/claim wait begins.
 }
 
+async function waitForInspectionResume(
+  lines: InputLines,
+  reservationDeadlineAtMs: number,
+  stage: "review_scope" | "approve_consent",
+): Promise<void> {
+  emit({
+    type: "status",
+    stage: "source_review_expired",
+    message:
+      "The prior local inspection expired and was cleared. No evidence was sent.",
+  });
+  while (true) {
+    emit({
+      type: "input_required",
+      operation: "resume_inspection",
+      commands: ["resume", "cancel"],
+    });
+    const command = await lines.nextBefore(reservationDeadlineAtMs);
+    if (command === null) {
+      throw reservationExpiredError(stage);
+    }
+    if (command === "cancel") throw new Error("Onboarding canceled");
+    if (command === "resume") return;
+  }
+}
+
+async function proveCollectorCleanup(
+  termination: OnboardingCollectorTermination,
+  stage: "review_scope" | "approve_consent",
+): Promise<void> {
+  try {
+    const cleanup = await termination.cleanup;
+    if (cleanup === null) {
+      throw collectorCleanupFailedError(stage);
+    }
+  } catch (error) {
+    if (error instanceof SourceReviewTerminalError) throw error;
+    throw collectorCleanupFailedError(stage);
+  }
+}
+
 export async function runSourceOnboardCli(input: {
   baseUrl: string;
   launcherVersion: string;
-}): Promise<void> {
+}, dependencies: {
+  /**
+   * Narrow test seam for deterministic collector-generation expiry. Production
+   * callers omit it and always use the verified native collector host.
+   */
+  openCollector?: typeof openOnboardingCollector;
+} = {}): Promise<void> {
   const lines = new InputLines();
   const lifecycle = new AbortController();
   let collector: OnboardingCollectorSession | undefined;
@@ -585,20 +924,85 @@ export async function runSourceOnboardCli(input: {
     const reservation = getReservation();
     if (!reservation)
       throw new Error("Layers source reservation was not retained");
+    const reservationDeadlineAtMs = Date.parse(reservation.expiresAt);
+    if (
+      !Number.isFinite(reservationDeadlineAtMs) ||
+      Date.now() >= reservationDeadlineAtMs
+    ) {
+      throw reservationExpiredError("review_scope");
+    }
 
-    collector = await openOnboardingCollector({
-      deadlineAtMs: Date.parse(reservation.expiresAt),
-      signal: lifecycle.signal,
-    });
-    const initial = (await collector.inspect({ root: process.cwd() }))
-      .projection;
-    await approveAndUpload(
-      collector,
-      lines,
-      initial,
-      input.baseUrl,
-      lifecycle.signal,
-    );
+    for (;;) {
+      let stage: "review_scope" | "approve_consent" = "review_scope";
+      try {
+        if (Date.now() >= reservationDeadlineAtMs) {
+          throw reservationExpiredError(stage);
+        }
+        collector = await (
+          dependencies.openCollector ?? openOnboardingCollector
+        )({
+          deadlineAtMs: reservationDeadlineAtMs,
+          signal: lifecycle.signal,
+        });
+        const initial = (await collector.inspect({ root: process.cwd() }))
+          .projection;
+        await approveAndUpload(
+          collector,
+          lines,
+          initial,
+          input.baseUrl,
+          lifecycle.signal,
+        );
+        break;
+      } catch (error) {
+        const ended =
+          error instanceof CollectorGenerationEnded
+            ? error
+            : error instanceof CollectorReviewOperationError
+              ? error
+              : undefined;
+        if (ended) stage = ended.stage;
+        const hostError =
+          error instanceof CollectorReviewOperationError
+            ? error.cause
+            : error instanceof OnboardingCollectorHostError
+              ? error
+              : undefined;
+        let termination =
+          error instanceof CollectorGenerationEnded
+            ? error.termination
+            : undefined;
+        if (!termination && hostError && collector) {
+          termination = await collector.waitForTermination();
+        }
+        if (termination) {
+          collector = undefined;
+          await proveCollectorCleanup(termination, stage);
+          if (termination.reason === "expired") {
+            if (Date.now() >= reservationDeadlineAtMs) {
+              throw reservationExpiredError(stage);
+            }
+            await waitForInspectionResume(
+              lines,
+              reservationDeadlineAtMs,
+              stage,
+            );
+            continue;
+          }
+          throw terminalReviewError(stage, hostError ?? termination.error);
+        }
+        if (hostError) {
+          if (
+            hostError.supportCode === "ONBOARD_COLLECTOR_TIMEOUT" &&
+            Date.now() >= reservationDeadlineAtMs
+          ) {
+            throw reservationExpiredError(stage);
+          }
+          throw terminalReviewError(stage, hostError);
+        }
+        throw error;
+      }
+    }
     submitted = true;
     collector = undefined;
     emit({
@@ -612,17 +1016,35 @@ export async function runSourceOnboardCli(input: {
       reservation.expiresAt,
     );
   } catch (error) {
+    let finalError = error;
     if (collector) {
       if (submitted) collector.abort();
-      else await collector.cancel().catch(() => collector?.abort());
+      else {
+        try {
+          await collector.cancel();
+        } catch {
+          collector.abort();
+          if (finalError instanceof SourceReviewTerminalError) {
+            // Cleanup proof is a privacy invariant and therefore outranks the
+            // earlier terminal classification. Retaining that earlier code
+            // would falsely imply the local source generation was cleared.
+            finalError = collectorCleanupFailedError(finalError.event.stage);
+          }
+        }
+      }
+      collector = undefined;
     }
-    if (error instanceof OnboardingCollectorHostError) {
+    if (finalError instanceof SourceReviewTerminalError) {
+      emit(finalError.event);
+      throw finalError;
+    }
+    if (finalError instanceof OnboardingCollectorHostError) {
       throw new Error(
-        `${error.message} (${error.supportCode}). ${error.retryCommand}`,
+        `${finalError.message} (${finalError.supportCode}). ${finalError.retryCommand}`,
       );
     }
-    if (error instanceof SourceOnboardingError) throw error;
-    throw error;
+    if (finalError instanceof SourceOnboardingError) throw finalError;
+    throw finalError;
   } finally {
     process.removeListener("SIGINT", stopForSignal);
     process.removeListener("SIGTERM", stopForSignal);

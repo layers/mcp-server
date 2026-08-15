@@ -97,6 +97,12 @@ async function waitForStageCleanup(root) {
   assert.deepEqual(await stageDirectories(root), []);
 }
 
+function suspendEventLoopUntilAfter(deadlineAtMs) {
+  const remainingMs = Math.max(0, deadlineAtMs - Date.now() + 5);
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, remainingMs);
+  assert.ok(Date.now() >= deadlineAtMs);
+}
+
 async function createWorkspace(root) {
   const workspace = join(root, "workspace");
   await mkdir(workspace, { mode: 0o755 });
@@ -186,6 +192,11 @@ function assertPreparedPairsWithProjection(preparedValue, projection) {
 
 function assertProtocolError(error) {
   assert.equal(error?.supportCode, "ONBOARD_COLLECTOR_PROTOCOL");
+  return true;
+}
+
+function assertTimeoutError(error) {
+  assert.equal(error?.supportCode, "ONBOARD_COLLECTOR_TIMEOUT");
   return true;
 }
 
@@ -412,6 +423,162 @@ test("runs the real handshake, inspect/prepare/reinspect/prepare/complete and ca
   }
 });
 
+test(
+  "expires an idle inspected generation with an exact cleanup receipt before later body access",
+  { timeout: 15_000 },
+  async () => {
+    const outerTmp = await mkdtemp(join(tmpdir(), "layers-collector-expiry-test-"));
+    const savedTmp = new Map(
+      ["TMPDIR", "TMP", "TEMP"].map((name) => [name, process.env[name]]),
+    );
+    for (const name of savedTmp.keys()) process.env[name] = outerTmp;
+
+    let session;
+    try {
+      const workspace = await createWorkspace(outerTmp);
+      const requestedDeadlineAtMs = Date.now() + 4_000;
+      session = await openOnboardingCollector({
+        deadlineAtMs: requestedDeadlineAtMs,
+      });
+      assert.ok(session.deadlineAtMs <= requestedDeadlineAtMs);
+      assert.ok(session.deadlineAtMs > Date.now());
+
+      const projection = await inspectReady(session, workspace);
+      assert.equal((await stageDirectories(outerTmp)).length, 1);
+
+      const termination = await session.waitForTermination();
+      assert.equal(termination.reason, "expired");
+      assert.equal(termination.error.supportCode, "ONBOARD_COLLECTOR_TIMEOUT");
+
+      // Graceful expiry enters closing before publishing termination. A signal
+      // delivered after the event must not clobber its native cleanup receipt.
+      session.abort();
+
+      // A caller can observe expiry before graceful native cancellation has
+      // finished. A late operation must not replace that in-flight cleanup
+      // with a hard stop or erase its exact receipt.
+      await assert.rejects(session.complete(), assertTimeoutError);
+      assert.deepEqual(await termination.cleanup, {
+        bufferCount: projection.excerptSummary.count,
+        bufferBytes: projection.excerptSummary.totalBytes,
+      });
+      assert.deepEqual(await stageDirectories(outerTmp), []);
+
+      await assert.rejects(
+        session.prepare(),
+        (error) => error?.supportCode === "ONBOARD_COLLECTOR_TIMEOUT",
+      );
+      await assert.rejects(session.cancel(), assertProtocolError);
+      session = undefined;
+    } finally {
+      try {
+        session?.abort();
+        await waitForStageCleanup(outerTmp);
+      } finally {
+        for (const [name, value] of savedTmp) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        await rm(outerTmp, { recursive: true, force: true });
+      }
+    }
+  },
+);
+
+test(
+  "fails closed when a suspended host starts an operation after generation expiry",
+  { timeout: 15_000 },
+  async () => {
+    const outerTmp = await mkdtemp(
+      join(tmpdir(), "layers-collector-active-expiry-test-"),
+    );
+    const savedTmp = new Map(
+      ["TMPDIR", "TMP", "TEMP"].map((name) => [name, process.env[name]]),
+    );
+    for (const name of savedTmp.keys()) process.env[name] = outerTmp;
+
+    let session;
+    try {
+      const workspace = await createWorkspace(outerTmp);
+      session = await openOnboardingCollector({
+        deadlineAtMs: Date.now() + 4_000,
+      });
+      await inspectReady(session, workspace);
+
+      // The deadline timer is deliberately unable to run during this simulated
+      // host suspend. The resumed operation must enforce the same absolute TTL.
+      suspendEventLoopUntilAfter(session.deadlineAtMs);
+      await assert.rejects(session.prepare(), assertTimeoutError);
+
+      const termination = await session.waitForTermination();
+      assert.equal(termination.reason, "expired");
+      assertTimeoutError(termination.error);
+      assert.equal(await termination.cleanup, null);
+      assert.deepEqual(await stageDirectories(outerTmp), []);
+      session = undefined;
+    } finally {
+      try {
+        session?.abort();
+        await waitForStageCleanup(outerTmp);
+      } finally {
+        for (const [name, value] of savedTmp) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        await rm(outerTmp, { recursive: true, force: true });
+      }
+    }
+  },
+);
+
+test(
+  "publishes failed termination when abort races ordinary cleanup",
+  { timeout: 15_000 },
+  async () => {
+    const outerTmp = await mkdtemp(
+      join(tmpdir(), "layers-collector-cleanup-failure-test-"),
+    );
+    const savedTmp = new Map(
+      ["TMPDIR", "TMP", "TEMP"].map((name) => [name, process.env[name]]),
+    );
+    for (const name of savedTmp.keys()) process.env[name] = outerTmp;
+
+    let session;
+    try {
+      const workspace = await createWorkspace(outerTmp);
+      session = await openOnboardingCollector({
+        deadlineAtMs: Date.now() + 120_000,
+      });
+      await inspectReady(session, workspace);
+      await session.prepare();
+
+      const completion = session.complete();
+      session.abort();
+      const termination = await session.waitForTermination();
+      assert.equal(termination.reason, "failed");
+      assert.equal(
+        termination.error.supportCode,
+        "ONBOARD_COLLECTOR_FAILED",
+      );
+      assert.equal(await termination.cleanup, null);
+      await completion.catch(() => undefined);
+      await waitForStageCleanup(outerTmp);
+      session = undefined;
+    } finally {
+      try {
+        session?.abort();
+        await waitForStageCleanup(outerTmp);
+      } finally {
+        for (const [name, value] of savedTmp) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+        await rm(outerTmp, { recursive: true, force: true });
+      }
+    }
+  },
+);
+
 test("enforces serialized, bounded JSONL framing on a temporary host copy", async () => {
   const copyRoot = await mkdtemp(join(tmpdir(), "layers-collector-reader-test-"));
   try {
@@ -504,6 +671,41 @@ test("enforces serialized, bounded JSONL framing on a temporary host copy", asyn
       await assert.rejects(frame, assertProtocolError);
       assert.equal(fatals.length, 1);
       assertProtocolError(fatals[0]);
+    }
+
+    {
+      const stream = new PassThrough();
+      const fatals = [];
+      const reader = new BoundedJsonlReader(stream, 256, (error) => {
+        fatals.push(error);
+      }, true);
+      const deadlineAtMs = Date.now() + 25;
+      const frame = reader.next(1_000, deadlineAtMs);
+      const privateBody = Buffer.from(
+        '{"type":"prepared_artifact","body":"must-not-materialize"}\n',
+      );
+      const originalJsonParse = JSON.parse;
+      let privateBodyParsed = false;
+      JSON.parse = (value, reviver) => {
+        if (String(value).includes("must-not-materialize")) {
+          privateBodyParsed = true;
+        }
+        return originalJsonParse(value, reviver);
+      };
+      try {
+        // Model host suspend: the absolute deadline passes while the event loop
+        // cannot service either the frame or its timer. The data callback runs
+        // first on resume and must still reject before UTF-8/JSON materialization.
+        suspendEventLoopUntilAfter(deadlineAtMs);
+        stream.write(privateBody);
+        await assert.rejects(frame, assertTimeoutError);
+      } finally {
+        JSON.parse = originalJsonParse;
+      }
+      assert.equal(privateBodyParsed, false);
+      assert.ok(privateBody.every((byte) => byte === 0));
+      assert.equal(fatals.length, 1);
+      assertTimeoutError(fatals[0]);
     }
   } finally {
     await rm(copyRoot, { recursive: true, force: true });
