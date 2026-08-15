@@ -133,7 +133,12 @@ class InputLines {
         sequence: ++this.#sequence,
       };
       const waiter = this.#waiter;
-      if (!waiter || waiter.epoch !== this.#epoch) return;
+      if (!waiter || waiter.epoch !== this.#epoch) {
+        // Input is valid only as a reply to the currently advertised prompt.
+        // Buffering an unsolicited line could replay a stale prepare or approve
+        // command into a later collector generation.
+        return;
+      }
       // Receipt time and use time are both fenced. After host suspend, a line
       // buffered by the terminal cannot revive an expired collector generation.
       if (
