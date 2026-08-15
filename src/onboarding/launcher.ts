@@ -1025,6 +1025,9 @@ export async function runSourceOnboardCli(input: {
         } catch {
           collector.abort();
           if (finalError instanceof SourceReviewTerminalError) {
+            // Cleanup proof is a privacy invariant and therefore outranks the
+            // earlier terminal classification. Retaining that earlier code
+            // would falsely imply the local source generation was cleared.
             finalError = collectorCleanupFailedError(finalError.event.stage);
           }
         }
