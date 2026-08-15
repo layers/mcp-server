@@ -24,6 +24,48 @@ finishes within its bounded window. Reservation, transport, PKCE verifier,
 post-claim capability, full evidence-envelope, and transient excerpt values
 never enter terminal output; the bounded consent projection does.
 
+### Claude Code process control
+
+The command stays alive across scope review, human approval, preview creation,
+and claim. In Claude Code, run it as a native background Bash task so later tool
+calls can read its JSONL and answer its stdin. Do not put `&`, `nohup`, or a
+foreground `wait` around the command; those do not give Claude a controllable
+task handle.
+
+1. In a short foreground Bash call, create the private input pipe and retain the
+   absolute directory printed by the last line:
+
+   ```sh
+   layers_session_dir="$(mktemp -d "${TMPDIR:-/tmp}/layers-onboard.XXXXXX")"
+   chmod 700 "$layers_session_dir"
+   mkfifo "$layers_session_dir/input"
+   chmod 600 "$layers_session_dir/input"
+   printf '%s\n' "$layers_session_dir"
+   ```
+
+2. In a second Bash tool call, substitute that absolute path and run exactly
+   this shell with the Bash tool's `run_in_background` parameter set to `true`:
+
+   ```sh
+   exec 3<>"/absolute/layers-onboard.ABC123/input"
+   npx --yes @layers/mcp-server@latest onboard <&3
+   ```
+
+   The shell command itself stays in the foreground of the background task.
+   Claude Code returns a task ID instead of blocking the conversation.
+
+3. Use `TaskOutput` on that task ID to read new JSONL. Send each advertised
+   response from a separate short Bash call, for example:
+
+   ```sh
+   printf '%s\n' 'prepare' > '/absolute/layers-onboard.ABC123/input'
+   ```
+
+   Read `TaskOutput` again after every response. Relay the complete consent
+   proposal and wait for the human's explicit approval before writing the
+   advertised `approve <displayEventId> <sha256>` command. Keep the task alive
+   until a terminal `complete` event or an error.
+
 For ordinary public callers, a server that has not opened source admission stops
 the command before local inspection. An operator-only environment token can
 authorize a closed internal probe. The older public-URL compatibility form

@@ -29,9 +29,9 @@ import { openOnboardingCollector } from "../dist/onboarding/collector-host.js";
 
 const require = createRequire(import.meta.url);
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const COLLECTOR_VERSION = "0.1.3";
+const COLLECTOR_VERSION = "0.1.4";
 const CONTRACT_MANIFEST_SHA256 =
-  "9633a66e7095fd473483a4dee1fb4e5bc328f3f75ed322096f5a6ed2a1a71aa4";
+  "5e58fd2e735e5fe396935e3967626af50935823abb04c3398a55168cb06cbb39";
 const COLLECTION_POLICY_SHA256 =
   "d35170d24c54f0dfad57cce99bfeaf69ca05d779c4e422a1fa5636680c2127b6";
 const STAGE_PREFIX = "layers-onboarding-collector-";
@@ -39,28 +39,28 @@ const EXCLUDED_SECRET_SENTINEL = "collector-secret-must-never-cross";
 
 const EXPECTED_BINARIES = {
   "@layers/onboarding-collector-darwin-arm64": {
-    bytes: 5_718_898,
-    sha256: "d544a7e9a860cb832cab5fe58c149c05bcc54156c7462d117cb1cc0d52431615",
+    bytes: 5_736_546,
+    sha256: "33939b7aaa05012d048b9b14d8c929b1d9a458b45584fb52f17b8fa6b4b4f683",
   },
   "@layers/onboarding-collector-darwin-x64": {
-    bytes: 5_877_392,
-    sha256: "2e1aad9a651f7d5a58470cacd1617a47f1071a6e0ae625a27b535117ef8aaa8c",
+    bytes: 5_899_008,
+    sha256: "3380c2a54460da2d300699cda62a569be6a9b4eb5774e77c89a5ffe3297a7c20",
   },
   "@layers/onboarding-collector-linux-arm64": {
-    bytes: 5_762_951,
-    sha256: "e9c9e8db97e16ccd1846d196139b235b1e30435925afe1d0ef4966810ef9c037",
+    bytes: 5_770_264,
+    sha256: "637076c72fa334bc5cd99e1f85a27857b4107b20890cbc37fb780dab33d675d8",
   },
   "@layers/onboarding-collector-linux-x64": {
-    bytes: 5_930_867,
-    sha256: "1092f14b7df175e56c95d9d13ea4ee007317a872588eae5fcc7e46db3ac3a1ff",
+    bytes: 5_951_212,
+    sha256: "dd6f241bed441fc53ff179b572e2c41bd42fcdb34782fc28f70f9548f78c4ea8",
   },
   "@layers/onboarding-collector-win32-arm64": {
-    bytes: 5_949_952,
-    sha256: "e6e89f1b07614aa372f1e83e6da91e5d7efec4a586811d68472f201e6e5d8797",
+    bytes: 5_969_408,
+    sha256: "d2b7510fa7b689e1d56addb66ddacaf5ea9c8c74f59a75a382e83205efa1c6be",
   },
   "@layers/onboarding-collector-win32-x64": {
-    bytes: 6_237_184,
-    sha256: "e8ea8d9845cd451016ef538dea0b0b60af34ffef8fd2541c7de19f26202073d9",
+    bytes: 6_259_712,
+    sha256: "5bd9f61c64fac262f381603b9795db10712657d7d219cbd6982fc8ceb4f2a49e",
   },
 };
 
@@ -189,7 +189,7 @@ function assertProtocolError(error) {
   return true;
 }
 
-test("pins the exact installed 0.1.3 contract and current-platform collector artifacts", async () => {
+test("pins the exact installed 0.1.4 contract and current-platform collector artifacts", async () => {
   const hostPackage = await readJson(join(PROJECT_ROOT, "package.json"));
   assert.equal(hostPackage.dependencies["@layers/onboarding-contracts"], COLLECTOR_VERSION);
   for (const target of ONBOARDING_COLLECTOR_TARGETS) {

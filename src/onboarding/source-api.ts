@@ -28,7 +28,7 @@ import { getReservation, type OnboardingReservation } from "./session.js";
 
 const RESPONSE_LIMIT_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
-const COLLECTOR_VERSION = "0.1.3";
+const COLLECTOR_VERSION = "0.1.4";
 
 export class SourceOnboardingError extends Error {
   readonly retryable: boolean;
