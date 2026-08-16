@@ -31,11 +31,29 @@ directory, reserves a protocol-v1 trial, verifies and stages the matching native
 collector, and emits machine-readable inspection and consent events. It sends
 evidence only after the person approves the exact displayed projection.
 
+While the preview builds, the command walks the canonical pre-claim setup
+questions — the same questions, in the same order, that the Layers web
+onboarding asks. It reads them on the reservation capability alone, exactly as
+it reads progress, and emits `input_required: answer_intake` one question at a
+time with the canonical title, optional subtitle, offered options, and the exact
+commands that answer it. The next question is emitted only after the previous
+answer is recorded, and a proposal on screen silences the questions for as long
+as it is displayed.
+
 After the preview is ready, the command creates an attempt-bound browser claim
-with a process-private transport capability and PKCE verifier. It polls that
-exact exchange and, when the claim completes within its bounded window, performs
-the capability-only post-claim read before emitting terminal success. That
-claimed result contains the preview URL and bounded
+with a process-private transport capability and PKCE verifier. **That handoff
+requires both the preview and the setup questions**: whichever settles second
+releases the claim link, so the browser claim is never offered while questions
+are outstanding. Progress is reported on `intake` events carrying an explicit
+`complete` flag and a `state` of `asking`, `complete`, `not_required`, or
+`skipped`; the terminal event repeats the summary on its `intake` field. The
+gate FAILS OPEN as `skipped` when the question service is unreachable, refuses
+repeatedly, or the questions go unanswered past their bounded window — a broken
+question service costs a person their questions, never their workspace.
+
+The command polls that exact exchange and, when the claim completes within its
+bounded window, performs the capability-only post-claim read before emitting
+terminal success. That claimed result contains the preview URL and bounded
 organization/project/generation projection, never an API key or browser session.
 An unfinished browser claim terminates honestly as `awaiting_claim` without a
 post-claim projection.
@@ -101,7 +119,8 @@ npx --yes @layers/mcp-server onboard [<public-url>]
 ```
 
 Without a URL it emits JSONL operations for local selection, scope review,
-approval, progress, browser claim, and the final safe post-claim projection.
+approval, the pre-claim setup questions, progress, browser claim, and the final
+safe post-claim projection.
 
 ## Security boundaries
 
