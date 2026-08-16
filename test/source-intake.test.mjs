@@ -358,6 +358,30 @@ test("a broken question service fails the claim gate open with an honest event",
   assert.equal(harness.runner.gate.isSettled(), true);
 });
 
+test("an API without the intake route asks nothing and holds nothing", async () => {
+  // The launcher can be installed ahead of the API that serves the walk. A 404
+  // is not retryable, so it costs one call and the claim gate opens.
+  let reads = 0;
+  const harness = runnerHarness({
+    readWalk: async () => {
+      reads += 1;
+      throw new SourceOnboardingError(
+        "Layers onboarding intake read failed (404)",
+        undefined,
+        404,
+        false,
+      );
+    },
+    submitAnswer: async () => assert.fail("no answer may be written"),
+  });
+  await harness.runner.run();
+
+  assert.equal(reads, 1);
+  assert.deepEqual(turnsIn(harness.events), []);
+  assert.equal(settlementOf(harness.events).reason, "http_404");
+  assert.equal(harness.runner.gate.isSettled(), true);
+});
+
 test("a write that stays unreachable fails open after the remaining questions", async () => {
   let writes = 0;
   const harness = runnerHarness({

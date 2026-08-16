@@ -1080,6 +1080,18 @@ export async function runSourceOnboardCli(input: {
     // point in the flow. The walk runs beside the progress poll rather than
     // before it, so the build is never waiting on a person and the person is
     // never waiting on the build.
+    //
+    // THE WALK IS READ AT THE START OF THAT WINDOW, which is BEFORE the
+    // evidence analysis has bound a project. The server builds the walk from
+    // whatever facts exist when it is read, and several questions have
+    // variants gated on the detected app type and business type — so a walk
+    // read now is the cold variant of those questions, where the browser
+    // (asking after its own analysis) would show the detected one. The trial
+    // holds the answers either way and the server heals the copy into the
+    // project on the next read, so nothing is lost; what differs is which
+    // wording of a question the person saw. Moving this read later would buy
+    // the tailored wording at the cost of the window itself, which is the one
+    // thing this flow exists to use.
     const intake = createIntakeWalkRunner({
       baseUrl: input.baseUrl,
       signal: lifecycle.signal,
