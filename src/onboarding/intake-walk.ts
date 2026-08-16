@@ -386,6 +386,11 @@ export function createIntakeWalkRunner(options: {
       reservationDeadlineAtMs,
     );
     {
+      // The explicit non-interleaving guard, checked before the walk says
+      // anything at all. The sequence already puts this after approval; this
+      // makes it true by construction rather than by reading the call order.
+      if (consent.isDisplayed()) await consent.whenIdle();
+
       let remaining: IntakeQuestion[];
       try {
         remaining = record(await attempt(readWalk));
@@ -415,9 +420,8 @@ export function createIntakeWalkRunner(options: {
       let refusal: string | undefined;
       while (remaining.length > 0) {
         if (signal.aborted) return;
-        // The explicit non-interleaving guard. The sequence already puts this
-        // after approval; this makes it true by construction rather than by
-        // reading the call order.
+        // Re-checked per turn: a proposal that reappears mid-walk must silence
+        // the questions for exactly as long as it is on screen.
         if (consent.isDisplayed()) await consent.whenIdle();
 
         const question = remaining[0]!;
