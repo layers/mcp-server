@@ -24,29 +24,68 @@ import {
   type OnboardingEvidenceEnvelope,
   type OnboardingProgressProjection,
 } from "@layers/onboarding-contracts";
+import {
+  IntakeAnswersRequestSchema,
+  IntakeAnswersResponseSchema,
+  ONBOARD_AGENT_INTAKE_ANSWERS_ROUTE_PATH,
+  type IntakeAnswer,
+  type IntakeAnswersResponse,
+} from "./intake-contract.js";
 import { getReservation, type OnboardingReservation } from "./session.js";
 
 const RESPONSE_LIMIT_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
 const COLLECTOR_VERSION = "0.1.4";
+/** The longest server-supplied refusal reason this process will relay. */
+const REFUSAL_REASON_MAX_LENGTH = 200;
 
 export class SourceOnboardingError extends Error {
   readonly retryable: boolean;
   readonly retryAfterSeconds?: number;
   readonly status?: number;
+  /**
+   * The server's own reason for refusing a request, when it sent one.
+   *
+   * Bounded and stripped of control characters before it is retained, because
+   * the only consumer relays it into an agent transcript. A refusal that names
+   * what was wrong ("Unknown option for goal: bananas") is what lets a caller
+   * re-ask with the offered options instead of abandoning the walk.
+   */
+  readonly reason?: string;
 
   constructor(
     message: string,
     retryAfterSeconds?: number,
     status?: number,
     retryable = false,
+    reason?: string,
   ) {
     super(message);
     this.name = "SourceOnboardingError";
     this.retryable = retryable;
     this.retryAfterSeconds = retryAfterSeconds;
     this.status = status;
+    this.reason = reason;
   }
+}
+
+/** The `reason` an error envelope carries, made safe to relay. */
+function safeRefusalReason(text: string): string | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(text) as unknown;
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const reason = (parsed as { reason?: unknown }).reason;
+  if (typeof reason !== "string") return undefined;
+  const sanitized = reason
+    .replace(/[\u0000-\u001F\u007F]/gu, " ")
+    .replace(/\s+/gu, " ")
+    .trim()
+    .slice(0, REFUSAL_REASON_MAX_LENGTH);
+  return sanitized.length > 0 ? sanitized : undefined;
 }
 
 const endpoint = (baseUrl: string, path: string): URL => new URL(path, baseUrl);
@@ -135,6 +174,7 @@ async function parseResponse(
         : undefined,
       response.status,
       response.status === 429 || response.status >= 500,
+      safeRefusalReason(text),
     );
   }
   try {
@@ -827,4 +867,97 @@ export async function readSourceProgress(
     );
   }
   return parsed.data;
+}
+
+/**
+ * The pre-claim intake walk, read on the reservation capability alone.
+ *
+ * Authorized exactly like the progress poll above — the same
+ * `x-layers-onboard-capability` header, hashed and matched server-side, so the
+ * plaintext capability never reaches a query, a log line, or this process's
+ * stdout. That is why the LAUNCHER walks intake and the agent driving it never
+ * could: the capability is deliberately absent from everything the agent reads.
+ */
+function intakeAnswersEndpoint(trialHandle: string): string {
+  return routePath(ONBOARD_AGENT_INTAKE_ANSWERS_ROUTE_PATH, trialHandle);
+}
+
+function parseIntakeResponse(
+  body: unknown,
+  trialHandle: string,
+): IntakeAnswersResponse {
+  const parsed = IntakeAnswersResponseSchema.safeParse(body);
+  if (!parsed.success || parsed.data.trialHandle !== trialHandle) {
+    throw new SourceOnboardingError(
+      "Layers onboarding intake returned an invalid response",
+    );
+  }
+  return parsed.data;
+}
+
+export async function readIntakeWalk(
+  baseUrl: string,
+  signal?: AbortSignal,
+): Promise<IntakeAnswersResponse> {
+  throwIfCallerAborted(signal);
+  const reservation = activeReservation();
+  const body = await requestJson(
+    endpoint(baseUrl, intakeAnswersEndpoint(reservation.trialHandle)),
+    {
+      headers: {
+        Accept: "application/json",
+        [ONBOARD_AGENT_PUBLIC_HEADER_NAMES.reservationCapability]:
+          reservation.reservationCapability,
+      },
+    },
+    "Layers onboarding intake read",
+    200,
+    signal,
+  );
+  return parseIntakeResponse(body, reservation.trialHandle);
+}
+
+/**
+ * One answer, recorded, answering with the RECOMPUTED walk.
+ *
+ * One answer per call rather than a batch: the walk is emitted one question at
+ * a time, so a batch would mean holding answers the person already gave while
+ * asking for more, and losing all of them to one failed request.
+ */
+export async function submitIntakeAnswer(
+  baseUrl: string,
+  answer: IntakeAnswer,
+  signal?: AbortSignal,
+): Promise<IntakeAnswersResponse> {
+  throwIfCallerAborted(signal);
+  const reservation = activeReservation();
+  const parsedRequest = IntakeAnswersRequestSchema.safeParse({
+    protocolVersion: ONBOARDING_PROTOCOL_VERSION,
+    answers: [answer],
+  });
+  if (!parsedRequest.success) {
+    throw new SourceOnboardingError(
+      "Layers onboarding intake answer is invalid",
+      undefined,
+      400,
+    );
+  }
+  const body = await requestJson(
+    endpoint(baseUrl, intakeAnswersEndpoint(reservation.trialHandle)),
+    {
+      method: "POST",
+      headers: {
+        Accept: "application/json",
+        [ONBOARD_AGENT_PUBLIC_HEADER_NAMES.contentType]:
+          ONBOARD_AGENT_EVIDENCE_CONTENT_TYPE,
+        [ONBOARD_AGENT_PUBLIC_HEADER_NAMES.reservationCapability]:
+          reservation.reservationCapability,
+      },
+      body: JSON.stringify(parsedRequest.data),
+    },
+    "Layers onboarding intake answer",
+    200,
+    signal,
+  );
+  return parseIntakeResponse(body, reservation.trialHandle);
 }

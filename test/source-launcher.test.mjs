@@ -548,7 +548,7 @@ async function writeExpiryDriver(temporaryRoot) {
     "",
     "try {",
     "  await runSourceOnboardCli(",
-    "    { baseUrl, launcherVersion: '1.2.3' },",
+    "    { baseUrl, launcherVersion: '1.3.0' },",
     "    { openCollector },",
     "  );",
     "} catch (error) {",

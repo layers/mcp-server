@@ -23,6 +23,13 @@ import {
   type SourceClaimSession,
   uploadSourceEvidence,
 } from "./source-api.js";
+import {
+  ConsentSurface,
+  createIntakeWalkRunner,
+  type IntakeEvent,
+  type IntakeSummary,
+  type IntakeWalkGate,
+} from "./intake-walk.js";
 import { getReservation } from "./session.js";
 import { startOnboarding } from "./tools.js";
 
@@ -49,6 +56,7 @@ type LauncherEvent =
         | "resume_inspection";
       commands: string[];
     }
+  | IntakeEvent
   | {
       type: "consent_proposal";
       displayEventId: string;
@@ -65,12 +73,14 @@ type LauncherEvent =
       previewUrl: string;
       state: "claimed";
       postclaim: OnboardAgentPostclaimResponse;
+      intake: IntakeSummary | null;
     }
   | {
       type: "complete";
       previewUrl: string;
       state: "awaiting_claim";
       postclaim: null;
+      intake: IntakeSummary | null;
     }
   | {
       type: "error";
@@ -462,6 +472,7 @@ async function collectApproval(
   session: OnboardingCollectorSession,
   lines: InputLines,
   initialInspection: OnboardingSourceInspection,
+  consentSurface: ConsentSurface,
 ): Promise<unknown> {
   let inspection = await resolveInspection(session, lines, initialInspection);
   const scope: ScopeState = {
@@ -536,6 +547,9 @@ async function collectApproval(
       });
       displayEventId = randomUUID();
       displayedAt = new Date().toISOString();
+      // The proposal is on screen from here until it is approved or discarded.
+      // Nothing else may prompt in that window.
+      consentSurface.display();
       emit({
         type: "consent_proposal",
         displayEventId,
@@ -565,6 +579,7 @@ async function collectApproval(
     if (
       command === `approve ${displayEventId} ${draft.canonicalProjectionSha256}`
     ) {
+      consentSurface.clear();
       return approveOnboardingCodebaseConsent({
         draft,
         displayEventId: displayEventId!,
@@ -581,6 +596,7 @@ async function collectApproval(
 
     // Make the prior approval surface and its excerpt-bearing draft
     // unreachable before asking the collector to mutate scope.
+    consentSurface.clear();
     draft = undefined;
     displayEventId = undefined;
     displayedAt = undefined;
@@ -601,11 +617,24 @@ async function collectApproval(
   }
 }
 
+/**
+ * Wait for the preview, then hand off the attempt-bound browser claim.
+ *
+ * THE CLAIM LINK NOW WAITS FOR TWO THINGS: the preview being ready, and intake
+ * being settled. Whichever arrives second releases it. Handing over the claim
+ * link while questions are still outstanding is what the browser door does not
+ * do, and it ends the conversation — a person who has claimed their workspace
+ * has left, and the questions that shape their first plan go unanswered.
+ *
+ * `intakeGate` is optional so the exported function keeps working for callers
+ * that run no walk at all; a missing gate is an open gate.
+ */
 export async function waitForPreviewAndClaim(
   baseUrl: string,
   signal: AbortSignal,
   reservationExpiresAt: string,
   emitEvent: (event: LauncherEvent) => void = emit,
+  intakeGate?: IntakeWalkGate,
 ): Promise<void> {
   const reservationDeadline = Date.parse(reservationExpiresAt);
   if (!Number.isFinite(reservationDeadline)) {
@@ -615,6 +644,8 @@ export async function waitForPreviewAndClaim(
   let claimDeadline: number | undefined;
   let latestPreviewUrl: string | undefined;
   let claimSession: SourceClaimSession | undefined;
+  const intakeSummary = (): IntakeSummary | null =>
+    intakeGate ? intakeGate.summary() : null;
   const finishAwaitingClaimIfExpired = (): boolean => {
     if (claimDeadline === undefined || Date.now() < claimDeadline) return false;
     if (!latestPreviewUrl) {
@@ -625,6 +656,7 @@ export async function waitForPreviewAndClaim(
       previewUrl: latestPreviewUrl,
       state: "awaiting_claim",
       postclaim: null,
+      intake: intakeSummary(),
     });
     return true;
   };
@@ -666,11 +698,16 @@ export async function waitForPreviewAndClaim(
       }
       if (progress.previewUrl) latestPreviewUrl = progress.previewUrl;
 
+      // BOTH conditions, or no claim attempt exists to surface. The attempt is
+      // what mints the browser URL, so gating its creation is what gates the
+      // link — the progress projection below can only publish a URL that a
+      // live attempt already produced.
       if (
         !claimSession &&
         progress.claimReady &&
         progress.previewReady &&
-        progress.previewUrl
+        progress.previewUrl &&
+        (intakeGate === undefined || intakeGate.isSettled())
       ) {
         claimDeadline ??= Math.min(
           Date.now() + CLAIM_WAIT_MS,
@@ -772,6 +809,7 @@ export async function waitForPreviewAndClaim(
             previewUrl: latestPreviewUrl,
             state: "claimed",
             postclaim: exchange.postclaim,
+            intake: intakeSummary(),
           });
           return;
         }
@@ -787,7 +825,18 @@ export async function waitForPreviewAndClaim(
         if (finishAwaitingClaimIfExpired()) return;
       }
 
-      await delay(PROGRESS_POLL_MS, signal);
+      // While intake still holds the gate, the poll sleep also waits on it, so
+      // the claim link appears in the same beat as the final answer instead of
+      // up to one poll interval later.
+      if (intakeGate && !intakeGate.isSettled()) {
+        // The swallowed rejection is the abort, which the top of the next
+        // iteration raises anyway. Left unhandled it would surface as an
+        // unhandled rejection whenever the gate won the race.
+        const sleep = delay(PROGRESS_POLL_MS, signal).catch(() => undefined);
+        await Promise.race([sleep, intakeGate.settled]);
+      } else {
+        await delay(PROGRESS_POLL_MS, signal);
+      }
     }
   } finally {
     claimSession?.dispose();
@@ -800,8 +849,20 @@ async function approveAndUpload(
   inspection: OnboardingSourceInspection,
   baseUrl: string,
   signal: AbortSignal,
+  consentSurface: ConsentSurface,
 ): Promise<void> {
-  const envelope = await collectApproval(collector, lines, inspection);
+  let envelope: unknown;
+  try {
+    envelope = await collectApproval(
+      collector,
+      lines,
+      inspection,
+      consentSurface,
+    );
+  } finally {
+    // A proposal abandoned by a throw is no longer on screen either.
+    consentSurface.clear();
+  }
   // The collector's absolute deadline may expire while an upload is in flight.
   // Finish its private cleanup before starting the network request so a
   // successful evidence submission can never lose the later claim handoff to
@@ -876,6 +937,7 @@ export async function runSourceOnboardCli(input: {
   openCollector?: typeof openOnboardingCollector;
 } = {}): Promise<void> {
   const lines = new InputLines();
+  const consentSurface = new ConsentSurface();
   const lifecycle = new AbortController();
   let collector: OnboardingCollectorSession | undefined;
   let submitted = false;
@@ -952,6 +1014,7 @@ export async function runSourceOnboardCli(input: {
           initial,
           input.baseUrl,
           lifecycle.signal,
+          consentSurface,
         );
         break;
       } catch (error) {
@@ -1010,11 +1073,36 @@ export async function runSourceOnboardCli(input: {
       stage: "preview",
       message: "Building the Layers preview.",
     });
-    await waitForPreviewAndClaim(
-      input.baseUrl,
-      lifecycle.signal,
-      reservation.expiresAt,
-    );
+
+    // THE BACKGROUND BUILD WINDOW. The approved evidence has left, the preview
+    // takes a minute or two, and the canonical intake questions get asked in
+    // exactly that gap — the same questions the browser door asks, at the same
+    // point in the flow. The walk runs beside the progress poll rather than
+    // before it, so the build is never waiting on a person and the person is
+    // never waiting on the build.
+    const intake = createIntakeWalkRunner({
+      baseUrl: input.baseUrl,
+      signal: lifecycle.signal,
+      input: lines,
+      emit,
+      consent: consentSurface,
+      reservationDeadlineAtMs,
+    });
+    const walk = intake.run();
+    try {
+      await waitForPreviewAndClaim(
+        input.baseUrl,
+        lifecycle.signal,
+        reservation.expiresAt,
+        emit,
+        intake.gate,
+      );
+    } finally {
+      // The walk owns the input pipe until it settles. Closing the pipe under
+      // it is what ends it once the claim handoff is done.
+      lines.close();
+      await walk;
+    }
   } catch (error) {
     let finalError = error;
     if (collector) {
