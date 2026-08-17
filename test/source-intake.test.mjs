@@ -800,6 +800,78 @@ test("a refusal that empties the walk still gets the post-empty re-read", async 
   assert.equal(settlement.reason, "refused");
 });
 
+test("the refusal budget is per question, not shared across the walk", async () => {
+  // INTAKE_REFUSAL_LIMIT is defined as consecutive refusals of ONE question. A
+  // single shared counter never delivered that: a question revealed later
+  // inherited whatever the earlier one had already spent, so one mistake could
+  // fail it open.
+  const late = { ...GOAL_QUESTION, field: "goal" };
+  let reads = 0;
+  const refusedFields = [];
+  const budgetBurn = INTAKE_REFUSAL_LIMIT - 1;
+  const harness = runnerHarness({
+    input: scriptedInput([
+      // Burn almost the whole budget on triedChannels...
+      ...Array.from({ length: budgetBurn }, () => "answer triedChannels social"),
+      // ...then answer it acceptably, and answer the late question once badly
+      // and once well.
+      "answer triedChannels ads",
+      "answer goal installs",
+      "answer goal other something else",
+    ]),
+    readWalk: async () => {
+      reads += 1;
+      return walkResponse(reads === 1 ? [MULTI_QUESTION] : [late]);
+    },
+    submitAnswer: async (answer) => {
+      const refuseTried =
+        answer.field === "triedChannels" &&
+        refusedFields.filter((f) => f === "triedChannels").length < budgetBurn;
+      const refuseGoalOnce =
+        answer.field === "goal" &&
+        refusedFields.filter((f) => f === "goal").length < 1;
+      if (refuseTried || refuseGoalOnce) {
+        refusedFields.push(answer.field);
+        return walkResponse(
+          answer.field === "triedChannels" ? [MULTI_QUESTION] : [late],
+          [],
+          [
+            {
+              field: answer.field,
+              reason: "option_not_offered",
+              message: "Not on the list.",
+              options: MULTI_QUESTION.options,
+            },
+          ],
+        );
+      }
+      return walkResponse(
+        answer.field === "triedChannels" ? [] : [],
+        [answer.field],
+      );
+    },
+  });
+  await harness.runner.run();
+
+  // triedChannels spent budgetBurn refusals; goal spent exactly one. With a
+  // shared counter goal would have been over the limit on that single refusal
+  // and the walk would have failed open.
+  assert.equal(
+    refusedFields.filter((f) => f === "goal").length,
+    1,
+    "the late question was refused once",
+  );
+  const turns = turnsIn(harness.events);
+  const goalTurns = turns.filter((turn) => turn.question.field === "goal");
+  assert.ok(
+    goalTurns.length >= 2,
+    "the late question was re-asked after its own refusal rather than skipped",
+  );
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "complete");
+  assert.equal(settlement.complete, true);
+});
+
 test("a required multi-select does not advertise the empty pick", () => {
   // The wire now says which questions take silence for an answer. Advertising
   // `answer <field>` on a required one offers a command the server can only

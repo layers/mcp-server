@@ -433,7 +433,24 @@ export function createIntakeWalkRunner(options: {
         ...summary,
       });
 
-      let refusals = 0;
+      /**
+       * Consecutive refusals, COUNTED PER QUESTION.
+       *
+       * `INTAKE_REFUSAL_LIMIT` is defined as "consecutive server refusals of
+       * ONE question", and a single shared counter never actually delivered
+       * that: the walk recomputes after every write, so a counter carried
+       * across a change of question let one stubborn answer spend another
+       * question's budget. Continuing past an emptying refusal into the
+       * post-empty re-read widened the same hole — questions revealed by the
+       * re-read inherited whatever the baseline set had already used, and could
+       * fail open after a single mistake.
+       */
+      const refusalsByField = new Map<string, number>();
+      const countRefusal = (field: string): number => {
+        const next = (refusalsByField.get(field) ?? 0) + 1;
+        refusalsByField.set(field, next);
+        return next;
+      };
       let refusal: { field: string; message: string } | undefined;
       /**
        * Whether the walk currently holds a refusal nobody has resolved.
@@ -555,11 +572,10 @@ export function createIntakeWalkRunner(options: {
           if (
             error instanceof SourceOnboardingError &&
             error.status === 400 &&
-            refusals + 1 < INTAKE_REFUSAL_LIMIT
+            countRefusal(parsed.answer.field) < INTAKE_REFUSAL_LIMIT
           ) {
             // A structured refusal names what was wrong with the pick. Re-ask
             // with the offered options rather than abandoning the walk.
-            refusals += 1;
             refusal = {
               field: parsed.answer.field,
               message: error.reason ?? "That answer was not accepted.",
@@ -584,8 +600,7 @@ export function createIntakeWalkRunner(options: {
         );
         remaining = record(response);
         if (rejection) {
-          if (refusals + 1 < INTAKE_REFUSAL_LIMIT) {
-            refusals += 1;
+          if (countRefusal(rejection.field) < INTAKE_REFUSAL_LIMIT) {
             refusal = {
               field: rejection.field,
               message:
@@ -609,7 +624,7 @@ export function createIntakeWalkRunner(options: {
           return;
         }
 
-        refusals = 0;
+        refusalsByField.delete(parsed.answer.field);
         unresolvedRejections.delete(parsed.answer.field);
         if (remaining.length > 0) {
           emit({
