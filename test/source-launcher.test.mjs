@@ -1047,7 +1047,17 @@ test(
         TRIAL_HANDLE,
       );
       const progressRequests = requestsAt(api.requests, progressPath);
-      assert.equal(progressRequests.length, 2);
+      // NOT PINNED TO AN EXACT COUNT. Progress polls every PROGRESS_POLL_MS
+      // while the claim exchange runs on its own, slower interval, so how many
+      // progress reads land before the claim is a function of that gap and of
+      // how fast the runner gets through the collector — a timing coincidence,
+      // not an invariant. The range still catches a launcher that stopped
+      // polling or started hammering; what this block actually pins is the
+      // capability on every read, below.
+      assert.ok(
+        progressRequests.length >= 2 && progressRequests.length <= 12,
+        `unexpected progress poll count: ${progressRequests.length}`,
+      );
       for (const request of progressRequests) {
         const progressHeaders = OnboardAgentProgressHeadersSchema.parse({
           reservationCapability: requestHeader(
@@ -2586,6 +2596,82 @@ test(
       "an unreachable exchange is not the server withdrawing the link",
     );
     assert.match(stillOpen[0].message, /re-minted 7 times without being opened/u);
+  },
+);
+
+test(
+  "the claim exchange is polled far slower than progress",
+  { timeout: 120_000 },
+  async () => {
+    // THE OUTAGE THIS PREVENTS. The exchange route is rate limited PER ATTEMPT
+    // and fails closed: 12 requests/minute and 180/day as of 2026-08-17.
+    // Polling it once per progress tick is exactly 12/minute and exactly 180
+    // across a 15-minute attempt — zero headroom on both — so runs 429ed
+    // persistently. Those 429s are retryable, so the wait looped on them and
+    // never saw a pending exchange, which is how trial d960be37 reported that
+    // Layers had withdrawn every claim link.
+    //
+    // Pinning the RATE rather than the constant: a future edit that ties the
+    // exchange back to the progress cadence fails here, whatever it renames.
+    const reservationExpiresAt = new Date(Date.now() + 20_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    const exchangeAt = [];
+    const progressAt = [];
+
+    globalThis.fetch = async (input) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname.endsWith("/progress")) {
+        progressAt.push(Date.now());
+        return Response.json(PROGRESS_RESPONSE, { status: 200 });
+      }
+      if (pathname.endsWith("/claim-attempts")) {
+        return Response.json(CLAIM_ATTEMPT_RESPONSE, { status: 202 });
+      }
+      if (pathname.endsWith("/exchange")) {
+        exchangeAt.push(Date.now());
+        return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "exchange cadence",
+        110_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.ok(
+      exchangeAt.length >= 2,
+      `expected repeated exchanges, saw ${exchangeAt.length}`,
+    );
+    // 15s nominal; 14s of slack absorbs a slow runner without admitting the
+    // 5s cadence that caused the outage.
+    const gap = exchangeAt[1] - exchangeAt[0];
+    assert.ok(
+      gap >= 14_000,
+      `exchange polled every ${gap}ms, which is inside the server's budget`,
+    );
+    // Four a minute against an rpm of 12, and 60 across a 15-minute attempt
+    // against a daily cap of 180.
+    assert.ok(60_000 / gap <= 5, "exchange rate must stay well under rpm 12");
+
+    // DECOUPLED, not merely slowed: progress keeps its own faster cadence,
+    // which is what drives attempt expiry and the preview checks.
+    assert.ok(
+      progressAt.length > exchangeAt.length,
+      `progress (${progressAt.length}) must poll more often than the exchange (${exchangeAt.length})`,
+    );
   },
 );
 

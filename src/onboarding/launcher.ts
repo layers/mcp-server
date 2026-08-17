@@ -76,6 +76,33 @@ const CLAIM_WAIT_MS = 24 * 60 * 60_000;
 const CLAIM_HEARTBEAT_MS = 5 * 60_000;
 
 /**
+ * How often the claim EXCHANGE is polled, as distinct from progress.
+ *
+ * MUST STAY UNDER THE SERVER'S PER-ATTEMPT BUDGET ON
+ * `/claim-attempts/:attemptHandle/exchange`, which is rate limited per attempt
+ * and fails CLOSED. As of 2026-08-17 that budget is 12 requests/minute and 180
+ * per day; a raise to 30/minute and 600/day is in flight.
+ *
+ * THE OLD CADENCE SAT EXACTLY ON THE LIMIT. Polling the exchange once per
+ * `PROGRESS_POLL_MS` is 12 requests a minute against an rpm of 12, and 180
+ * requests across a 15-minute attempt against a daily cap of 180 — zero
+ * headroom on both, so a run 429ed persistently. Those 429s are retryable, so
+ * the wait quietly looped on them and never saw a pending exchange, which is
+ * how a healthy 30-minute wait ended up reporting that Layers had withdrawn
+ * every claim link (trial d960be37).
+ *
+ * 15 seconds is 4 requests a minute and 60 across a full attempt: a third of
+ * the current budget, a tenth of the daily one, and it stays comfortable if the
+ * server budget is ever tightened again rather than raised. The cost is up to
+ * one extra interval of latency between a person clicking and this process
+ * noticing, which is invisible next to the browser round trip they just made.
+ *
+ * Progress polling is deliberately NOT slowed: it is a different route with its
+ * own budget, and it drives the attempt-expiry and preview checks.
+ */
+const CLAIM_EXCHANGE_POLL_MS = 15_000;
+
+/**
  * The longest a server-requested backoff may actually hold this process.
  *
  * `Retry-After` was being clamped to 10 seconds, which is not honouring it —
@@ -856,6 +883,15 @@ export async function waitForPreviewAndClaim(
   let activeAttemptWaitSinceMs: number | undefined;
   /** Throttle for the claim-setup notice, so it cannot become a flood. */
   let lastSetupNoticeAtMs = 0;
+  /**
+   * When the current leg was last exchanged.
+   *
+   * Zero means "exchange on the next pass", which is what a freshly minted leg
+   * wants: the first exchange is what proves the leg live and what catches a
+   * person who clicks immediately, so it runs at once and the interval applies
+   * only to the polling that follows.
+   */
+  let lastExchangeAtMs = 0;
   /** Why the last leg was retired, so the replacement can say what happened. */
   let retiredBecause: string | undefined;
   /**
@@ -936,6 +972,7 @@ export async function waitForPreviewAndClaim(
     retiredBecause = cause;
     retiredLegWasEmitted = attemptUrlEmitted;
     attemptUrlEmitted = false;
+    lastExchangeAtMs = 0;
     // A LEG THAT RAN ITS FULL TERM IS NOT A DEAD LEG, whatever else happened
     // to it. `deadLegs` exists for links the server WITHDREW before anybody
     // could use them; a link that lived its whole TTL and simply went
@@ -1257,7 +1294,15 @@ export async function waitForPreviewAndClaim(
         return;
       }
 
-      if (claimSession) {
+      // PACED SEPARATELY FROM THE PROGRESS POLL. Running the exchange once per
+      // loop tied it to `PROGRESS_POLL_MS` and put it exactly on the server's
+      // per-attempt rate limit; it now runs on its own, slower interval while
+      // progress keeps its cadence.
+      if (
+        claimSession &&
+        Date.now() - lastExchangeAtMs >= CLAIM_EXCHANGE_POLL_MS
+      ) {
+        lastExchangeAtMs = Date.now();
         let exchange: Awaited<ReturnType<SourceClaimSession["exchange"]>>;
         try {
           exchange = await claimSession.exchange(signal);
