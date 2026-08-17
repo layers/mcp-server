@@ -3372,6 +3372,143 @@ test("a 409 on claim setup waits for the old leg instead of ending the run", asy
   assert.equal(terminal[0].state, "claimed");
 });
 
+test("a preview that never goes ready ends with an honest post-upload error", async () => {
+  // TWO LIES IN ONE EVENT, BEFORE THIS. It reported stage `preflight`, which
+  // the agent instructions define as "nothing was read from this machine", and
+  // `evidenceSubmitted: false` — both said after the approved source had
+  // already been uploaded.
+  const reservationExpiresAt = new Date(Date.now() + 1_200).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let polls = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      polls += 1;
+      // Perfectly healthy, and never ready. This never touches the retry path,
+      // so the deadline used to slide by unnoticed.
+      return Response.json(
+        {
+          ...PROGRESS_RESPONSE,
+          state: "analyzing",
+          previewReady: false,
+          previewUrl: null,
+          claimReady: false,
+          claimUrl: null,
+        },
+        { status: 200 },
+      );
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await assert.rejects(
+      withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "preview timeout",
+        60_000,
+      ),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.ok(polls >= 1);
+  const errors = events.filter((event) => event.type === "error");
+  assert.equal(errors.length, 1, "the timeout is a terminal event, not silence");
+  assert.equal(errors[0].stage, "await_preview");
+  assert.equal(errors[0].code, "ONBOARD_PREVIEW_TIMEOUT");
+  assert.equal(
+    errors[0].evidenceSubmitted,
+    true,
+    "the approved evidence had already been sent",
+  );
+  assert.match(errors[0].message, /already on the server|still on the server/u);
+  // There is nothing to claim, so it must not pretend otherwise.
+  assert.equal(
+    events.some((event) => event.type === "complete"),
+    false,
+  );
+  assert.equal(
+    events.some(
+      (event) => event.type === "status" && event.stage === "claim_still_open",
+    ),
+    false,
+  );
+});
+
+test("a server that never releases the previous claim link stops on its own", async () => {
+  // The 409 wait was unbounded and unthrottled: one request and one identical
+  // event every five seconds, for up to twenty-four hours.
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let setupCalls = 0;
+  // Long enough for several 409 cycles at the 5s poll cadence, so the throttle
+  // has something to suppress; the CLAIM_ATTEMPT_TTL_MS bound is 15 minutes of
+  // wall clock, which a test cannot sit through, so the reservation is the
+  // bound that ends this one.
+  const shortReservation = new Date(Date.now() + 17_000).toISOString();
+  rememberLauncherReservation(shortReservation);
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      setupCalls += 1;
+      return Response.json(
+        { error: "A claim attempt is already active for this trial." },
+        { status: 409 },
+      );
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        shortReservation,
+        (event) => events.push(event),
+      ),
+      "bounded 409 wait",
+      90_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // THROTTLED. Several 409s, at most one notice — not one per poll.
+  const retrying = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_setup_retrying",
+  );
+  assert.ok(
+    setupCalls >= 3,
+    `expected several 409 cycles, saw ${setupCalls}`,
+  );
+  assert.equal(
+    retrying.length,
+    1,
+    `the notice must be throttled, saw ${retrying.length} for ${setupCalls} refusals`,
+  );
+  // And it ends, rather than sitting there for a day.
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "awaiting_claim");
+});
+
 test("a terminal failure names the trial, the last state, and the server's code", async () => {
   const message = await progressFailureMessage(
     terminalProgress("failed", {

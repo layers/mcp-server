@@ -241,6 +241,10 @@ test("the instructions cover the re-minted claim link and the stderr channel", (
   // only stdout would otherwise report silence.
   assert.match(AGENT_INSTRUCTIONS, /Anything this process has to say that is not one of those lines is on STDERR/u);
   assert.match(AGENT_INSTRUCTIONS, /stage is preflight means nothing was reserved/u);
+  // The post-upload stage must not be read as the pre-upload one: telling a
+  // person their source was never sent when it was is the lie this prevents.
+  assert.match(AGENT_INSTRUCTIONS, /stage is await_preview means the opposite/u);
+  assert.match(AGENT_INSTRUCTIONS, /Read evidenceSubmitted rather than guessing/u);
 });
 
 test("closed admission is one stdout error event, and reserves nothing", async () => {

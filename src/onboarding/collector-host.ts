@@ -171,10 +171,14 @@ export type OnboardingCollectorSupportCode =
 const COLLECTOR_REMEDY_COMMANDS: Readonly<
   Partial<Record<OnboardingCollectorSupportCode, string>>
 > = {
-  // The package was never installed, so install it. `npx` caches aggressively
-  // enough that a fresh cache is the reliable form.
+  // NOT `npm install`. This launcher writes only inside its own mkdtemp, and a
+  // remedy that edits the caller's package.json and lockfile breaks that for a
+  // fault that is usually not even in their project — it is `npx` having
+  // resolved the package with optional dependencies switched off. Re-running the
+  // same invocation with `npm_config_include=optional` repairs the actual
+  // failure and touches nothing the person owns.
   ONBOARD_COLLECTOR_NOT_INSTALLED:
-    "npm install --include=optional @layers/mcp-server",
+    "npm_config_include=optional npx --yes @layers/mcp-server@1.3.1 onboard",
   // A timeout is the one collector fault that a second run genuinely fixes.
   ONBOARD_COLLECTOR_TIMEOUT: ONBOARDING_COLLECTOR_UPDATE_COMMAND,
   // Nothing local fixes an unsupported platform, and nothing local fixes an

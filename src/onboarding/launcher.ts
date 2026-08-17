@@ -210,11 +210,24 @@ type LauncherEvent =
        * local collector artifacts. Those used to reach stdout not at all — they
        * were a stderr line and an exit code — so an agent reading the JSONL
        * stream saw the process die with no event explaining it.
+       *
+       * `await_preview` is everything that fails AFTER the approved evidence
+       * has been uploaded. It is a separate stage because the agent is told
+       * that `preflight` means nothing left this machine, and reporting a
+       * post-upload timeout under that stage tells a person their source was
+       * never sent when it was.
        */
-      stage: "preflight" | "review_scope" | "approve_consent";
+      stage: "preflight" | "await_preview" | "review_scope" | "approve_consent";
       code: string;
       retryable: boolean;
-      evidenceSubmitted: false;
+      /**
+       * Whether the approved evidence had already been sent when this failed.
+       *
+       * Was hard-`false`, which was true of every case that existed at the
+       * time and quietly became a lie the moment a post-upload failure learned
+       * to emit an event.
+       */
+      evidenceSubmitted: boolean;
       message: string;
       /** The exact command that resolves the failure, when one exists. */
       updateCommand?: string;
@@ -832,6 +845,10 @@ export async function waitForPreviewAndClaim(
   let attemptEverLive = false;
   /** Consecutive legs that died without ever completing a pending exchange. */
   let deadLegs = 0;
+  /** When the current run of `active_attempt` 409s began. */
+  let activeAttemptWaitSinceMs: number | undefined;
+  /** Throttle for the claim-setup notice, so it cannot become a flood. */
+  let lastSetupNoticeAtMs = 0;
   /** Why the last leg was retired, so the replacement can say what happened. */
   let retiredBecause: string | undefined;
   /**
@@ -928,10 +945,39 @@ export async function waitForPreviewAndClaim(
     attemptEverLive ||
     (attemptMintedAtMs !== undefined &&
       Date.now() - attemptMintedAtMs >= PROGRESS_POLL_MS);
+  /**
+   * The wait ran out before the preview was ever ready.
+   *
+   * A DIFFERENT ENDING FROM `claim_still_open`, which speaks for a workspace
+   * that exists and is waiting to be claimed. Here there is nothing to claim
+   * yet, so the honest report is that the build did not finish in time and the
+   * evidence is already on the server.
+   */
+  const finishWithoutPreview = (): never => {
+    emitEvent({
+      type: "error",
+      stage: "await_preview",
+      code: "ONBOARD_PREVIEW_TIMEOUT",
+      retryable: true,
+      // The approved evidence left this machine before this wait began.
+      evidenceSubmitted: true,
+      message:
+        "Layers did not finish building the preview before this process ran out of time. The approved evidence was accepted and the trial is still on the server, so nothing was lost by stopping here.",
+    });
+    throw new SourceOnboardingError(
+      "Layers preview did not become ready before the wait expired",
+    );
+  };
   try {
     while (true) {
       if (signal.aborted) throw new Error("Onboarding interrupted");
       if (finishAwaitingClaimIfExpired()) return;
+      // CHECKED EVERY PASS, not only on a retry. A build that keeps answering
+      // healthy progress and never goes ready never touches the retry path, so
+      // the deadline used to go by unnoticed and the loop polled on until the
+      // reservation lapsed and `activeReservation()` threw — stderr only, with
+      // no terminal event and nothing for an agent to report.
+      if (!handoffStarted && Date.now() >= waitDeadline) finishWithoutPreview();
       let progress: Awaited<ReturnType<typeof readSourceProgress>>;
       try {
         progress = await readSourceProgress(baseUrl, signal);
@@ -948,22 +994,8 @@ export async function waitForPreviewAndClaim(
             : Math.max(PROGRESS_POLL_MS, Math.min(requested, RETRY_AFTER_CEILING_MS));
           await delay(waitMs, signal);
           if (finishAwaitingClaimIfExpired()) return;
-          // A wait that runs out before the preview is ready never reaches the
-          // claim handoff, so `finishAwaitingClaimIfExpired` cannot speak for
-          // it. Ending silently on a bare throw is how this looked like a crash.
           if (!handoffStarted && Date.now() >= waitDeadline) {
-            emitEvent({
-              type: "error",
-              stage: "preflight",
-              code: "ONBOARD_PREVIEW_TIMEOUT",
-              retryable: true,
-              evidenceSubmitted: false,
-              message:
-                "Layers did not finish building the preview before this process ran out of time. The evidence was accepted and the trial is still on the server; nothing was lost by stopping here.",
-            });
-            throw new SourceOnboardingError(
-              "Layers preview did not become ready before the wait expired",
-            );
+            finishWithoutPreview();
           }
           continue;
         }
@@ -1074,12 +1106,30 @@ export async function waitForPreviewAndClaim(
             error.status === 409 &&
             Date.now() < waitDeadline
           ) {
-            emitEvent({
-              type: "status",
-              stage: "claim_setup_retrying",
-              message:
-                "Layers still holds the previous claim link open; waiting for it to lapse before asking for a fresh one. Nothing is wrong and nothing needs restarting.",
-            });
+            const now = Date.now();
+            activeAttemptWaitSinceMs ??= now;
+            // BOUNDED BY THE THING BEING WAITED FOR. The server holds an
+            // attempt for at most its own TTL, so a 409 that outlives that is
+            // not a lapse anybody is still waiting on. Without this the wait
+            // sat here for the full 24 hours, one request and one identical
+            // event every five seconds.
+            if (now - activeAttemptWaitSinceMs >= CLAIM_ATTEMPT_TTL_MS) {
+              stopReason =
+                "Layers kept reporting an existing claim link as still active for longer than one can live, so this process stopped asking for a fresh one.";
+              finishAwaitingClaim();
+              return;
+            }
+            // Throttled like the heartbeat: the same sentence every five
+            // seconds is not information, it is a flood with a calm tone.
+            if (now - lastSetupNoticeAtMs >= CLAIM_HEARTBEAT_MS) {
+              lastSetupNoticeAtMs = now;
+              emitEvent({
+                type: "status",
+                stage: "claim_setup_retrying",
+                message:
+                  "Layers still holds the previous claim link open; waiting for it to lapse before asking for a fresh one. Nothing is wrong and nothing needs restarting.",
+              });
+            }
             await delay(boundedRetryDelay(PROGRESS_POLL_MS), signal);
             continue;
           }
@@ -1117,6 +1167,7 @@ export async function waitForPreviewAndClaim(
             )
           : mintedAtMs + CLAIM_ATTEMPT_TTL_MS;
         attemptMintedAtMs = mintedAtMs;
+        activeAttemptWaitSinceMs = undefined;
         claimLinksMinted += 1;
         // A REPLACED LINK MUST BE ANNOUNCED — but only one that was ever live.
         // Telling somebody to discard a link that never worked, when they were
@@ -1653,10 +1704,11 @@ export async function runSourceOnboardCli(input: {
           collector.abort();
           if (
             finalError instanceof SourceReviewTerminalError &&
-            // A collector only exists after preflight passed, so the stage here
-            // is always a review stage; the guard is what proves it to the type
-            // rather than a cast that would outlive the reasoning.
-            finalError.event.stage !== "preflight"
+            // A collector only exists between preflight and upload, so the
+            // stage here is always a review stage; the guard proves that to the
+            // type rather than a cast that would outlive the reasoning.
+            (finalError.event.stage === "review_scope" ||
+              finalError.event.stage === "approve_consent")
           ) {
             // Cleanup proof is a privacy invariant and therefore outranks the
             // earlier terminal classification. Retaining that earlier code

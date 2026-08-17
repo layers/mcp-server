@@ -231,7 +231,14 @@ test("a missing platform package is not reported as an integrity failure", () =>
   assert.equal(other.supportCode, "ONBOARD_COLLECTOR_INTEGRITY");
 
   // A REMEDY IS A PROMISE. Only faults a command actually fixes get one.
-  assert.match(notInstalled.remedyCommand, /npm install --include=optional/u);
+  assert.match(
+    notInstalled.remedyCommand,
+    /^npm_config_include=optional npx --yes @layers\/mcp-server@1\.3\.1 onboard$/u,
+  );
+  // IT MUST NOT WRITE TO THE USER'S REPO. This launcher writes only inside its
+  // own mkdtemp; a remedy that edits package.json and the lockfile breaks that,
+  // and does not repair the npx-cached invocation that actually failed.
+  assert.equal(/npm install/u.test(notInstalled.remedyCommand), false);
   assert.equal(
     other.remedyCommand,
     undefined,

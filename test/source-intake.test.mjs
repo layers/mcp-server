@@ -1048,8 +1048,11 @@ test("a walk that finishes first still waits for the preview", async () => {
   };
 
   // The wait is bounded by the reservation, which is the cheap way to reach the
-  // awaiting-claim handoff without waiting out the 24-hour budget.
-  const shortReservation = new Date(Date.now() + 1_200).toISOString();
+  // awaiting-claim handoff without waiting out the 24-hour budget. It has to
+  // outlast the SECOND poll, though: the preview goes ready there, and a
+  // deadline that lands first is a different ending entirely — the preview
+  // never became ready, which now terminates with `await_preview` instead.
+  const shortReservation = new Date(Date.now() + 6_500).toISOString();
   try {
     await waitForPreviewAndClaim(
       BASE_URL,
