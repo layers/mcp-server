@@ -140,6 +140,17 @@ export const ONBOARDING_COLLECTOR_UPDATE_COMMAND =
 
 export type OnboardingCollectorSupportCode =
   | "ONBOARD_COLLECTOR_UNSUPPORTED"
+  /**
+   * The platform package is not on disk at all.
+   *
+   * DISTINCT FROM INTEGRITY, because the remedy is the opposite. An integrity
+   * failure means "what is installed is not what this launcher trusts" and the
+   * honest response is to stop. This means "nothing is installed", which is
+   * almost always `--omit=optional`, `--no-optional`, or a lockfile that pruned
+   * the optional deps — a reinstall fixes it. Reporting the two the same way
+   * sent people hunting for a supply-chain problem they did not have.
+   */
+  | "ONBOARD_COLLECTOR_NOT_INSTALLED"
   | "ONBOARD_COLLECTOR_INTEGRITY"
   | "ONBOARD_COLLECTOR_PROTOCOL"
   | "ONBOARD_COLLECTOR_TIMEOUT"
@@ -261,6 +272,32 @@ function protocolError(): OnboardingCollectorHostError {
     "ONBOARD_COLLECTOR_PROTOCOL",
     "The local onboarding collector returned an invalid response.",
   );
+}
+
+/**
+ * Why the platform package could not be resolved.
+ *
+ * "NOT INSTALLED" AND "NOT TRUSTWORTHY" NEED OPPOSITE RESPONSES. An integrity
+ * failure means what is on disk is not what this launcher trusts, and the
+ * correct move is to stop and not run it. A missing module means nothing is on
+ * disk — nearly always `--omit=optional`, `--no-optional`, or a lockfile that
+ * pruned the optional deps — and the correct move is to reinstall. Reporting
+ * both as "could not be verified" sent people hunting a supply-chain problem
+ * they did not have.
+ */
+export function collectorResolutionError(
+  error: unknown,
+  packageName: string,
+): OnboardingCollectorHostError {
+  if (
+    (error as NodeJS.ErrnoException | undefined)?.code === "MODULE_NOT_FOUND"
+  ) {
+    return new OnboardingCollectorHostError(
+      "ONBOARD_COLLECTOR_NOT_INSTALLED",
+      `${packageName} is not installed. Layers onboarding ships the collector as an optional platform dependency, so an install run with --omit=optional or --no-optional leaves nothing to verify. Reinstall without omitting optional dependencies.`,
+    );
+  }
+  return integrityError();
 }
 
 function integrityError(): OnboardingCollectorHostError {
@@ -559,17 +596,29 @@ async function verifyCollectorInstallation(): Promise<VerifiedCollector> {
     );
   }
 
+  // RESOLUTION IS ITS OWN FAILURE MODE, checked before anything can call the
+  // result an integrity problem. `require.resolve` throwing MODULE_NOT_FOUND
+  // means the optional platform package was never installed; every later check
+  // in this function is about a package that IS installed.
+  let packageJsonUnresolved: string;
+  let integrityUnresolved: string;
   try {
-    const packageJsonUnresolved = require.resolve(
+    packageJsonUnresolved = require.resolve(
       `${target.packageName}/package.json`,
     );
+    integrityUnresolved = require.resolve(`${target.packageName}/integrity.json`);
+  } catch (error) {
+    throw collectorResolutionError(error, target.packageName);
+  }
+
+  try {
     const packageRoot = await realpath(dirname(packageJsonUnresolved));
     const packageJsonPath = await resolveRegularFile(
       packageJsonUnresolved,
       packageRoot,
     );
     const integrityPath = await resolveRegularFile(
-      require.resolve(`${target.packageName}/integrity.json`),
+      integrityUnresolved,
       packageRoot,
     );
     const [packageBytes, integrityBytes] = await Promise.all([
@@ -626,6 +675,24 @@ async function verifyCollectorInstallation(): Promise<VerifiedCollector> {
     if (error instanceof OnboardingCollectorHostError) throw error;
     throw integrityError();
   }
+}
+
+/**
+ * Verify the installed collector artifacts without staging or running one.
+ *
+ * WHY THE LAUNCHER CALLS THIS FIRST. A local artifact fault — wrong version,
+ * bad digest, platform package pruned by `--omit=optional` — is knowable before
+ * anything is reserved. `openOnboardingCollector` only runs after a reservation
+ * exists, so the same fault used to cost a trial row, a reservation the person
+ * never uses, and a session that has to explain why it stopped. Checking here
+ * costs one filesystem read and zero server state.
+ *
+ * The verified binary is released immediately: this answers a question, it does
+ * not hold a collector open.
+ */
+export async function verifyOnboardingCollectorArtifacts(): Promise<void> {
+  const verified = await verifyCollectorInstallation();
+  verified.binary.fill(0);
 }
 
 async function stageCollector(

@@ -240,7 +240,16 @@ const claimVerifyPublicSchema = z
   .object({
     status: identifier,
     continuity: z.enum(["browser", "same_account"]),
-    postclaimAssets: postclaimAssetsSchema,
+    /**
+     * Optional, because a claim that succeeded is not invalid just because the
+     * post-claim asset projection is not ready to describe.
+     *
+     * Requiring it turned "the assets have not started generating yet" into
+     * "Onboarding claim verify returned an invalid public response" — a hard
+     * failure reported to a person whose workspace had, in fact, just been
+     * claimed. The caller already treats these fields as advisory.
+     */
+    postclaimAssets: postclaimAssetsSchema.optional(),
   })
   .strip();
 

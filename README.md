@@ -40,6 +40,21 @@ The phrase "as a background process" is load-bearing: Claude Code's permission
 classifier approves a long-running `npx` only when it is told the task runs in
 the background. Keep it.
 
+**The paste pins an exact version, on purpose.** The server's capability
+manifest is the source of truth for which launcher it will accept: it advertises
+`minimumMcpServerVersion` and `acceptedCollectorVersions`, and a launcher outside
+that window is refused at preflight before anything is reserved. Pinning the
+paste to the version the server currently advertises means the paste and the
+server agree by construction. `@latest` does not: it can outrun a cutover and
+hand somebody a launcher the server has not been told about yet, which fails with
+"requires an update" for a version that is newer than the one being demanded. So
+the paste stays pinned and moves when the server's advertised version moves.
+
+Examples further down that are about mechanics rather than the paste itself —
+the FIFO recipe, the compatibility URL form — use `@latest`, because they
+illustrate a shape rather than hand somebody a command to run against a live
+cutover.
+
 The command checks server compatibility before reading the workspace, runs the
 checksum-verified native collector locally, shows the exact bounded source-data
 proposal, and waits for explicit approval before sending evidence. While the

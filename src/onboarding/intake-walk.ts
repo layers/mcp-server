@@ -44,9 +44,12 @@ import {
 /**
  * How long the whole walk may hold the claim gate.
  *
- * Deliberately the same 15 minutes the claim handoff itself waits: intake runs
- * inside the window a person is already sitting in, and a walk nobody answers
- * must not outlive the thing it is delaying.
+ * FIFTEEN MINUTES IS NOW ITS OWN NUMBER. It used to be described as matching
+ * the claim handoff; the handoff waits far longer than that as of 1.3.1, and
+ * intake deliberately did NOT follow it. The claim wait is long because a person
+ * has to go to a browser and come back. This one is short because a walk nobody
+ * is answering must not outlive the thing it is delaying — the questions are
+ * meant to fill the build window, not to become the reason someone waits.
  */
 export const INTAKE_WALK_WAIT_MS = 15 * 60_000;
 
@@ -105,8 +108,15 @@ export type IntakeEvent =
       answered: number;
       remaining: number;
       commands: string[];
-      /** The server's reason for refusing the previous answer, when there was one. */
-      refusal?: string;
+      /**
+       * The server's refusal of the PREVIOUS answer, when there was one.
+       *
+       * Carries the field it belongs to, because the walk recomputes after
+       * every write: the question at the head of the list may not be the one
+       * that was refused, and pinning a stale reason under a fresh question
+       * tells the person their good answer was rejected.
+       */
+      refusal?: { field: string; message: string };
     };
 
 /** The launcher's input pipe, narrowed to what the walk uses. */
@@ -196,11 +206,15 @@ export function intakeAnswerCommands(question: IntakeQuestion): string[] {
     if (question.options.length > 1) {
       commands.push(`answer ${question.field} <value>,<value>`);
     }
-    // The empty pick is a real answer to a multi-select — leaving every box
-    // unticked commits `[]` rather than nothing (founder ruling 2026-08-06).
-    // The wire question carries no `optional` flag, so this is advertised for
-    // every multi-select and a server refusal re-prompts.
-    commands.push(`answer ${question.field}`);
+    // The empty pick is a real answer to an OPTIONAL multi-select — leaving
+    // every box unticked commits `[]` rather than nothing (founder ruling
+    // 2026-08-06). The wire now says which questions those are, so a required
+    // multi-select no longer advertises a command the server can only refuse.
+    // Absent flag keeps 1.3.0's behaviour: advertise it and let a refusal
+    // re-prompt.
+    if (question.optional !== false) {
+      commands.push(`answer ${question.field}`);
+    }
   }
   const freeTextOption = intakeFreeTextOptionValue(question);
   if (freeTextOption !== undefined) {
@@ -420,7 +434,7 @@ export function createIntakeWalkRunner(options: {
       });
 
       let refusals = 0;
-      let refusal: string | undefined;
+      let refusal: { field: string; message: string } | undefined;
       // The walk is re-read ONCE after it empties, and only once.
       let recheckedAfterEmpty = false;
       for (;;) {
@@ -483,7 +497,13 @@ export function createIntakeWalkRunner(options: {
           answered: summary.answered,
           remaining: summary.remaining,
           commands: intakeAnswerCommands(question),
-          ...(refusal === undefined ? {} : { refusal }),
+          // ONLY AGAINST THE QUESTION IT BELONGS TO. The server recomputes the
+          // walk on every write, so the head of the list can change under a
+          // pending refusal; showing it anyway would tell the person a fresh
+          // question had rejected an answer they never gave to it.
+          ...(refusal === undefined || refusal.field !== question.field
+            ? {}
+            : { refusal }),
         });
         refusal = undefined;
 
@@ -520,7 +540,10 @@ export function createIntakeWalkRunner(options: {
             // A structured refusal names what was wrong with the pick. Re-ask
             // with the offered options rather than abandoning the walk.
             refusals += 1;
-            refusal = error.reason ?? "That answer was not accepted.";
+            refusal = {
+              field: parsed.answer.field,
+              message: error.reason ?? "That answer was not accepted.",
+            };
             continue;
           }
           settle(
@@ -541,13 +564,21 @@ export function createIntakeWalkRunner(options: {
         );
         remaining = record(response);
         if (rejection) {
-          if (refusals + 1 < INTAKE_REFUSAL_LIMIT) {
+          if (refusals + 1 < INTAKE_REFUSAL_LIMIT && remaining.length > 0) {
             refusals += 1;
-            refusal =
-              boundedRelayText(rejection.message) ??
-              "That answer was not accepted.";
+            refusal = {
+              field: rejection.field,
+              message:
+                boundedRelayText(rejection.message) ??
+                "That answer was not accepted.",
+            };
             continue;
           }
+          // A REFUSAL NEVER COMPLETES THE WALK. If the refused answer was the
+          // last outstanding question, `remaining` is now empty — and falling
+          // through would settle `complete` on a walk whose final answer the
+          // server explicitly would not take. Refusing at the cap and refusing
+          // the last question are the same honest outcome: skipped.
           settle(
             "skipped",
             "Layers could not record the setup answers, so the remaining questions were skipped. Nothing else is held up.",

@@ -25,7 +25,10 @@ import {
   OnboardingSourceInspectionSchema,
 } from "@layers/onboarding-contracts";
 
-import { openOnboardingCollector } from "../dist/onboarding/collector-host.js";
+import {
+  collectorResolutionError,
+  openOnboardingCollector,
+} from "../dist/onboarding/collector-host.js";
 
 const require = createRequire(import.meta.url);
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
@@ -201,6 +204,39 @@ function assertTimeoutError(error) {
   assert.equal(error?.supportCode, "ONBOARD_COLLECTOR_TIMEOUT");
   return true;
 }
+
+test("a missing platform package is not reported as an integrity failure", () => {
+  // OPPOSITE REMEDIES. An integrity failure means what is on disk is not what
+  // this launcher trusts, and the answer is to stop. A missing module means
+  // nothing is on disk — almost always --omit=optional — and the answer is to
+  // reinstall. Reporting both as "could not be verified" sent people hunting a
+  // supply-chain problem they did not have.
+  const missing = Object.assign(new Error("Cannot find module"), {
+    code: "MODULE_NOT_FOUND",
+  });
+  const notInstalled = collectorResolutionError(
+    missing,
+    "@layers/onboarding-collector-linux-x64",
+  );
+  assert.equal(notInstalled.supportCode, "ONBOARD_COLLECTOR_NOT_INSTALLED");
+  assert.match(notInstalled.message, /@layers\/onboarding-collector-linux-x64/u);
+  assert.match(notInstalled.message, /--omit=optional/u);
+  assert.match(notInstalled.message, /Reinstall/u);
+
+  // Anything else resolving badly is still an integrity failure.
+  const other = collectorResolutionError(
+    new Error("EACCES: permission denied"),
+    "@layers/onboarding-collector-linux-x64",
+  );
+  assert.equal(other.supportCode, "ONBOARD_COLLECTOR_INTEGRITY");
+
+  // The real resolver does produce MODULE_NOT_FOUND for a package that is not
+  // installed, so the discriminator above is the one that actually fires.
+  assert.throws(
+    () => require.resolve("@layers/onboarding-collector-linux-x64/package.json"),
+    (error) => error.code === "MODULE_NOT_FOUND",
+  );
+});
 
 test("pins the exact installed contract and current-platform collector artifacts", async () => {
   const hostPackage = await readJson(join(PROJECT_ROOT, "package.json"));

@@ -2388,11 +2388,14 @@ function rememberLauncherReservation(expiresAt) {
 }
 
 test("late claim setup surfaces its safe URL before awaiting-claim completion", async () => {
-  const reservationExpiresAt = "2100-08-14T01:00:00.000Z";
+  // THE INVARIANT: a minted attempt's browser URL reaches the agent before the
+  // wait can end. The wait is bounded here by the reservation rather than by a
+  // dead transport leg — as of 1.3.1 an expired leg is re-armed, so it is no
+  // longer a way to end anything.
+  const reservationExpiresAt = new Date(Date.now() + 1_500).toISOString();
   rememberLauncherReservation(reservationExpiresAt);
   const originalFetch = globalThis.fetch;
   const events = [];
-  let exchangeRequests = 0;
 
   globalThis.fetch = async (input) => {
     const pathname = new URL(String(input)).pathname;
@@ -2400,21 +2403,24 @@ test("late claim setup surfaces its safe URL before awaiting-claim completion", 
       return Response.json(PROGRESS_RESPONSE, { status: 200 });
     }
     if (pathname.endsWith("/claim-attempts")) {
-      return Response.json(
-        { ...CLAIM_ATTEMPT_RESPONSE, expiresAt: "2000-01-01T00:00:00.000Z" },
-        { status: 202 },
-      );
+      return Response.json(CLAIM_ATTEMPT_RESPONSE, { status: 202 });
     }
-    exchangeRequests += 1;
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+    }
     throw new Error(`unexpected request: ${pathname}`);
   };
 
   try {
-    await waitForPreviewAndClaim(
-      "https://api.layers.test",
-      new AbortController().signal,
-      reservationExpiresAt,
-      (event) => events.push(event),
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "late claim setup",
+      60_000,
     );
   } finally {
     globalThis.fetch = originalFetch;
@@ -2429,11 +2435,72 @@ test("late claim setup surfaces its safe URL before awaiting-claim completion", 
     (event) =>
       event.type === "complete" && event.state === "awaiting_claim",
   );
-  assert.ok(safeProgressIndex >= 0);
+  assert.ok(safeProgressIndex >= 0, "the attempt-bound URL was published");
   assert.ok(completionIndex > safeProgressIndex);
   assert.equal(events[completionIndex].previewUrl, PREVIEW_URL);
   assert.equal(events[completionIndex].postclaim, null);
-  assert.equal(exchangeRequests, 0);
+  // The portable trial-wide claim URL is still never exposed.
+  assert.equal(
+    events.some((event) => JSON.stringify(event).includes(LEGACY_CLAIM_TOKEN)),
+    false,
+  );
+});
+
+test("re-arming is capped rather than unbounded", async () => {
+  // Re-arming exists so a slow human still gets a live link. A server that
+  // refuses every leg must not turn that into an unbounded mint loop.
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let attempts = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      attempts += 1;
+      return Response.json(
+        {
+          ...CLAIM_ATTEMPT_RESPONSE,
+          claimUrl: `${ATTEMPT_CLAIM_URL}&mint=${attempts}`,
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      // The server sweeps every leg the moment it is used.
+      return Response.json({ error: "attempt expired" }, { status: 410 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "capped re-arm",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(attempts, 8, "re-arming stopped at the cap");
+  const stillOpen = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_still_open",
+  );
+  assert.equal(stillOpen.length, 1);
+  assert.match(stillOpen[0].message, /re-minted 8 times without being opened/u);
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "awaiting_claim");
 });
 
 test("claimed progress gets its final exchange after the local deadline", async () => {
@@ -2752,6 +2819,357 @@ test("stopping the wait says the workspace is still claimable", async () => {
   assert.equal(terminal.length, 1);
   assert.equal(terminal[0].state, "awaiting_claim");
   assert.ok(events.indexOf(stillOpen[0]) < events.indexOf(terminal[0]));
+});
+
+/**
+ * A claim mock whose attempt the server has already swept.
+ *
+ * The exchange answers 410 for a swept attempt, and a clock a few seconds out
+ * puts the launcher there before its own `attemptExpired()` is true. 1.3.0 —
+ * and 1.3.1 before this fix — turned that into a dead run.
+ */
+test("a non-retryable exchange failure on a dead leg re-arms instead of ending the wait", async () => {
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let attempts = 0;
+  let exchanges = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      attempts += 1;
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          claimUrl: `${ATTEMPT_CLAIM_URL}&mint=${attempts}`,
+          // Server says the leg is alive for a while; the server then refuses
+          // it anyway, which is the skew case this test exists for.
+          expiresAt: ATTEMPT_EXPIRES_AT,
+          state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      exchanges += 1;
+      if (attempts >= 2) {
+        return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+      }
+      // 410 Gone: not retryable, and fatal in 1.3.0.
+      return Response.json({ error: "attempt expired" }, { status: 410 });
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "re-armed claim handoff after a refused exchange",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(attempts, 2, "the refused leg was replaced");
+  assert.ok(exchanges >= 2);
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "claimed");
+});
+
+test("an exchange state this version does not know retires the leg", async () => {
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let attempts = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      attempts += 1;
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          claimUrl: `${ATTEMPT_CLAIM_URL}&mint=${attempts}`,
+          expiresAt: ATTEMPT_EXPIRES_AT,
+          state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      if (attempts >= 2) {
+        return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+      }
+      // A 200 carrying a state neither `pending` nor `claimed`. Whatever it
+      // means, it is not success and its expiry is unreadable.
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          state: "quarantined",
+        },
+        { status: 200 },
+      );
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "unknown exchange state",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(attempts, 2);
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "claimed");
+});
+
+test("an interrupt mid-wait still reports the workspace as claimable", async () => {
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  const controller = new AbortController();
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          claimUrl: ATTEMPT_CLAIM_URL,
+          expiresAt: ATTEMPT_EXPIRES_AT,
+          state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      // The human hits Ctrl-C while the launcher sits in its poll sleep.
+      queueMicrotask(() => controller.abort());
+      return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await assert.rejects(
+      withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          controller.signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "interrupted claim wait",
+        60_000,
+      ),
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // The abort still propagates; what changed is that it no longer leaves the
+  // agent with an empty stream and no way to tell cancellation from expiry.
+  const stillOpen = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_still_open",
+  );
+  assert.equal(stillOpen.length, 1);
+  assert.match(stillOpen[0].message, /interrupted before the claim completed/u);
+  assert.match(stillOpen[0].message, /still claimable until/u);
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "awaiting_claim");
+});
+
+test("claim setup honors Retry-After and says it is retrying", async () => {
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let setupCalls = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      setupCalls += 1;
+      if (setupCalls <= 2) {
+        return Response.json(
+          { error: "claim setup is busy" },
+          { status: 429, headers: { "retry-after": "0" } },
+        );
+      }
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          claimUrl: ATTEMPT_CLAIM_URL,
+          expiresAt: ATTEMPT_EXPIRES_AT,
+          state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "claim setup retry",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // The backoff used to be silent, which is indistinguishable from a hang to
+  // whatever is polling this process.
+  const retrying = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_setup_retrying",
+  );
+  assert.ok(retrying.length >= 1, "the retry announced itself");
+  assert.match(retrying[0].message, /retrying in \d+s/u);
+  assert.match(retrying[0].message, /nothing needs restarting/u);
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal[0].state, "claimed");
+});
+
+test("a progress projection with unknown fields and states does not brick the wait", async () => {
+  // The pinned canonical schema is `.strict()` with an enumerated `state`, so
+  // this exact payload fails it. The launcher polls this route every few
+  // seconds for hours; a server-added field must not end somebody's claim.
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let polls = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      polls += 1;
+      return Response.json(
+        {
+          ...PROGRESS_RESPONSE,
+          state: polls === 1 ? "reticulating_splines" : "awaiting_claim",
+          brandNewServerField: { shape: "nobody here has seen" },
+          groundedPlayback: [
+            { fact: "layers_sdk_presence", value: "present", extra: "future" },
+          ],
+        },
+        { status: 200 },
+      );
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          claimUrl: ATTEMPT_CLAIM_URL,
+          expiresAt: ATTEMPT_EXPIRES_AT,
+          state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "tolerant progress read",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "claimed");
+
+  // Unknown fields are RELAYED, not dropped: the agent reads grounded facts out
+  // of this event, including shapes this build has never heard of.
+  const progressEvents = events.filter((event) => event.type === "progress");
+  assert.ok(progressEvents.length >= 1);
+  assert.deepEqual(progressEvents[0].progress.brandNewServerField, {
+    shape: "nobody here has seen",
+  });
+  assert.deepEqual(progressEvents[0].progress.groundedPlayback, [
+    { fact: "layers_sdk_presence", value: "present", extra: "future" },
+  ]);
 });
 
 test("a terminal failure names the trial, the last state, and the server's code", async () => {

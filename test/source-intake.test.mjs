@@ -39,6 +39,7 @@ const RESERVATION_EXPIRES_AT = new Date(
 ).toISOString();
 const PREVIEW_URL = "https://app.layers.test/p/preview-token";
 const ATTEMPT_HANDLE = "h".repeat(43);
+const ATTEMPT_EXPIRES_AT = "2100-08-14T00:15:00.000Z";
 const ATTEMPT_CLAIM_URL =
   `https://app.layers.test/claim#token=browser-claim-token&claimAttemptHandle=${ATTEMPT_HANDLE}`;
 
@@ -394,7 +395,10 @@ test("re-asks with the offered options when the server refuses an answer", async
   const turns = turnsIn(harness.events);
   assert.equal(turns.length, 2, "the refusal re-asks rather than failing");
   assert.equal(turns[0].refusal, undefined);
-  assert.equal(turns[1].refusal, "goal does not take free text");
+  assert.deepEqual(turns[1].refusal, {
+    field: "goal",
+    message: "goal does not take free text",
+  });
   assert.deepEqual(turns[1].question.options, GOAL_QUESTION.options);
   assert.equal(harness.runner.gate.summary().state, "complete");
 });
@@ -462,7 +466,10 @@ test("a 200 that refuses the answer re-asks instead of reading as recorded", asy
   const turns = turnsIn(harness.events);
   assert.equal(turns.length, 2, "the refusal re-asks the same question");
   assert.equal(turns[0].refusal, undefined);
-  assert.equal(turns[1].refusal, "goal does not take free text right now.");
+  assert.deepEqual(turns[1].refusal, {
+    field: "goal",
+    message: "goal does not take free text right now.",
+  });
   assert.deepEqual(turns[1].question.options, GOAL_QUESTION.options);
   // The refusal must never be reported as an accepted answer.
   assert.equal(
@@ -513,16 +520,16 @@ test("a control-laden rejection message is bounded before it is relayed", async 
         {
           field: "goal",
           reason: "option_not_offered",
-          message: `line one\nlinetwo ${"x".repeat(400)}`,
+          message: `line\u0000one\nline\u007ftwo ${"x".repeat(400)}`,
           options: GOAL_QUESTION.options,
         },
       ]),
   });
   await harness.runner.run();
 
-  const relayed = turnsIn(harness.events)[1].refusal;
+  const relayed = turnsIn(harness.events)[1].refusal.message;
   assert.equal(relayed.length <= 200, true, "the relayed reason is bounded");
-  assert.equal(/[ -]/u.test(relayed), false);
+  assert.equal(/[\u0000-\u001f\u007f]/u.test(relayed), false);
   assert.match(relayed, /^line one line two x+$/u);
 });
 
@@ -597,6 +604,98 @@ test("a failed final re-read completes rather than reporting a skip", async () =
   assert.equal(settlement.complete, true);
   assert.equal(settlement.answered, 1);
   assert.equal(harness.runner.gate.isSettled(), true);
+});
+
+test("a refusal is shown only against the question it belongs to", async () => {
+  // The walk recomputes on every write, so the question at the head of the list
+  // after a refusal is not necessarily the refused one. Pinning a stale reason
+  // under a fresh question tells the person their good answer was rejected.
+  const late = { ...GOAL_QUESTION, field: "goal" };
+  let writes = 0;
+  const harness = runnerHarness({
+    input: scriptedInput([
+      "answer triedChannels social",
+      "answer goal installs",
+    ]),
+    readWalk: async () => walkResponse([MULTI_QUESTION, late]),
+    submitAnswer: async () => {
+      writes += 1;
+      if (writes === 1) {
+        // Refuses `triedChannels`, and hands back a walk whose head is `goal`.
+        return walkResponse([late], [], [
+          {
+            field: "triedChannels",
+            reason: "option_not_offered",
+            message: "That channel is not on the list.",
+            options: MULTI_QUESTION.options,
+          },
+        ]);
+      }
+      return walkResponse([], ["goal"]);
+    },
+  });
+  await harness.runner.run();
+
+  const turns = turnsIn(harness.events);
+  const goalTurn = turns.find((turn) => turn.question.field === "goal");
+  assert.ok(goalTurn, "the walk moved on to goal");
+  assert.equal(
+    goalTurn.refusal,
+    undefined,
+    "a triedChannels refusal must not be rendered under goal",
+  );
+});
+
+test("a refusal that empties the walk settles skipped, never complete", async () => {
+  // The refused answer was the last outstanding question, so `remaining` is now
+  // empty. Settling `complete` there would report a walk as finished on an
+  // answer the server explicitly would not take.
+  const harness = runnerHarness({
+    input: scriptedInput(["answer goal installs"]),
+    readWalk: async () => walkResponse([GOAL_QUESTION]),
+    submitAnswer: async () =>
+      walkResponse([], [], [
+        {
+          field: "goal",
+          reason: "option_not_offered",
+          message: "That option is no longer offered.",
+          options: GOAL_QUESTION.options,
+        },
+      ]),
+  });
+  await harness.runner.run();
+
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "skipped");
+  assert.equal(settlement.complete, false);
+  assert.equal(settlement.reason, "refused");
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "intake" && event.message === "Answer recorded.",
+    ),
+    false,
+  );
+});
+
+test("a required multi-select does not advertise the empty pick", () => {
+  // The wire now says which questions take silence for an answer. Advertising
+  // `answer <field>` on a required one offers a command the server can only
+  // refuse, which costs a round trip and reads to the person as a bug.
+  const required = { ...MULTI_QUESTION, optional: false };
+  assert.equal(
+    intakeAnswerCommands(required).includes("answer triedChannels"),
+    false,
+  );
+  const optional = { ...MULTI_QUESTION, optional: true };
+  assert.equal(
+    intakeAnswerCommands(optional).includes("answer triedChannels"),
+    true,
+  );
+  // Absent flag keeps 1.3.0's behaviour exactly.
+  assert.equal(
+    intakeAnswerCommands(MULTI_QUESTION).includes("answer triedChannels"),
+    true,
+  );
 });
 
 test("a broken question service fails the claim gate open with an honest event", async () => {
@@ -859,10 +958,20 @@ test("a walk that finishes first still waits for the preview", async () => {
           trialHandle: TRIAL_HANDLE,
           attemptHandle: ATTEMPT_HANDLE,
           claimUrl: ATTEMPT_CLAIM_URL,
-          // An already-expired attempt terminates the wait as awaiting_claim
-          // right after the safe URL is published.
-          expiresAt: "2000-01-01T00:00:00.000Z",
+          expiresAt: ATTEMPT_EXPIRES_AT,
           state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          state: "pending",
+          expiresAt: ATTEMPT_EXPIRES_AT,
         },
         { status: 202 },
       );
@@ -870,11 +979,14 @@ test("a walk that finishes first still waits for the preview", async () => {
     throw new Error(`unexpected request: ${pathname}`);
   };
 
+  // The wait is bounded by the reservation, which is the cheap way to reach the
+  // awaiting-claim handoff without waiting out the 24-hour budget.
+  const shortReservation = new Date(Date.now() + 1_200).toISOString();
   try {
     await waitForPreviewAndClaim(
       BASE_URL,
       new AbortController().signal,
-      RESERVATION_EXPIRES_AT,
+      shortReservation,
       (event) => events.push(event),
       settledGate.runner.gate,
     );
