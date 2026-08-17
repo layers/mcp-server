@@ -45,8 +45,30 @@ import {
 
 const require = createRequire(import.meta.url);
 
-const COLLECTOR_PACKAGE_VERSION = "0.1.4";
+/**
+ * The onboarding artifact set this launcher will run: the contracts package and
+ * the six native collector packages, which move together.
+ *
+ * ONE NUMBER BECAUSE UPSTREAM STAMPS ONE NUMBER.
+ * `scripts/build-onboarding-collector-packages.mjs` in `layers/layers` hard-
+ * fails unless `@layers/onboarding-contracts` carries its `PACKAGE_VERSION`,
+ * and writes that same value into each collector package's version, its
+ * `collectorVersion`, and its `contractArtifactVersion`;
+ * `collector-protocol.ts` then requires all three to agree. There is no
+ * releasable combination where the collector moves and the contracts artifact
+ * does not, so splitting this constant would only let this file describe a
+ * state that cannot exist.
+ *
+ * DIGESTS BELOW ARE PART OF THIS PIN. Bumping this without re-measuring
+ * `CONTRACT_MANIFEST_SHA256`, `COLLECTION_POLICY_SHA256` and every
+ * `EXPECTED_BINARIES` entry leaves the launcher refusing artifacts it just
+ * installed. `test/collector-host.test.mjs` is the gate: it re-derives all
+ * eight from the installed packages.
+ */
+const COLLECTOR_PACKAGE_VERSION = "0.1.5";
 const CONTRACT_PACKAGE_NAME = "@layers/onboarding-contracts";
+// PENDING 0.1.5: measured from 0.1.4 and re-measured by `npm test` once the
+// 0.1.5 artifacts are installable.
 const CONTRACT_MANIFEST_SHA256 =
   "5e58fd2e735e5fe396935e3967626af50935823abb04c3398a55168cb06cbb39";
 const COLLECTION_POLICY_SHA256 =
@@ -66,6 +88,13 @@ const SESSION_MAX_MS = 15 * 60_000;
 const STAGE_PREFIX = "layers-onboarding-collector-";
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
+/**
+ * PENDING 0.1.5. These are 0.1.4's measurements, kept until the 0.1.5 tarballs
+ * exist to measure. Re-derive each pair from
+ * `node_modules/@layers/onboarding-collector-<platform>-<arch>/integrity.json`
+ * (`binaryBytes` / `binarySha256`) after `npm install`, and let
+ * `test/collector-host.test.mjs` prove them.
+ */
 const EXPECTED_BINARIES: Readonly<
   Record<string, { readonly bytes: number; readonly sha256: string }>
 > = {

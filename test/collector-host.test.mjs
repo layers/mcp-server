@@ -29,7 +29,9 @@ import { openOnboardingCollector } from "../dist/onboarding/collector-host.js";
 
 const require = createRequire(import.meta.url);
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const COLLECTOR_VERSION = "0.1.4";
+// The contracts package and the six collector packages ship as one versioned
+// artifact set, so one constant covers both here exactly as it does upstream.
+const COLLECTOR_VERSION = "0.1.5";
 const CONTRACT_MANIFEST_SHA256 =
   "5e58fd2e735e5fe396935e3967626af50935823abb04c3398a55168cb06cbb39";
 const COLLECTION_POLICY_SHA256 =
@@ -200,7 +202,7 @@ function assertTimeoutError(error) {
   return true;
 }
 
-test("pins the exact installed 0.1.4 contract and current-platform collector artifacts", async () => {
+test("pins the exact installed contract and current-platform collector artifacts", async () => {
   const hostPackage = await readJson(join(PROJECT_ROOT, "package.json"));
   assert.equal(hostPackage.dependencies["@layers/onboarding-contracts"], COLLECTOR_VERSION);
   for (const target of ONBOARDING_COLLECTOR_TARGETS) {

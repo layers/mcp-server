@@ -43,7 +43,7 @@ const REQUEST_TIMEOUT_MS = 15_000;
  * downgrade: `capabilities.ts` in `layers/layers` must accept the new value
  * before a launcher pinned to it can onboard anyone.
  */
-const COLLECTOR_VERSION = "0.1.4";
+const COLLECTOR_VERSION = "0.1.5";
 /** The longest server-supplied refusal reason this process will relay. */
 const REFUSAL_REASON_MAX_LENGTH = 200;
 

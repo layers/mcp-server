@@ -10,12 +10,15 @@
  * `apps/api/src/routes/onboard/agent/intake-answers.ts`.
  *
  * WHY A LOCAL MIRROR rather than a dependency bump. The canonical schemas ship
- * in `@layers/onboarding-contracts`, which this package pins at `0.1.4`.
- * Upstream, the contract artifact and the six native collector binaries are
- * stamped from one version number, so bumping the contract package to reach
- * these schemas would force republishing all six collector packages for a
- * collector that did not change. The mirror is deliberately minimal: request
- * shape, response shape, and the route path.
+ * in `@layers/onboarding-contracts`, and upstream that artifact and the six
+ * native collector binaries are stamped from one version number, so reaching
+ * these schemas by bumping the contract package drags all six collector
+ * packages with it whether or not the collector changed. The mirror is
+ * deliberately minimal: request shape, response shape, and the route path.
+ *
+ * RECHECK ON EVERY ARTIFACT BUMP. If the pinned artifact starts carrying these
+ * schemas and the route key, this mirror should be deleted rather than kept in
+ * sync by hand.
  *
  * DRIFT POLICY. The mirrored question fields that this launcher only relays
  * (`group`, `channel`, `mode`) are typed as plain strings rather than as the
@@ -32,8 +35,8 @@ import { z } from "zod";
  * `GET`/`POST /api/onboard/agent/trials/:trialHandle/intake-answers`.
  *
  * Declared here rather than read from `ONBOARD_AGENT_PUBLIC_ROUTE_PATHS`
- * because the pinned `0.1.4` contract artifact predates the route and does not
- * carry the key.
+ * because the contract artifact this package pins predates the route and does
+ * not carry the key.
  */
 export const ONBOARD_AGENT_INTAKE_ANSWERS_ROUTE_PATH =
   "/api/onboard/agent/trials/:trialHandle/intake-answers";
