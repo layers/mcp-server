@@ -9,11 +9,36 @@ any MCP client.
 
 ## One-paste onboarding
 
-Run this from the product repository in the same Codex or Claude shell session:
+Paste this one sentence to your coding agent, from the product repository:
 
-```sh
-npx --yes @layers/mcp-server@latest onboard
 ```
+Onboard this repository into Layers: run npx --yes @layers/mcp-server@1.3.1 onboard from the repo root as a background process and follow the agent_instructions it prints; each input_required event advertises the exact command to send, except approve_consent, where you print the consent_proposal verbatim and stop until the human explicitly approves.
+```
+
+That is the whole paste. The consent clause is not decoration: `approve_consent`
+advertises its approval command like every other turn, so a paste that says only
+"send the advertised command" reads as licence to send that one too. The
+exception has to be stated where the human pastes it, not only inside the
+launcher output the agent may summarize.
+
+The rest of the rules for driving the launcher used to live in the paste; they
+now arrive from the launcher itself, as the FIRST line it writes:
+
+```json
+{"type":"agent_instructions","protocolVersion":1,"instructions":"…","commands":{…}}
+```
+
+`instructions` is the full operating protocol in plain ASCII — how to poll the
+process, what to print verbatim, when to stop and wait for a human, and what to
+do with the SDK fact after the claim. `commands` lists the command shapes the
+protocol uses; every turn still advertises its own exact command, and that
+advertised string is the one to send. The event is emitted once, before the
+launcher does anything else, so an agent that started the process has the
+protocol before it has to drive anything.
+
+The phrase "as a background process" is load-bearing: Claude Code's permission
+classifier approves a long-running `npx` only when it is told the task runs in
+the background. Keep it.
 
 The command checks server compatibility before reading the workspace, runs the
 checksum-verified native collector locally, shows the exact bounded source-data
@@ -39,8 +64,13 @@ offered `options` as `value`/`label` pairs) and the `commands` that answer it:
 answer <field> <value>                 pick one offered option
 answer <field> <value>,<value>         pick several (multi-select questions)
 answer <field>                         pick none (multi-select questions)
-answer goal other <your own words>     the one arm that takes free text
+answer <field> other <your own words>  questions whose allowsFreeText is true
 ```
+
+Which questions take free text is the server's call, carried per question on the
+wire and reported on the turn as `allowsFreeText`. A question the walk refuses an
+answer to is re-asked with the server's reason on `refusal`, rather than reported
+as recorded.
 
 Send exactly one advertised command per turn; the next question arrives once the
 answer is recorded. A line that names an option the question does not offer
@@ -56,6 +86,26 @@ gate failed open**: the question service was unreachable, refused repeatedly, or
 the questions were left unanswered past their bounded window. A broken question
 service costs a person their questions, never their workspace. The terminal
 `complete` event carries the same summary on its `intake` field.
+
+### Waiting for the browser claim
+
+The claim handoff waits for the human, not for a timer. A browser claim link is
+attempt-bound and the server caps each attempt at 15 minutes, so an unopened link
+is re-minted rather than treated as the end of the session: the command emits
+`status` with stage `claim_link_refreshed`, and the fresh URL arrives on the next
+`progress` event. Give the human that one; the earlier link is dead.
+
+While it waits it emits `status` with stage `awaiting_claim` every few minutes,
+so an agent polling a deliberately idle process has something true to report. The
+overall wait is 24 hours, intersected with the reservation.
+
+If it does stop before the claim, it says so explicitly on `status` with stage
+`claim_still_open` before the terminal `complete`: the workspace is still built
+and still claimable until the reservation expires, and nothing was cancelled.
+
+> 1.3.0 ended the wait at the 15-minute transport-attempt expiry and exited `0`
+> with `state: awaiting_claim`, which read as "the claim expired" when the only
+> thing that had expired was the transport leg. That is fixed in 1.3.1.
 
 ### Claude Code process control
 

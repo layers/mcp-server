@@ -2543,3 +2543,251 @@ test("claim setup exhaustion fails without claiming a handoff was exposed", asyn
     false,
   );
 });
+
+/**
+ * WHAT A TERMINAL SERVER FAILURE SAYS.
+ *
+ * `Layers onboarding failed` gives a person nothing to act on and support
+ * nothing to look up. The three facts always available are the trial handle,
+ * the last state this process actually read, and the server's own failure code
+ * when the projection carries one. An absent reason is reported as an absence
+ * rather than papered over with a guess.
+ */
+function terminalProgress(state, failure) {
+  return OnboardAgentProgressResponseSchema.parse({
+    ...PROGRESS_RESPONSE,
+    state,
+    stageLabel: "Onboarding ended",
+    previewReady: false,
+    previewUrl: null,
+    claimReady: false,
+    claimUrl: null,
+    failure,
+  });
+}
+
+async function progressFailureMessage(progress) {
+  const reservationExpiresAt = new Date(Date.now() + 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(progress, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+  try {
+    await waitForPreviewAndClaim(
+      "https://api.layers.test",
+      new AbortController().signal,
+      reservationExpiresAt,
+      () => {},
+    );
+  } catch (error) {
+    return error instanceof Error ? error.message : String(error);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+  return assert.fail("a failed progress projection must end the wait");
+}
+
+/**
+ * THE 15-MINUTE EXIT. 1.3.0 clamped its whole claim wait down to the server's
+ * transport-attempt expiry, so a link minted at 16:53 ended the session at 17:07
+ * reporting `awaiting_claim` — while the trial stayed claimable for the rest of
+ * the reservation and the human had simply not clicked yet.
+ */
+test("an expired transport attempt is re-armed instead of ending the wait", async () => {
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  const mintedClaimUrls = [];
+  let attempts = 0;
+  let exchanges = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      attempts += 1;
+      const claimUrl = `${ATTEMPT_CLAIM_URL}&mint=${attempts}`;
+      mintedClaimUrls.push(claimUrl);
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          claimUrl,
+          // The first attempt is already dead, exactly as a 15-minute leg is by
+          // the time a person gets back to their terminal.
+          expiresAt:
+            attempts === 1
+              ? new Date(Date.now() + 40).toISOString()
+              : ATTEMPT_EXPIRES_AT,
+          state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      exchanges += 1;
+      // The second attempt is the one the human finally opens.
+      if (attempts >= 2) {
+        return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+      }
+      return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "re-armed claim handoff",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(attempts, 2, "the expired attempt was replaced, not accepted");
+  assert.ok(exchanges >= 1);
+
+  // The wait ended on the claim, never on the transport leg.
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "claimed");
+  assert.equal(terminal[0].previewUrl, PREVIEW_URL);
+
+  // A replaced link must be announced, and the new URL published.
+  const refreshed = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_link_refreshed",
+  );
+  assert.equal(refreshed.length, 1);
+  const publishedClaimUrls = events
+    .filter((event) => event.type === "progress")
+    .map((event) => event.progress.claimUrl)
+    .filter(Boolean);
+  assert.equal(
+    publishedClaimUrls.includes(mintedClaimUrls[1]),
+    true,
+    "the fresh claim link reached the agent",
+  );
+  // The portable trial-wide claim URL is still never exposed.
+  assert.equal(
+    events.some((event) => JSON.stringify(event).includes(LEGACY_CLAIM_TOKEN)),
+    false,
+  );
+});
+
+test("stopping the wait says the workspace is still claimable", async () => {
+  // The wait is bounded by the reservation, so a reservation seconds from
+  // expiry is the cheap way to reach the stop path.
+  const reservationExpiresAt = new Date(Date.now() + 1_500).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          claimUrl: ATTEMPT_CLAIM_URL,
+          expiresAt: ATTEMPT_EXPIRES_AT,
+          state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "bounded claim wait",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  const stillOpen = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_still_open",
+  );
+  assert.equal(stillOpen.length, 1, "stopping must not be reported as expiring");
+  assert.match(stillOpen[0].message, /still claimable until/u);
+  assert.match(stillOpen[0].message, /nothing was cancelled/u);
+
+  // The explanation precedes the terminal event, so an agent reading in order
+  // has the reason before it has the verdict.
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "awaiting_claim");
+  assert.ok(events.indexOf(stillOpen[0]) < events.indexOf(terminal[0]));
+});
+
+test("a terminal failure names the trial, the last state, and the server's code", async () => {
+  const message = await progressFailureMessage(
+    terminalProgress("failed", {
+      retryable: false,
+      supportCode: "ONBOARD_ANALYSIS_FAILED",
+      retryOperation: "Start onboarding again from the repository root.",
+    }),
+  );
+  assert.match(message, /Layers onboarding failed\./u);
+  assert.match(message, new RegExp(`Trial handle: ${TRIAL_HANDLE}\\.`, "u"));
+  assert.match(message, /Last progress state: failed\./u);
+  assert.match(message, /Server failure code: ONBOARD_ANALYSIS_FAILED\./u);
+  assert.equal(message.includes(RESERVATION_CAPABILITY), false);
+});
+
+test("a terminal end with no server reason says so rather than guessing", async () => {
+  // `failed` always carries failure details (the projection refuses otherwise),
+  // so the reason-less terminal state this branch exists for is `expired`.
+  const message = await progressFailureMessage(
+    terminalProgress("expired", null),
+  );
+  assert.match(message, /Layers onboarding expired\./u);
+  assert.match(message, new RegExp(`Trial handle: ${TRIAL_HANDLE}\\.`, "u"));
+  assert.match(message, /Last progress state: expired\./u);
+  assert.match(message, /Server reported no reason\./u);
+  assert.equal(/Server failure code/u.test(message), false);
+});
+
+test("needs_clarification ends the wait with the same named facts", async () => {
+  const message = await progressFailureMessage(
+    terminalProgress("needs_clarification", null),
+  );
+  assert.match(message, /needs clarification before this session can continue\./u);
+  assert.match(message, new RegExp(`Trial handle: ${TRIAL_HANDLE}\\.`, "u"));
+  assert.match(message, /Last progress state: needs_clarification\./u);
+  assert.match(message, /Server reported no reason\./u);
+});

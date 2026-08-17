@@ -35,6 +35,14 @@ import { getReservation, type OnboardingReservation } from "./session.js";
 
 const RESPONSE_LIMIT_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
+/**
+ * The collector release this launcher runs, checked against the server's
+ * `compatibility.acceptedCollectorVersions` before any local inspection.
+ *
+ * Moving this ahead of the server is a hard preflight stop, not a silent
+ * downgrade: `capabilities.ts` in `layers/layers` must accept the new value
+ * before a launcher pinned to it can onboard anyone.
+ */
 const COLLECTOR_VERSION = "0.1.4";
 /** The longest server-supplied refusal reason this process will relay. */
 const REFUSAL_REASON_MAX_LENGTH = 200;
@@ -80,7 +88,18 @@ function safeRefusalReason(text: string): string | undefined {
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const reason = (parsed as { reason?: unknown }).reason;
   if (typeof reason !== "string") return undefined;
-  const sanitized = reason
+  return boundedRelayText(reason);
+}
+
+/**
+ * Server-authored prose, bounded and stripped before anything relays it.
+ *
+ * The only consumers write this into an agent transcript, so control characters
+ * and unbounded length are the two ways a refusal message could do more than
+ * explain itself.
+ */
+export function boundedRelayText(value: string): string | undefined {
+  const sanitized = value
     .replace(/[\u0000-\u001F\u007F]/gu, " ")
     .replace(/\s+/gu, " ")
     .trim()

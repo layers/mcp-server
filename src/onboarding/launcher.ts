@@ -9,6 +9,11 @@ import {
   type OnboardingSourceInspection,
 } from "@layers/onboarding-contracts";
 import {
+  AGENT_INSTRUCTIONS,
+  AGENT_INSTRUCTIONS_PROTOCOL_VERSION,
+  AGENT_INSTRUCTION_COMMANDS,
+} from "./agent-instructions.js";
+import {
   OnboardingCollectorHostError,
   openOnboardingCollector,
   type OnboardingCollectorSession,
@@ -34,7 +39,34 @@ import { getReservation } from "./session.js";
 import { startOnboarding } from "./tools.js";
 
 const PROGRESS_POLL_MS = 5_000;
-const CLAIM_WAIT_MS = 15 * 60_000;
+
+/**
+ * How long this process keeps waiting for a person to click the claim link.
+ *
+ * WAS 15 MINUTES, WHICH WAS THE WRONG NUMBER COPIED FROM THE WRONG THING. The
+ * server caps each claim TRANSPORT ATTEMPT at 15 minutes
+ * (`onboard_claim_transport_attempts` enforces `expires_at <= created_at +
+ * interval '15 minutes'`), and 1.3.0 clamped its whole wait down to that. So a
+ * launcher that minted a link at 16:53 exited at 17:07 reporting
+ * `awaiting_claim` — not because anything expired that mattered, but because
+ * the transport leg it happened to be holding did, while the trial itself stayed
+ * claimable for the rest of the reservation. The human had simply not clicked
+ * yet.
+ *
+ * The attempt is now re-armed instead of ending the wait, so this bound is what
+ * it always should have been: how long a person might reasonably take. It is
+ * still intersected with the reservation, which is the real outer limit.
+ */
+const CLAIM_WAIT_MS = 24 * 60 * 60_000;
+
+/**
+ * How often the wait says out loud that it is still waiting.
+ *
+ * A silent process is indistinguishable from a hung one, and the agent driving
+ * it has been told not to restart on unchanged output. This gives it something
+ * true to report on every poll it makes.
+ */
+const CLAIM_HEARTBEAT_MS = 5 * 60_000;
 const TEMPORARY_WORKSPACE_TERMS =
   "Layers creates an isolated, trial-scoped workspace only to analyze the approved evidence, build the preview, and let you claim or resume it. Depending on the branch, it may include an upload grant and fenced upload-intent generation/lease, evidence and public-validation records, analysis and preview jobs, an anonymous Supabase Auth user, organization, and membership, and—only for a normal new-product preview—a temporary project, SDK record, entitlement, organization/onboarding credits, media, and preview assets. For a public GitHub URL, the same-session bootstrap may inspect policy-eligible files from the pinned revision in a bounded, memory-only local workspace to prepare the receipt; no fetched Git blob, full file, or unapproved repository content is sent to Layers, and only the approved bounded facts and excerpts may be sent after consent. Existing-App-ID previews create no duplicate project before authorization. The browser may also create or sign into your normal Layers account; that account remains yours even if this product claim is denied, and you can delete it through the normal account-deletion flow. Nothing is exposed to another account before an authorized claim.";
 const BASE_PROCESSORS = [
@@ -44,7 +76,21 @@ const BASE_PROCESSORS = [
   "vertex_ai",
 ] as const;
 
+/**
+ * The launcher's own stdout vocabulary.
+ *
+ * LOCAL BY DESIGN. `agent_instructions` is emitted by this process and never
+ * sent by the server, so it belongs to this union rather than to
+ * `@layers/onboarding-contracts`; the pinned contract version is unchanged by
+ * its addition.
+ */
 type LauncherEvent =
+  | {
+      type: "agent_instructions";
+      protocolVersion: typeof AGENT_INSTRUCTIONS_PROTOCOL_VERSION;
+      instructions: string;
+      commands: typeof AGENT_INSTRUCTION_COMMANDS;
+    }
   | { type: "status"; stage: string; message: string }
   | { type: "inspection"; inspection: OnboardingSourceInspection }
   | {
@@ -97,6 +143,35 @@ function emit(event: LauncherEvent): void {
 
 function sha256(value: string): string {
   return createHash("sha256").update(value, "utf8").digest("hex");
+}
+
+/**
+ * What a terminal server-side failure says out loud.
+ *
+ * A launcher that ends on `Layers onboarding failed` tells a person nothing they
+ * can act on and tells support nothing they can look up. The three facts that
+ * are always available are the trial handle (already public on every progress
+ * event), the last state this process actually read, and the server's own
+ * failure code when the projection carries one.
+ *
+ * `failure` is `{ retryable, supportCode, retryOperation } | null` on the
+ * canonical progress projection, so an absent reason is a real, expected case
+ * rather than a bug — and it is reported as an absence rather than papered over
+ * with a guess.
+ */
+function terminalProgressMessage(
+  progress: Awaited<ReturnType<typeof readSourceProgress>>,
+  summary: string,
+): string {
+  const reason = progress.failure
+    ? `Server failure code: ${progress.failure.supportCode}.`
+    : "Server reported no reason.";
+  return [
+    summary,
+    `Trial handle: ${progress.trialHandle}.`,
+    `Last progress state: ${progress.state}.`,
+    reason,
+  ].join(" ");
 }
 
 async function delay(ms: number, signal: AbortSignal): Promise<void> {
@@ -641,16 +716,49 @@ export async function waitForPreviewAndClaim(
     throw new Error("Layers returned an invalid reservation expiry");
   }
   let previous = "";
-  let claimDeadline: number | undefined;
+  /**
+   * How long this process is willing to wait, total. Set once, when the claim
+   * handoff actually begins, and never shortened by a transport leg.
+   */
+  let waitDeadline: number | undefined;
+  /**
+   * When the CURRENT transport attempt dies. Shorter than `waitDeadline` by
+   * design; reaching it retires the attempt rather than the wait.
+   */
+  let attemptDeadline: number | undefined;
   let latestPreviewUrl: string | undefined;
   let claimSession: SourceClaimSession | undefined;
+  let claimLinksMinted = 0;
+  let lastHeartbeatAtMs = 0;
+  /**
+   * Set when re-arming cannot help, so the wait ends on the next check.
+   *
+   * The one case is an attempt that arrives ALREADY expired: minting another
+   * would produce another dead link, and a loop that mints dead links is worse
+   * than stopping. A healthy attempt reaching its expiry is not this case.
+   */
+  let cannotRearm = false;
   const intakeSummary = (): IntakeSummary | null =>
     intakeGate ? intakeGate.summary() : null;
+  const attemptExpired = (): boolean =>
+    attemptDeadline !== undefined && Date.now() >= attemptDeadline;
   const finishAwaitingClaimIfExpired = (): boolean => {
-    if (claimDeadline === undefined || Date.now() < claimDeadline) return false;
+    const exhausted = waitDeadline !== undefined && Date.now() >= waitDeadline;
+    if (!exhausted && !cannotRearm) return false;
     if (!latestPreviewUrl) {
       throw new Error("Claim handoff is missing its preview URL");
     }
+    // STOPPING IS NOT THE SAME AS EXPIRING, and the difference is the whole
+    // reason a person walks away thinking they lost their workspace. Say which
+    // one this is before the terminal event, in terms the agent can relay.
+    emitEvent({
+      type: "status",
+      stage: "claim_still_open",
+      message:
+        `This process stopped waiting for the browser claim, but the Layers workspace is still built and still claimable until ${reservationExpiresAt}. ` +
+        "The claim link last printed here is bound to a browser attempt that expires 15 minutes after it was printed, so if the human has not opened it by now it needs to be minted again. " +
+        "Tell them the workspace was not lost and nothing was cancelled.",
+    });
     emitEvent({
       type: "complete",
       previewUrl: latestPreviewUrl,
@@ -661,9 +769,9 @@ export async function waitForPreviewAndClaim(
     return true;
   };
   const boundedRetryDelay = (requestedMs: number): number =>
-    claimDeadline === undefined
+    waitDeadline === undefined
       ? requestedMs
-      : Math.max(1, Math.min(requestedMs, claimDeadline - Date.now()));
+      : Math.max(1, Math.min(requestedMs, waitDeadline - Date.now()));
   try {
     while (true) {
       if (signal.aborted) throw new Error("Onboarding interrupted");
@@ -689,14 +797,33 @@ export async function waitForPreviewAndClaim(
       if (signal.aborted) throw new Error("Onboarding interrupted");
 
       if (progress.state === "failed" || progress.state === "expired") {
-        throw new Error(`Layers onboarding ${progress.state}`);
+        throw new Error(
+          terminalProgressMessage(
+            progress,
+            `Layers onboarding ${progress.state}.`,
+          ),
+        );
       }
       if (progress.state === "needs_clarification") {
         throw new Error(
-          "Layers onboarding needs clarification before this session can continue",
+          terminalProgressMessage(
+            progress,
+            "Layers onboarding needs clarification before this session can continue.",
+          ),
         );
       }
       if (progress.previewUrl) latestPreviewUrl = progress.previewUrl;
+
+      // RETIRE AN EXPIRED TRANSPORT ATTEMPT, KEEP THE WAIT. The exchange below
+      // already had the last word on this attempt in the previous iteration, so
+      // reaching here with it expired means nobody clicked in time. The server
+      // lazily expires the stale attempt when the next one is created, so a
+      // fresh mint is all this takes.
+      if (claimSession && attemptExpired() && progress.state !== "claimed") {
+        claimSession.dispose();
+        claimSession = undefined;
+        attemptDeadline = undefined;
+      }
 
       // BOTH conditions, or no claim attempt exists to surface. The attempt is
       // what mints the browser URL, so gating its creation is what gates the
@@ -709,11 +836,11 @@ export async function waitForPreviewAndClaim(
         progress.previewUrl &&
         (intakeGate === undefined || intakeGate.isSettled())
       ) {
-        claimDeadline ??= Math.min(
+        waitDeadline ??= Math.min(
           Date.now() + CLAIM_WAIT_MS,
           reservationDeadline,
         );
-        if (Date.now() >= claimDeadline) {
+        if (Date.now() >= waitDeadline) {
           throw new SourceOnboardingError(
             "Layers claim continuity setup expired",
           );
@@ -722,10 +849,7 @@ export async function waitForPreviewAndClaim(
           baseUrl,
           signal,
           async (error) => {
-            if (
-              claimDeadline === undefined ||
-              Date.now() >= claimDeadline
-            ) {
+            if (waitDeadline === undefined || Date.now() >= waitDeadline) {
               return false;
             }
             const delayMs = Math.min(
@@ -736,17 +860,29 @@ export async function waitForPreviewAndClaim(
               ),
             );
             await delay(boundedRetryDelay(delayMs), signal);
-            return Date.now() < claimDeadline;
+            return Date.now() < waitDeadline;
           },
         );
         const attemptExpiresAt = Date.parse(claimSession.expiresAt);
         if (!Number.isFinite(attemptExpiresAt)) {
           throw new Error("Layers returned an invalid claim-attempt expiry");
         }
-        claimDeadline = Math.min(
-          claimDeadline,
-          attemptExpiresAt,
-        );
+        attemptDeadline = attemptExpiresAt;
+        claimLinksMinted += 1;
+        // BORN DEAD. Nobody can open this link, and minting another would only
+        // produce one more of the same. Publish it (the URL is still what the
+        // projection carries) and let the wait end rather than spin.
+        if (attemptExpiresAt <= Date.now()) cannotRearm = true;
+        // A REPLACED LINK MUST BE ANNOUNCED. The URL changes, so the agent's
+        // previously relayed link is now dead and re-sharing is not optional.
+        if (claimLinksMinted > 1) {
+          emitEvent({
+            type: "status",
+            stage: "claim_link_refreshed",
+            message:
+              "The previous browser claim link expired before it was opened. A fresh claim link rides on the next progress event; give the human that one and discard the earlier link.",
+          });
+        }
       }
 
       if (progress.state === "claimed" && !claimSession) {
@@ -818,11 +954,25 @@ export async function waitForPreviewAndClaim(
         if (!Number.isFinite(exchangeExpiresAt)) {
           throw new Error("Layers returned an invalid claim-exchange expiry");
         }
-        claimDeadline = Math.min(
-          claimDeadline ?? exchangeExpiresAt,
+        // The exchange's view of THIS attempt's expiry, which is the transport
+        // leg — never the wait. Clamping the wait to it is the 1.3.0 bug.
+        attemptDeadline = Math.min(
+          attemptDeadline ?? exchangeExpiresAt,
           exchangeExpiresAt,
         );
         if (finishAwaitingClaimIfExpired()) return;
+
+        // Say the quiet part out loud on a cadence, so an agent polling a
+        // process that is deliberately doing nothing has something to report.
+        if (Date.now() - lastHeartbeatAtMs >= CLAIM_HEARTBEAT_MS) {
+          lastHeartbeatAtMs = Date.now();
+          emitEvent({
+            type: "status",
+            stage: "awaiting_claim",
+            message:
+              "Still waiting for the human to open the claim link in their browser. This process stays alive and keeps the claim link fresh; do not restart it.",
+          });
+        }
       }
 
       // While intake still holds the gate, the poll sleep also waits on it, so
@@ -951,6 +1101,17 @@ export async function runSourceOnboardCli(input: {
   process.once("SIGTERM", stopForSignal);
   process.stdout.once("error", stopForStdoutFailure);
   try {
+    // FIRST, BEFORE ANYTHING ELSE, AND EXACTLY ONCE. The agent reads the
+    // protocol from the process it just started, so it must be able to read it
+    // before the process does anything that needs driving — including the
+    // preflight, which can fail and end the run.
+    emit({
+      type: "agent_instructions",
+      protocolVersion: AGENT_INSTRUCTIONS_PROTOCOL_VERSION,
+      instructions: AGENT_INSTRUCTIONS,
+      commands: AGENT_INSTRUCTION_COMMANDS,
+    });
+
     let internalProbeToken = consumeInternalProbeToken();
     const preflight = await preflightSourceOnboarding(
       input.baseUrl,

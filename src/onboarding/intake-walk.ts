@@ -27,15 +27,16 @@
  * service must cost a person their questions, never their workspace.
  */
 import {
-  INTAKE_FREE_TEXT_ARM,
   INTAKE_FREE_TEXT_MAX_LENGTH,
   type IntakeAnswer,
   type IntakeAnswersResponse,
   type IntakeQuestion,
+  intakeFreeTextOptionValue,
   questionAllowsFreeText,
 } from "./intake-contract.js";
 import {
   SourceOnboardingError,
+  boundedRelayText,
   readIntakeWalk,
   submitIntakeAnswer,
 } from "./source-api.js";
@@ -201,9 +202,10 @@ export function intakeAnswerCommands(question: IntakeQuestion): string[] {
     // every multi-select and a server refusal re-prompts.
     commands.push(`answer ${question.field}`);
   }
-  if (questionAllowsFreeText(question)) {
+  const freeTextOption = intakeFreeTextOptionValue(question);
+  if (freeTextOption !== undefined) {
     commands.push(
-      `answer ${question.field} ${INTAKE_FREE_TEXT_ARM.optionValue} <your own words>`,
+      `answer ${question.field} ${freeTextOption} <your own words>`,
     );
   }
   return commands;
@@ -253,13 +255,14 @@ export function parseIntakeAnswerLine(
 
   const text = rawText?.trim();
   if (text !== undefined && text.length > 0) {
-    // Free text has exactly one home in the canonical set. Sending it anywhere
-    // else is a 400 rather than a silent drop, so refuse it here instead of
-    // spending a request to be told the same thing.
+    // Free text has one home per question, named by the walk rather than
+    // assumed. Sending it anywhere else is a refusal rather than a silent drop,
+    // so refuse it here instead of spending a request to be told the same thing.
+    const freeTextOption = intakeFreeTextOptionValue(question);
     if (
-      !questionAllowsFreeText(question) ||
+      freeTextOption === undefined ||
       optionValues.length !== 1 ||
-      optionValues[0] !== INTAKE_FREE_TEXT_ARM.optionValue ||
+      optionValues[0] !== freeTextOption ||
       text.length > INTAKE_FREE_TEXT_MAX_LENGTH
     ) {
       return { ok: false };
@@ -418,8 +421,44 @@ export function createIntakeWalkRunner(options: {
 
       let refusals = 0;
       let refusal: string | undefined;
-      while (remaining.length > 0) {
+      // The walk is re-read ONCE after it empties, and only once.
+      let recheckedAfterEmpty = false;
+      for (;;) {
         if (signal.aborted) return;
+
+        if (remaining.length === 0) {
+          // THE WALK GROWS DURING THE BUILD WINDOW. It is first read before the
+          // evidence analysis has bound a project, and several questions become
+          // applicable only once server-side facts settle. An agent that answers
+          // the baseline set quickly empties `remaining` before those questions
+          // exist, so settling on that first emptiness silently drops them.
+          //
+          // ONE re-read, not a poll: this holds the claim gate, and a walk that
+          // keeps re-reading itself holds it for as long as the server keeps
+          // finding something to ask.
+          if (recheckedAfterEmpty) break;
+          recheckedAfterEmpty = true;
+          let reread: IntakeAnswersResponse;
+          try {
+            reread = await attempt(readWalk);
+          } catch {
+            if (signal.aborted) return;
+            // The answers already given are recorded server-side. A failed final
+            // read costs the newly applicable questions, never the answered ones,
+            // so this completes rather than reporting the walk as skipped.
+            break;
+          }
+          remaining = record(reread);
+          if (remaining.length === 0) break;
+          emit({
+            type: "intake",
+            message:
+              "Layers has more setup questions now that the analysis has landed.",
+            ...summary,
+          });
+          continue;
+        }
+
         // Re-checked per turn: a proposal that reappears mid-walk must silence
         // the questions for exactly as long as it is on screen.
         if (consent.isDisplayed()) await consent.whenIdle();
@@ -492,8 +531,32 @@ export function createIntakeWalkRunner(options: {
           return;
         }
 
-        refusals = 0;
+        // A 200 IS NOT AN ACKNOWLEDGEMENT. The route commits what it can and
+        // reports what it could not on `rejected`, so a refusal arrives as a
+        // successful response carrying the reason. Reading that as "Answer
+        // recorded." is what loops the same question until the claim gate times
+        // out (layers/mcp-server#19).
+        const rejection = response.rejected.find(
+          (entry) => entry.field === parsed.answer.field,
+        );
         remaining = record(response);
+        if (rejection) {
+          if (refusals + 1 < INTAKE_REFUSAL_LIMIT) {
+            refusals += 1;
+            refusal =
+              boundedRelayText(rejection.message) ??
+              "That answer was not accepted.";
+            continue;
+          }
+          settle(
+            "skipped",
+            "Layers could not record the setup answers, so the remaining questions were skipped. Nothing else is held up.",
+            "refused",
+          );
+          return;
+        }
+
+        refusals = 0;
         if (remaining.length > 0) {
           emit({
             type: "intake",
