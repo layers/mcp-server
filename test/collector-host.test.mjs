@@ -25,13 +25,18 @@ import {
   OnboardingSourceInspectionSchema,
 } from "@layers/onboarding-contracts";
 
-import { openOnboardingCollector } from "../dist/onboarding/collector-host.js";
+import {
+  collectorResolutionError,
+  openOnboardingCollector,
+} from "../dist/onboarding/collector-host.js";
 
 const require = createRequire(import.meta.url);
 const PROJECT_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
-const COLLECTOR_VERSION = "0.1.4";
+// The contracts package and the six collector packages ship as one versioned
+// artifact set, so one constant covers both here exactly as it does upstream.
+const COLLECTOR_VERSION = "0.1.5";
 const CONTRACT_MANIFEST_SHA256 =
-  "5e58fd2e735e5fe396935e3967626af50935823abb04c3398a55168cb06cbb39";
+  "a8139e2110716f59a2d2f13719e3f0d0da11a65d36970531b2f306c7b3e89127";
 const COLLECTION_POLICY_SHA256 =
   "d35170d24c54f0dfad57cce99bfeaf69ca05d779c4e422a1fa5636680c2127b6";
 const STAGE_PREFIX = "layers-onboarding-collector-";
@@ -39,28 +44,28 @@ const EXCLUDED_SECRET_SENTINEL = "collector-secret-must-never-cross";
 
 const EXPECTED_BINARIES = {
   "@layers/onboarding-collector-darwin-arm64": {
-    bytes: 5_736_546,
-    sha256: "33939b7aaa05012d048b9b14d8c929b1d9a458b45584fb52f17b8fa6b4b4f683",
+    bytes: 5_753_330,
+    sha256: "be8add935d55cc5c0aed6c198fd4aae8cff90e0bc9788d868686a066334e3d50",
   },
   "@layers/onboarding-collector-darwin-x64": {
-    bytes: 5_899_008,
-    sha256: "3380c2a54460da2d300699cda62a569be6a9b4eb5774e77c89a5ffe3297a7c20",
+    bytes: 5_907_456,
+    sha256: "1fb1ec90036966d8611552172538b3dc02663ac43a8d47fd51e1c82d3d895139",
   },
   "@layers/onboarding-collector-linux-arm64": {
-    bytes: 5_770_264,
-    sha256: "637076c72fa334bc5cd99e1f85a27857b4107b20890cbc37fb780dab33d675d8",
+    bytes: 5_771_488,
+    sha256: "e6a2d085e0b2c3cb3c33fb1e11302a09270bf2c3b35f01f9cfac85385df60b23",
   },
   "@layers/onboarding-collector-linux-x64": {
-    bytes: 5_951_212,
-    sha256: "dd6f241bed441fc53ff179b572e2c41bd42fcdb34782fc28f70f9548f78c4ea8",
+    bytes: 5_952_500,
+    sha256: "ed2bb914cdc6487ef752d2974e4cf826ed40b67d3075b3627b46a783d622e42d",
   },
   "@layers/onboarding-collector-win32-arm64": {
-    bytes: 5_969_408,
-    sha256: "d2b7510fa7b689e1d56addb66ddacaf5ea9c8c74f59a75a382e83205efa1c6be",
+    bytes: 5_974_016,
+    sha256: "d8511c7d08bfa6c6353fd16f8be03835bfaba91732d06ce168fae2d0f3d8be41",
   },
   "@layers/onboarding-collector-win32-x64": {
-    bytes: 6_259_712,
-    sha256: "5bd9f61c64fac262f381603b9795db10712657d7d219cbd6982fc8ceb4f2a49e",
+    bytes: 6_262_272,
+    sha256: "420d9e1030249a45438b2ee0715455cbff9ee319792c12f5b70a4e082d6a7fa7",
   },
 };
 
@@ -200,7 +205,69 @@ function assertTimeoutError(error) {
   return true;
 }
 
-test("pins the exact installed 0.1.4 contract and current-platform collector artifacts", async () => {
+test("a missing platform package is not reported as an integrity failure", () => {
+  // OPPOSITE REMEDIES. An integrity failure means what is on disk is not what
+  // this launcher trusts, and the answer is to stop. A missing module means
+  // nothing is on disk — almost always --omit=optional — and the answer is to
+  // reinstall. Reporting both as "could not be verified" sent people hunting a
+  // supply-chain problem they did not have.
+  const missing = Object.assign(new Error("Cannot find module"), {
+    code: "MODULE_NOT_FOUND",
+  });
+  const notInstalled = collectorResolutionError(
+    missing,
+    "@layers/onboarding-collector-linux-x64",
+  );
+  assert.equal(notInstalled.supportCode, "ONBOARD_COLLECTOR_NOT_INSTALLED");
+  assert.match(notInstalled.message, /@layers\/onboarding-collector-linux-x64/u);
+  assert.match(notInstalled.message, /omitted optional dependencies/u);
+  assert.match(notInstalled.message, /Re-run with --include=optional/u);
+
+  // Anything else resolving badly is still an integrity failure.
+  const other = collectorResolutionError(
+    new Error("EACCES: permission denied"),
+    "@layers/onboarding-collector-linux-x64",
+  );
+  assert.equal(other.supportCode, "ONBOARD_COLLECTOR_INTEGRITY");
+
+  // A REMEDY IS A PROMISE. Only faults a command actually fixes get one.
+  assert.equal(
+    notInstalled.remedyCommand,
+    "npx --yes --include=optional @layers/mcp-server@1.3.1 onboard",
+  );
+  // IT MUST NOT WRITE TO THE USER'S REPO. This launcher writes only inside its
+  // own mkdtemp; a remedy that edits package.json and the lockfile breaks that.
+  assert.equal(/npm install/u.test(notInstalled.remedyCommand), false);
+  // AND IT MUST RUN ON WINDOWS. `VAR=value cmd` is POSIX shell syntax that
+  // cmd.exe and PowerShell do not understand; `--include=optional` is a plain
+  // npm flag, which is why it replaced the env-var form.
+  assert.equal(/^\w+=/u.test(notInstalled.remedyCommand), false);
+  // The message has to say what the command does and what to do when a stale
+  // npx cache means the flag alone is not enough.
+  assert.match(notInstalled.message, /optional dependencies/u);
+  assert.match(notInstalled.message, /npm cache clean --force/u);
+  assert.equal(
+    other.remedyCommand,
+    undefined,
+    "an integrity mismatch is not a try-again",
+  );
+
+  // The real resolver does produce MODULE_NOT_FOUND for a package that is not
+  // installed, so the discriminator above is the one that actually fires.
+  //
+  // NOT a real platform package: which of the six is installed depends on the
+  // machine, and naming `linux-x64` passed on a darwin laptop while failing on
+  // a linux-x64 CI runner where that package is exactly the one present.
+  assert.throws(
+    () =>
+      require.resolve(
+        "@layers/onboarding-collector-nosucharch/package.json",
+      ),
+    (error) => error.code === "MODULE_NOT_FOUND",
+  );
+});
+
+test("pins the exact installed contract and current-platform collector artifacts", async () => {
   const hostPackage = await readJson(join(PROJECT_ROOT, "package.json"));
   assert.equal(hostPackage.dependencies["@layers/onboarding-contracts"], COLLECTOR_VERSION);
   for (const target of ONBOARDING_COLLECTOR_TARGETS) {

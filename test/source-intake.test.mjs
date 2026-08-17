@@ -39,6 +39,7 @@ const RESERVATION_EXPIRES_AT = new Date(
 ).toISOString();
 const PREVIEW_URL = "https://app.layers.test/p/preview-token";
 const ATTEMPT_HANDLE = "h".repeat(43);
+const ATTEMPT_EXPIRES_AT = "2100-08-14T00:15:00.000Z";
 const ATTEMPT_CLAIM_URL =
   `https://app.layers.test/claim#token=browser-claim-token&claimAttemptHandle=${ATTEMPT_HANDLE}`;
 
@@ -75,18 +76,48 @@ function rememberIntakeReservation(expiresAt = RESERVATION_EXPIRES_AT) {
   });
 }
 
-function walkResponse(remaining, answered = []) {
+function walkResponse(remaining, answered = [], rejected = []) {
   return {
     protocolVersion: 1,
     trialHandle: TRIAL_HANDLE,
     complete: remaining.length === 0,
     answersConverged: true,
     answered,
+    // Always present on the wire and usually empty. A response the launcher
+    // reads as an acknowledgement without looking here is the 1.3.0 bug.
+    rejected,
     intake: {
       docks: remaining.length === 0
         ? []
         : [{ group: remaining[0].group, questions: remaining }],
       remaining,
+    },
+  };
+}
+
+/**
+ * A walk that behaves the way the route does: answers accumulate, and BOTH
+ * methods recompute `remaining` from what is answered.
+ *
+ * A stub that answers a fixed list regardless of what was written models a
+ * server that forgets, which the launcher's final re-read reads as "these
+ * questions came back". Modelling the accumulation is what makes the re-read
+ * testable at all.
+ */
+function serverWalk(questions, { onSubmit } = {}) {
+  const answered = [];
+  const current = () =>
+    walkResponse(
+      questions.filter((question) => !answered.includes(question.field)),
+      [...answered],
+    );
+  return {
+    answered,
+    readWalk: async () => current(),
+    submitAnswer: async (answer) => {
+      onSubmit?.(answer);
+      if (!answered.includes(answer.field)) answered.push(answer.field);
+      return current();
     },
   };
 }
@@ -210,6 +241,74 @@ test("advertises one exact command per offered option", () => {
   assert.equal(questionAllowsFreeText(MULTI_QUESTION), false);
 });
 
+test("free text follows the wire flag, not the field name", () => {
+  // A SERVER-ADDED free-text question. 1.3.0 keyed the rule to `goal`, so this
+  // one was offered only a bare-option command the route then refused, and the
+  // walk looped on it until the claim gate timed out (layers/mcp-server#19).
+  const described = {
+    field: "appDescription",
+    group: "business",
+    select: "single",
+    allowsText: true,
+    optional: false,
+    title: "How would you describe your app?",
+    options: [
+      { value: "social", label: "A social app" },
+      { value: "other", label: "Something else" },
+    ],
+  };
+  assert.equal(questionAllowsFreeText(described), true);
+  assert.deepEqual(intakeAnswerCommands(described), [
+    "answer appDescription social",
+    "answer appDescription other",
+    "answer appDescription other <your own words>",
+  ]);
+  assert.deepEqual(
+    parseIntakeAnswerLine("answer appDescription other a running club", described),
+    {
+      ok: true,
+      answer: {
+        field: "appDescription",
+        optionValues: ["other"],
+        text: "a running club",
+      },
+    },
+  );
+
+  // The flag closes the arm as well as opening it: a server that says `goal`
+  // no longer takes text is believed over the launcher's old hard-coded rule.
+  assert.equal(
+    questionAllowsFreeText({ ...GOAL_QUESTION, allowsText: false }),
+    false,
+  );
+  assert.deepEqual(
+    parseIntakeAnswerLine("answer goal other selling hats", {
+      ...GOAL_QUESTION,
+      allowsText: false,
+    }),
+    { ok: false },
+  );
+
+  // ABSENT FLAG KEEPS 1.3.0's BEHAVIOR EXACTLY, so a server that predates it
+  // drives an installed launcher the same way it always did.
+  assert.equal(questionAllowsFreeText(GOAL_QUESTION), true);
+  assert.equal(questionAllowsFreeText(MULTI_QUESTION), false);
+  assert.equal(
+    questionAllowsFreeText({ ...described, allowsText: undefined }),
+    false,
+  );
+
+  // A flag with no arm to carry the text advertises no free-text command,
+  // rather than one the server could only refuse.
+  assert.equal(
+    questionAllowsFreeText({
+      ...described,
+      options: [{ value: "social", label: "A social app" }],
+    }),
+    false,
+  );
+});
+
 test("an empty walk settles the gate without asking anything", async () => {
   const harness = runnerHarness({
     readWalk: async () => walkResponse([]),
@@ -231,18 +330,16 @@ test("an empty walk settles the gate without asking anything", async () => {
 
 test("asks one question at a time and reports an explicit completion", async () => {
   const submitted = [];
+  const walk = serverWalk([MULTI_QUESTION, GOAL_QUESTION], {
+    onSubmit: (answer) => submitted.push(answer),
+  });
   const harness = runnerHarness({
     input: scriptedInput([
       "answer triedChannels social",
       "answer goal installs",
     ]),
-    readWalk: async () => walkResponse([MULTI_QUESTION, GOAL_QUESTION]),
-    submitAnswer: async (answer) => {
-      submitted.push(answer);
-      return submitted.length === 1
-        ? walkResponse([GOAL_QUESTION], ["triedChannels"])
-        : walkResponse([], ["triedChannels", "goal"]);
-    },
+    readWalk: walk.readWalk,
+    submitAnswer: walk.submitAnswer,
   });
   await harness.runner.run();
 
@@ -274,10 +371,11 @@ test("asks one question at a time and reports an explicit completion", async () 
 
 test("re-asks with the offered options when the server refuses an answer", async () => {
   let calls = 0;
+  const walk = serverWalk([GOAL_QUESTION]);
   const harness = runnerHarness({
     input: scriptedInput(["answer goal other custom", "answer goal installs"]),
-    readWalk: async () => walkResponse([GOAL_QUESTION]),
-    submitAnswer: async (answer) => {
+    readWalk: walk.readWalk,
+    submitAnswer: async (answer, abort) => {
       calls += 1;
       if (calls === 1) {
         throw new SourceOnboardingError(
@@ -289,7 +387,7 @@ test("re-asks with the offered options when the server refuses an answer", async
         );
       }
       assert.deepEqual(answer, { field: "goal", optionValues: ["installs"] });
-      return walkResponse([], ["goal"]);
+      return await walk.submitAnswer(answer, abort);
     },
   });
   await harness.runner.run();
@@ -297,7 +395,10 @@ test("re-asks with the offered options when the server refuses an answer", async
   const turns = turnsIn(harness.events);
   assert.equal(turns.length, 2, "the refusal re-asks rather than failing");
   assert.equal(turns[0].refusal, undefined);
-  assert.equal(turns[1].refusal, "goal does not take free text");
+  assert.deepEqual(turns[1].refusal, {
+    field: "goal",
+    message: "goal does not take free text",
+  });
   assert.deepEqual(turns[1].question.options, GOAL_QUESTION.options);
   assert.equal(harness.runner.gate.summary().state, "complete");
 });
@@ -330,6 +431,474 @@ test("a refused answer is retried, not resent, and the gate opens after the cap"
   assert.equal(settlement.complete, false);
   assert.equal(settlement.reason, "http_400");
   assert.equal(harness.runner.gate.isSettled(), true);
+});
+
+test("a 200 that refuses the answer re-asks instead of reading as recorded", async () => {
+  const submitted = [];
+  const walk = serverWalk([GOAL_QUESTION]);
+  let calls = 0;
+  const harness = runnerHarness({
+    input: scriptedInput([
+      "answer goal other selling more hats",
+      "answer goal installs",
+    ]),
+    readWalk: walk.readWalk,
+    submitAnswer: async (answer, abort) => {
+      submitted.push(answer);
+      calls += 1;
+      if (calls === 1) {
+        // THE 1.3.0 DEAD END. The route commits what it can and reports what it
+        // could not, so a refusal is a 200 carrying `rejected`, never a throw.
+        return walkResponse([GOAL_QUESTION], [], [
+          {
+            field: "goal",
+            reason: "free_text_not_accepted",
+            message: "goal does not take free text right now.",
+            options: GOAL_QUESTION.options,
+          },
+        ]);
+      }
+      return await walk.submitAnswer(answer, abort);
+    },
+  });
+  await harness.runner.run();
+
+  const turns = turnsIn(harness.events);
+  assert.equal(turns.length, 2, "the refusal re-asks the same question");
+  assert.equal(turns[0].refusal, undefined);
+  assert.deepEqual(turns[1].refusal, {
+    field: "goal",
+    message: "goal does not take free text right now.",
+  });
+  assert.deepEqual(turns[1].question.options, GOAL_QUESTION.options);
+  // The refusal must never be reported as an accepted answer.
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "intake" && event.message === "Answer recorded.",
+    ),
+    false,
+  );
+  assert.equal(harness.runner.gate.summary().state, "complete");
+  assert.equal(submitted.length, 2);
+});
+
+test("a rejection that keeps coming back opens the claim gate", async () => {
+  const rejection = {
+    field: "goal",
+    reason: "option_not_offered",
+    message: "Unknown option for goal.",
+    options: GOAL_QUESTION.options,
+  };
+  let calls = 0;
+  const harness = runnerHarness({
+    input: scriptedInput(
+      Array.from({ length: INTAKE_REFUSAL_LIMIT + 2 }, () => "answer goal installs"),
+    ),
+    readWalk: async () => walkResponse([GOAL_QUESTION]),
+    submitAnswer: async () => {
+      calls += 1;
+      return walkResponse([GOAL_QUESTION], [], [rejection]);
+    },
+  });
+  await harness.runner.run();
+
+  assert.equal(calls, INTAKE_REFUSAL_LIMIT);
+  assert.equal(turnsIn(harness.events).length, INTAKE_REFUSAL_LIMIT);
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "skipped");
+  assert.equal(settlement.complete, false);
+  assert.equal(settlement.reason, "refused");
+  assert.equal(harness.runner.gate.isSettled(), true);
+});
+
+test("a control-laden rejection message is bounded before it is relayed", async () => {
+  const harness = runnerHarness({
+    input: scriptedInput(["answer goal installs", "answer goal installs"]),
+    readWalk: async () => walkResponse([GOAL_QUESTION]),
+    submitAnswer: async () =>
+      walkResponse([GOAL_QUESTION], [], [
+        {
+          field: "goal",
+          reason: "option_not_offered",
+          message: `line\u0000one\nline\u007ftwo ${"x".repeat(400)}`,
+          options: GOAL_QUESTION.options,
+        },
+      ]),
+  });
+  await harness.runner.run();
+
+  const relayed = turnsIn(harness.events)[1].refusal.message;
+  assert.equal(relayed.length <= 200, true, "the relayed reason is bounded");
+  assert.equal(/[\u0000-\u001f\u007f]/u.test(relayed), false);
+  assert.match(relayed, /^line one line two x+$/u);
+});
+
+test("the walk is re-read once after it empties and asks what the build added", async () => {
+  // THE BUILD WINDOW MOVES THE WALK. The first read happens before the analysis
+  // binds a project, so questions gated on server-side facts do not exist yet.
+  // An agent that answers the baseline set quickly empties `remaining` before
+  // they appear, and 1.3.0 settled there and dropped them.
+  const late = { ...GOAL_QUESTION, field: "goal" };
+  const answered = [];
+  let reads = 0;
+  const harness = runnerHarness({
+    input: scriptedInput(["answer triedChannels social", "answer goal installs"]),
+    readWalk: async () => {
+      reads += 1;
+      // The second read is the launcher's post-empty re-read; only then does
+      // the newly applicable question exist.
+      const pool = reads === 1 ? [MULTI_QUESTION] : [MULTI_QUESTION, late];
+      return walkResponse(
+        pool.filter((question) => !answered.includes(question.field)),
+        [...answered],
+      );
+    },
+    submitAnswer: async (answer) => {
+      if (!answered.includes(answer.field)) answered.push(answer.field);
+      const pool = reads === 1 ? [MULTI_QUESTION] : [MULTI_QUESTION, late];
+      return walkResponse(
+        pool.filter((question) => !answered.includes(question.field)),
+        [...answered],
+      );
+    },
+  });
+  await harness.runner.run();
+
+  assert.deepEqual(
+    turnsIn(harness.events).map((turn) => turn.question.field),
+    ["triedChannels", "goal"],
+    "the late question was asked",
+  );
+  assert.deepEqual(answered, ["triedChannels", "goal"]);
+  // ONE extra read for the whole walk, not one per emptying: this holds the
+  // claim gate, and a walk that keeps re-reading itself holds it for as long as
+  // the server keeps finding something to ask.
+  assert.equal(reads, 2, "one opening read and exactly one re-read");
+  assert.equal(harness.runner.gate.summary().state, "complete");
+  assert.equal(harness.runner.gate.summary().complete, true);
+});
+
+test("a failed final re-read completes rather than reporting a skip", async () => {
+  const walk = serverWalk([GOAL_QUESTION]);
+  let reads = 0;
+  const harness = runnerHarness({
+    input: scriptedInput(["answer goal installs"]),
+    readWalk: async (abort) => {
+      reads += 1;
+      if (reads === 1) return await walk.readWalk(abort);
+      throw new SourceOnboardingError(
+        "Layers onboarding intake read failed (503)",
+        undefined,
+        503,
+        true,
+      );
+    },
+    submitAnswer: walk.submitAnswer,
+  });
+  await harness.runner.run();
+
+  // The answer that WAS given is recorded server-side, so the honest report is
+  // completion. A failed re-read costs the questions nobody has seen yet.
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "complete");
+  assert.equal(settlement.complete, true);
+  assert.equal(settlement.answered, 1);
+  assert.equal(harness.runner.gate.isSettled(), true);
+});
+
+test("a refusal is shown only against the question it belongs to", async () => {
+  // The walk recomputes on every write, so the question at the head of the list
+  // after a refusal is not necessarily the refused one. Pinning a stale reason
+  // under a fresh question tells the person their good answer was rejected.
+  const late = { ...GOAL_QUESTION, field: "goal" };
+  let writes = 0;
+  const harness = runnerHarness({
+    input: scriptedInput([
+      "answer triedChannels social",
+      "answer goal installs",
+    ]),
+    readWalk: async () => walkResponse([MULTI_QUESTION, late]),
+    submitAnswer: async () => {
+      writes += 1;
+      if (writes === 1) {
+        // Refuses `triedChannels`, and hands back a walk whose head is `goal`.
+        return walkResponse([late], [], [
+          {
+            field: "triedChannels",
+            reason: "option_not_offered",
+            message: "That channel is not on the list.",
+            options: MULTI_QUESTION.options,
+          },
+        ]);
+      }
+      return walkResponse([], ["goal"]);
+    },
+  });
+  await harness.runner.run();
+
+  const turns = turnsIn(harness.events);
+  const goalTurn = turns.find((turn) => turn.question.field === "goal");
+  assert.ok(goalTurn, "the walk moved on to goal");
+  assert.equal(
+    goalTurn.refusal,
+    undefined,
+    "a triedChannels refusal must not be rendered under goal",
+  );
+});
+
+test("a suppressed refusal is held until its own question comes back", async () => {
+  // The walk recomputes on every write, so a refused question can drop off the
+  // head and return later. Clearing the refusal the moment it was suppressed
+  // meant the person answered that question a second time with no idea why the
+  // first answer had not counted.
+  const answered = [];
+  let writes = 0;
+  // Answer-aware, like the route: a stub that re-serves answered questions
+  // makes the launcher's post-empty re-read look like new work.
+  const current = (rejected = []) =>
+    walkResponse(
+      [MULTI_QUESTION, GOAL_QUESTION].filter(
+        (question) => !answered.includes(question.field),
+      ),
+      [...answered],
+      rejected,
+    );
+  const harness = runnerHarness({
+    input: scriptedInput([
+      "answer triedChannels social",
+      "answer goal installs",
+      "answer triedChannels ads",
+    ]),
+    readWalk: async () => current(),
+    submitAnswer: async (answer) => {
+      writes += 1;
+      if (writes === 1) {
+        // triedChannels is refused and stays outstanding, but the walk hands
+        // back goal first — so the refusal cannot be shown on this turn.
+        return walkResponse([GOAL_QUESTION, MULTI_QUESTION], [], [
+          {
+            field: "triedChannels",
+            reason: "option_not_offered",
+            message: "That channel is not on the list.",
+            options: MULTI_QUESTION.options,
+          },
+        ]);
+      }
+      answered.push(answer.field);
+      return current();
+    },
+  });
+  await harness.runner.run();
+
+  const turns = turnsIn(harness.events);
+  const goalTurn = turns.find((turn) => turn.question.field === "goal");
+  assert.ok(goalTurn);
+  assert.equal(goalTurn.refusal, undefined, "not shown under the wrong question");
+
+  // The triedChannels turn that follows the goal turn is the one that must
+  // carry it.
+  const goalIndex = turns.indexOf(goalTurn);
+  const returning = turns
+    .slice(goalIndex + 1)
+    .find((turn) => turn.question.field === "triedChannels");
+  assert.ok(returning, "triedChannels came back around");
+  assert.deepEqual(
+    returning.refusal,
+    { field: "triedChannels", message: "That channel is not on the list." },
+    "the refusal survived until its own question was asked again",
+  );
+  // ...and is cleared once shown, so it cannot haunt a later turn.
+  const afterShown = turns.slice(turns.indexOf(returning) + 1);
+  for (const turn of afterShown) {
+    assert.equal(turn.refusal, undefined, "a shown refusal is not repeated");
+  }
+});
+
+test("a refusal that empties the walk settles skipped, never complete", async () => {
+  // The refused answer was the last outstanding question, so `remaining` is now
+  // empty. Settling `complete` there would report a walk as finished on an
+  // answer the server explicitly would not take.
+  let reads = 0;
+  const harness = runnerHarness({
+    input: scriptedInput(["answer goal installs"]),
+    readWalk: async () => {
+      reads += 1;
+      // The opening read offers the question; the post-empty re-read confirms
+      // the server has nothing further to ask.
+      return walkResponse(reads === 1 ? [GOAL_QUESTION] : []);
+    },
+    submitAnswer: async () =>
+      walkResponse([], [], [
+        {
+          field: "goal",
+          reason: "option_not_offered",
+          message: "That option is no longer offered.",
+          options: GOAL_QUESTION.options,
+        },
+      ]),
+  });
+  await harness.runner.run();
+
+  // THE RE-READ STILL RAN. Settling straight from the refusal skipped it, so
+  // questions that become applicable once analysis lands were never asked.
+  assert.equal(reads, 2, "the refusal did not bypass the post-empty re-read");
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "skipped");
+  assert.equal(settlement.complete, false);
+  assert.equal(settlement.reason, "refused");
+  assert.equal(
+    harness.events.some(
+      (event) => event.type === "intake" && event.message === "Answer recorded.",
+    ),
+    false,
+  );
+});
+
+test("a refusal that empties the walk still gets the post-empty re-read", async () => {
+  // The refusal emptied `remaining`, and the questions that become applicable
+  // once the analysis lands appear only on the re-read. Settling on the refusal
+  // silently cost the person the rest of their walk.
+  const late = { ...GOAL_QUESTION, field: "goal" };
+  let reads = 0;
+  let writes = 0;
+  const harness = runnerHarness({
+    input: scriptedInput([
+      "answer triedChannels social",
+      "answer goal installs",
+    ]),
+    readWalk: async () => {
+      reads += 1;
+      // The late question exists only by the time the re-read happens.
+      return walkResponse(reads === 1 ? [MULTI_QUESTION] : [late]);
+    },
+    submitAnswer: async () => {
+      writes += 1;
+      if (writes === 1) {
+        return walkResponse([], [], [
+          {
+            field: "triedChannels",
+            reason: "option_not_offered",
+            message: "That channel is not on the list.",
+            options: MULTI_QUESTION.options,
+          },
+        ]);
+      }
+      return walkResponse([], ["goal"]);
+    },
+  });
+  await harness.runner.run();
+
+  assert.equal(reads, 2, "the re-read ran despite the refusal");
+  assert.deepEqual(
+    turnsIn(harness.events).map((turn) => turn.question.field),
+    ["triedChannels", "goal"],
+    "the newly applicable question was still asked",
+  );
+  // The refusal was never resolved, so the walk cannot claim completion.
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "skipped");
+  assert.equal(settlement.reason, "refused");
+});
+
+test("the refusal budget is per question, not shared across the walk", async () => {
+  // INTAKE_REFUSAL_LIMIT is documented as consecutive refusals of ONE question.
+  //
+  // THE FAILURE MODE IS SPECIFICALLY A REFUSAL THAT EMPTIES THE WALK. The old
+  // shared counter reset to 0 on any accepted answer, so a script with a
+  // success between the two questions passes either way and proves nothing.
+  // Here nothing is ever accepted until the very end: `triedChannels` is
+  // refused until it has spent all but one of the budget, its final refusal
+  // empties `remaining`, and the post-empty re-read reveals `goal` — which then
+  // inherits a shared counter sitting at the limit and fails open on its first
+  // mistake.
+  const late = { ...GOAL_QUESTION, field: "goal" };
+  const burn = INTAKE_REFUSAL_LIMIT - 1;
+  let reads = 0;
+  let triedRefusals = 0;
+  let goalAttempts = 0;
+  const harness = runnerHarness({
+    input: scriptedInput([
+      ...Array.from({ length: burn }, () => "answer triedChannels social"),
+      "answer goal installs",
+      "answer goal installs",
+    ]),
+    readWalk: async () => {
+      reads += 1;
+      return walkResponse(reads === 1 ? [MULTI_QUESTION] : [late]);
+    },
+    submitAnswer: async (answer) => {
+      if (answer.field === "triedChannels") {
+        triedRefusals += 1;
+        // The last refusal empties the walk, which is what sends the loop into
+        // the single post-empty re-read with no success in between.
+        return walkResponse(
+          triedRefusals < burn ? [MULTI_QUESTION] : [],
+          [],
+          [
+            {
+              field: "triedChannels",
+              reason: "option_not_offered",
+              message: "Not on the list.",
+              options: MULTI_QUESTION.options,
+            },
+          ],
+        );
+      }
+      goalAttempts += 1;
+      if (goalAttempts === 1) {
+        return walkResponse([late], [], [
+          {
+            field: "goal",
+            reason: "option_not_offered",
+            message: "Not on the list.",
+            options: GOAL_QUESTION.options,
+          },
+        ]);
+      }
+      return walkResponse([], ["goal"]);
+    },
+  });
+  await harness.runner.run();
+
+  assert.equal(triedRefusals, burn, "the first question spent its own budget");
+  assert.equal(reads, 2, "the emptying refusal reached the post-empty re-read");
+  // THE DISCRIMINATOR. Under a shared counter goal's single refusal lands on a
+  // budget already at the limit, the walk fails open, and goal never gets a
+  // second turn. Under a per-question budget it does.
+  assert.equal(goalAttempts, 2, "the late question was re-asked after one refusal");
+  const goalTurns = turnsIn(harness.events).filter(
+    (turn) => turn.question.field === "goal",
+  );
+  assert.ok(goalTurns.length >= 2, "goal was asked again rather than skipped");
+
+  // The walk still ends `skipped`, and that is correct rather than incidental:
+  // `triedChannels` was refused to the end and never accepted, so an
+  // unresolved rejection outlives the walk. The budget fix is about goal
+  // getting its turn, not about turning that ending into a completion.
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "skipped");
+  assert.equal(settlement.reason, "refused");
+});
+
+test("a required multi-select does not advertise the empty pick", () => {
+  // The wire now says which questions take silence for an answer. Advertising
+  // `answer <field>` on a required one offers a command the server can only
+  // refuse, which costs a round trip and reads to the person as a bug.
+  const required = { ...MULTI_QUESTION, optional: false };
+  assert.equal(
+    intakeAnswerCommands(required).includes("answer triedChannels"),
+    false,
+  );
+  const optional = { ...MULTI_QUESTION, optional: true };
+  assert.equal(
+    intakeAnswerCommands(optional).includes("answer triedChannels"),
+    true,
+  );
+  // Absent flag keeps 1.3.0's behaviour exactly.
+  assert.equal(
+    intakeAnswerCommands(MULTI_QUESTION).includes("answer triedChannels"),
+    true,
+  );
 });
 
 test("a broken question service fails the claim gate open with an honest event", async () => {
@@ -424,11 +993,12 @@ test("an unanswered walk stops holding the claim gate", async () => {
 test("no intake turn is emitted while a consent proposal is on screen", async () => {
   const consent = new ConsentSurface();
   consent.display();
+  const server = serverWalk([GOAL_QUESTION]);
   const harness = runnerHarness({
     consent,
     input: scriptedInput(["answer goal installs"]),
-    readWalk: async () => walkResponse([GOAL_QUESTION]),
-    submitAnswer: async () => walkResponse([], ["goal"]),
+    readWalk: server.readWalk,
+    submitAnswer: server.submitAnswer,
   });
 
   const walk = harness.runner.run();
@@ -591,10 +1161,20 @@ test("a walk that finishes first still waits for the preview", async () => {
           trialHandle: TRIAL_HANDLE,
           attemptHandle: ATTEMPT_HANDLE,
           claimUrl: ATTEMPT_CLAIM_URL,
-          // An already-expired attempt terminates the wait as awaiting_claim
-          // right after the safe URL is published.
-          expiresAt: "2000-01-01T00:00:00.000Z",
+          expiresAt: ATTEMPT_EXPIRES_AT,
           state: "pending",
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(
+        {
+          protocolVersion: 1,
+          trialHandle: TRIAL_HANDLE,
+          attemptHandle: ATTEMPT_HANDLE,
+          state: "pending",
+          expiresAt: ATTEMPT_EXPIRES_AT,
         },
         { status: 202 },
       );
@@ -602,11 +1182,17 @@ test("a walk that finishes first still waits for the preview", async () => {
     throw new Error(`unexpected request: ${pathname}`);
   };
 
+  // The wait is bounded by the reservation, which is the cheap way to reach the
+  // awaiting-claim handoff without waiting out the 24-hour budget. It has to
+  // outlast the SECOND poll, though: the preview goes ready there, and a
+  // deadline that lands first is a different ending entirely — the preview
+  // never became ready, which now terminates with `await_preview` instead.
+  const shortReservation = new Date(Date.now() + 6_500).toISOString();
   try {
     await waitForPreviewAndClaim(
       BASE_URL,
       new AbortController().signal,
-      RESERVATION_EXPIRES_AT,
+      shortReservation,
       (event) => events.push(event),
       settledGate.runner.gate,
     );

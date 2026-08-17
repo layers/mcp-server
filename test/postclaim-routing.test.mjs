@@ -204,7 +204,12 @@ test("claim projection failure leaves process claim state untouched", async () =
     jsonResponse({
       status: "claimed",
       organizationId: "org_must_not_be_retained",
-      continuity: "same_account",
+      // A continuity value no version of this contract has ever defined. The
+      // drift has to be in a field the projection actually constrains: unknown
+      // top-level keys are stripped by design, and `postclaimAssets` became
+      // optional in 1.3.1 because a real claim can land before the asset
+      // projection is ready to describe.
+      continuity: "telepathy",
       apiKey: { secret: "lp_live_must_not_be_retained" },
     });
 
@@ -221,6 +226,42 @@ test("claim projection failure leaves process claim state untouched", async () =
     assert.match(result.content[0].text, /invalid public response/);
     assert.equal(getSession().claim, undefined);
     assert.equal(getClaimedApiKey(), undefined);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
+test("a claim without postclaimAssets succeeds and still hides the key", async () => {
+  // The asset projection describes work that starts AFTER the claim. Requiring
+  // it turned "the assets have not started generating yet" into "invalid public
+  // response" — reported to somebody whose workspace had just been claimed.
+  rememberSession(session());
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async () =>
+    jsonResponse({
+      status: "claimed",
+      organizationId: "org_from_a_real_claim",
+      continuity: "same_account",
+      apiKey: { secret: "lp_live_must_never_reach_the_agent" },
+    });
+
+  try {
+    const onboardingTools = toolRegistry((server) =>
+      registerOnboardingTools(server, "https://api.layers.test"),
+    );
+    const result = await onboardingTools.get("onboard_claim_verify").handler({
+      email: "human@example.com",
+      code: "123456",
+    });
+
+    assert.equal(result.isError, undefined);
+    // The claim is real, so the process records it.
+    assert.equal(getSession().claim?.continuity, "same_account");
+    assert.equal(getSession().claim?.organizationId, "org_from_a_real_claim");
+    // ...and the agent still never sees the credential or the org id.
+    const text = result.content.map((part) => part.text ?? "").join("\n");
+    assert.equal(text.includes("lp_live_must_never_reach_the_agent"), false);
+    assert.equal(text.includes("org_from_a_real_claim"), false);
   } finally {
     globalThis.fetch = originalFetch;
   }

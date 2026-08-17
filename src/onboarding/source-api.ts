@@ -16,14 +16,16 @@ import {
   OnboardAgentEvidenceUploadResponseSchema,
   OnboardAgentPostclaimHeadersSchema,
   OnboardAgentPostclaimResponseSchema,
-  OnboardAgentProgressResponseSchema,
   OnboardingCapabilityManifestConsumerSchema,
   OnboardingEvidenceEnvelopeSchema,
   type OnboardAgentPostclaimResponse,
   type OnboardingCapabilityManifest,
   type OnboardingEvidenceEnvelope,
-  type OnboardingProgressProjection,
 } from "@layers/onboarding-contracts";
+import {
+  ProgressProjectionSchema,
+  type ProgressProjection,
+} from "./progress-contract.js";
 import {
   IntakeAnswersRequestSchema,
   IntakeAnswersResponseSchema,
@@ -35,7 +37,15 @@ import { getReservation, type OnboardingReservation } from "./session.js";
 
 const RESPONSE_LIMIT_BYTES = 1024 * 1024;
 const REQUEST_TIMEOUT_MS = 15_000;
-const COLLECTOR_VERSION = "0.1.4";
+/**
+ * The collector release this launcher runs, checked against the server's
+ * `compatibility.acceptedCollectorVersions` before any local inspection.
+ *
+ * Moving this ahead of the server is a hard preflight stop, not a silent
+ * downgrade: `capabilities.ts` in `layers/layers` must accept the new value
+ * before a launcher pinned to it can onboard anyone.
+ */
+const COLLECTOR_VERSION = "0.1.5";
 /** The longest server-supplied refusal reason this process will relay. */
 const REFUSAL_REASON_MAX_LENGTH = 200;
 
@@ -69,6 +79,35 @@ export class SourceOnboardingError extends Error {
   }
 }
 
+/**
+ * A refusal that happens BEFORE anything is reserved.
+ *
+ * Carries a machine-readable code so the launcher can emit a real `error` event
+ * instead of matching on message text — the messages are prose written for a
+ * person, and branching on prose is how a copy edit becomes an outage.
+ */
+export class OnboardingPreflightError extends SourceOnboardingError {
+  readonly code:
+    | "ONBOARD_UPDATE_REQUIRED"
+    | "ONBOARD_ADMISSION_CLOSED"
+    | "ONBOARD_UNREACHABLE";
+  /** The exact command that resolves the refusal, when the server names one. */
+  readonly updateCommand?: string;
+
+  constructor(
+    code: OnboardingPreflightError["code"],
+    message: string,
+    options: { retryable?: boolean; updateCommand?: string } = {},
+  ) {
+    super(message, undefined, undefined, options.retryable ?? false);
+    this.name = "OnboardingPreflightError";
+    this.code = code;
+    if (options.updateCommand !== undefined) {
+      this.updateCommand = options.updateCommand;
+    }
+  }
+}
+
 /** The `reason` an error envelope carries, made safe to relay. */
 function safeRefusalReason(text: string): string | undefined {
   let parsed: unknown;
@@ -80,7 +119,18 @@ function safeRefusalReason(text: string): string | undefined {
   if (typeof parsed !== "object" || parsed === null) return undefined;
   const reason = (parsed as { reason?: unknown }).reason;
   if (typeof reason !== "string") return undefined;
-  const sanitized = reason
+  return boundedRelayText(reason);
+}
+
+/**
+ * Server-authored prose, bounded and stripped before anything relays it.
+ *
+ * The only consumers write this into an agent transcript, so control characters
+ * and unbounded length are the two ways a refusal message could do more than
+ * explain itself.
+ */
+export function boundedRelayText(value: string): string | undefined {
+  const sanitized = value
     .replace(/[\u0000-\u001F\u007F]/gu, " ")
     .replace(/\s+/gu, " ")
     .trim()
@@ -342,7 +392,8 @@ export async function preflightSourceOnboarding(
 
   if (manifest.sourceAdmission === "closed") {
     if (!internalProbeToken) {
-      throw new SourceOnboardingError(
+      throw new OnboardingPreflightError(
+        "ONBOARD_ADMISSION_CLOSED",
         "Layers source onboarding is not open yet",
       );
     }
@@ -367,8 +418,16 @@ export async function preflightSourceOnboarding(
     semverAtLeast(launcherVersion, compatibility.minimumBootstrapVersion);
 
   if (!compatible) {
-    throw new SourceOnboardingError(
-      `Layers onboarding requires an update: ${compatibility.unsafeMismatch.updateCommand}`,
+    // The update command is server-authored text that this process prints and
+    // an agent may relay, so it is bounded and control-stripped like every
+    // other server string that reaches a transcript.
+    const updateCommand = boundedRelayText(
+      compatibility.unsafeMismatch.updateCommand,
+    );
+    throw new OnboardingPreflightError(
+      "ONBOARD_UPDATE_REQUIRED",
+      `Layers onboarding requires an update: ${updateCommand ?? "reinstall the latest @layers/mcp-server"}`,
+      updateCommand === undefined ? {} : { updateCommand },
     );
   }
   return {};
@@ -396,6 +455,16 @@ export interface SourceClaimSession {
         readonly state: "claimed";
         readonly postclaim: OnboardAgentPostclaimResponse;
       }
+    /**
+     * A well-formed response carrying a state this build does not know.
+     *
+     * TOLERATED RATHER THAN THROWN. The canonical schema is a strict union, so
+     * a state added server-side used to fail the parse and end the run — during
+     * a claim wait, after consent, with the workspace already built. It is not
+     * `claimed`, so it is not success; the caller retires the transport leg and
+     * mints a fresh one instead of ending a person's claim over a new word.
+     */
+    | { readonly state: "unknown" }
   >;
   dispose(): void;
 }
@@ -556,8 +625,25 @@ class ProcessPrivateSourceClaimSession implements SourceClaimSession {
       );
       const parsedExchange =
         OnboardAgentClaimExchangeResponseSchema.safeParse(exchange.body);
+      if (!parsedExchange.success) {
+        // The envelope still has to be OURS before an unknown state is treated
+        // as anything but garbage: right trial, right attempt, and a state that
+        // is at least a string. Anything else is an invalid response, as before.
+        const body = exchange.body as Record<string, unknown> | null;
+        if (
+          typeof body === "object" &&
+          body !== null &&
+          body.trialHandle === this.#trialHandle &&
+          body.attemptHandle === this.#attemptHandle &&
+          typeof body.state === "string"
+        ) {
+          return { state: "unknown" };
+        }
+        throw new SourceOnboardingError(
+          "Layers claim continuity exchange returned an invalid response",
+        );
+      }
       if (
-        !parsedExchange.success ||
         parsedExchange.data.trialHandle !== this.#trialHandle ||
         parsedExchange.data.attemptHandle !== this.#attemptHandle
       ) {
@@ -838,7 +924,7 @@ export async function uploadSourceEvidence(
 export async function readSourceProgress(
   baseUrl: string,
   signal?: AbortSignal,
-): Promise<OnboardingProgressProjection> {
+): Promise<ProgressProjection> {
   throwIfCallerAborted(signal);
   const reservation = activeReservation();
   const body = await requestJson(
@@ -860,7 +946,10 @@ export async function readSourceProgress(
     200,
     signal,
   );
-  const parsed = OnboardAgentProgressResponseSchema.safeParse(body);
+  // Parsed through the LOCAL mirror, not the pinned canonical schema: that one
+  // is `.strict()` with an enumerated `state`, so a field or state added
+  // server-side would fail this read on every poll of an hours-long claim wait.
+  const parsed = ProgressProjectionSchema.safeParse(body);
   if (!parsed.success || parsed.data.trialHandle !== reservation.trialHandle) {
     throw new SourceOnboardingError(
       "Layers onboarding progress returned an invalid response",
