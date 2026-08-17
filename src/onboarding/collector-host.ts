@@ -171,14 +171,23 @@ export type OnboardingCollectorSupportCode =
 const COLLECTOR_REMEDY_COMMANDS: Readonly<
   Partial<Record<OnboardingCollectorSupportCode, string>>
 > = {
-  // NOT `npm install`. This launcher writes only inside its own mkdtemp, and a
-  // remedy that edits the caller's package.json and lockfile breaks that for a
-  // fault that is usually not even in their project — it is `npx` having
-  // resolved the package with optional dependencies switched off. Re-running the
-  // same invocation with `npm_config_include=optional` repairs the actual
-  // failure and touches nothing the person owns.
+  // A PLAIN npm FLAG, not a POSIX env-var prefix. `npm_config_include=optional
+  // npx …` is `VAR=value cmd` shell syntax that cmd.exe and PowerShell do not
+  // understand, so the remedy was unrunnable for every Windows user — the
+  // platform most likely to hit an optional-dependency problem in the first
+  // place. `--include=optional` is a flag npm honours on `npx`, verified to
+  // override an `omit=optional` configuration.
+  //
+  // NOT `npm install`, either: this launcher writes only inside its own
+  // mkdtemp, and a remedy that edits the caller's package.json and lockfile
+  // breaks that for a fault usually not even in their project.
+  //
+  // THE FLAG ALONE IS NOT ALWAYS ENOUGH, and the message says so. `npx` reuses
+  // an existing `_npx` tree without re-resolving, so a cache already populated
+  // without the collector stays that way no matter which flags the next
+  // invocation carries. Clearing the cache is what makes the flag take.
   ONBOARD_COLLECTOR_NOT_INSTALLED:
-    "npm_config_include=optional npx --yes @layers/mcp-server@1.3.1 onboard",
+    "npx --yes --include=optional @layers/mcp-server@1.3.1 onboard",
   // A timeout is the one collector fault that a second run genuinely fixes.
   ONBOARD_COLLECTOR_TIMEOUT: ONBOARDING_COLLECTOR_UPDATE_COMMAND,
   // Nothing local fixes an unsupported platform, and nothing local fixes an
@@ -331,7 +340,7 @@ export function collectorResolutionError(
   ) {
     return new OnboardingCollectorHostError(
       "ONBOARD_COLLECTOR_NOT_INSTALLED",
-      `${packageName} is not installed. Layers onboarding ships the collector as an optional platform dependency, so an install run with --omit=optional or --no-optional leaves nothing to verify. Reinstall without omitting optional dependencies.`,
+      `${packageName} is not installed. Layers onboarding ships the collector as an optional platform dependency, so an install that omitted optional dependencies leaves nothing to verify. Re-run with --include=optional, which tells npm to install them even when the surrounding configuration says not to. If that changes nothing, npx is reusing a cached copy of the incomplete install: run "npm cache clean --force" first, then re-run with the flag.`,
     );
   }
   return integrityError();

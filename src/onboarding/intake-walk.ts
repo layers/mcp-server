@@ -435,6 +435,19 @@ export function createIntakeWalkRunner(options: {
 
       let refusals = 0;
       let refusal: { field: string; message: string } | undefined;
+      /**
+       * Whether the walk currently holds a refusal nobody has resolved.
+       *
+       * Kept so the ending can be honest without the refusal path having to
+       * short-circuit the loop: a walk that empties while one of these is
+       * outstanding settles `skipped`, never `complete`.
+       *
+       * PER FIELD, because a refusal is only resolved by an accepted answer to
+       * THE SAME QUESTION. A single flag let a later success on some other
+       * field clear it, which would report a walk as complete while the one
+       * answer the server actually rejected was still rejected.
+       */
+      const unresolvedRejections = new Set<string>();
       // The walk is re-read ONCE after it empties, and only once.
       let recheckedAfterEmpty = false;
       for (;;) {
@@ -571,7 +584,7 @@ export function createIntakeWalkRunner(options: {
         );
         remaining = record(response);
         if (rejection) {
-          if (refusals + 1 < INTAKE_REFUSAL_LIMIT && remaining.length > 0) {
+          if (refusals + 1 < INTAKE_REFUSAL_LIMIT) {
             refusals += 1;
             refusal = {
               field: rejection.field,
@@ -579,13 +592,15 @@ export function createIntakeWalkRunner(options: {
                 boundedRelayText(rejection.message) ??
                 "That answer was not accepted.",
             };
+            // CONTINUE EVEN WHEN THE WALK IS NOW EMPTY. Returning here on an
+            // empty `remaining` skipped the single post-empty re-read, so
+            // questions that become applicable once the analysis lands were
+            // never asked — the refusal silently cost the person the rest of
+            // their walk. The loop's empty branch does the re-read; the flag
+            // below is what still keeps the ending honest.
+            unresolvedRejections.add(rejection.field);
             continue;
           }
-          // A REFUSAL NEVER COMPLETES THE WALK. If the refused answer was the
-          // last outstanding question, `remaining` is now empty — and falling
-          // through would settle `complete` on a walk whose final answer the
-          // server explicitly would not take. Refusing at the cap and refusing
-          // the last question are the same honest outcome: skipped.
           settle(
             "skipped",
             "Layers could not record the setup answers, so the remaining questions were skipped. Nothing else is held up.",
@@ -595,6 +610,7 @@ export function createIntakeWalkRunner(options: {
         }
 
         refusals = 0;
+        unresolvedRejections.delete(parsed.answer.field);
         if (remaining.length > 0) {
           emit({
             type: "intake",
@@ -604,7 +620,19 @@ export function createIntakeWalkRunner(options: {
         }
       }
 
-      settle("complete", "Every Layers setup question is answered.");
+      // A REFUSAL NEVER COMPLETES THE WALK. Reaching the end with one still
+      // outstanding means the last thing the server said about an answer was
+      // that it would not take it, and reporting that as `complete` would tell
+      // the claim gate a story the trial does not hold.
+      if (unresolvedRejections.size > 0) {
+        settle(
+          "skipped",
+          "Layers could not record the setup answers, so the remaining questions were skipped. Nothing else is held up.",
+          "refused",
+        );
+      } else {
+        settle("complete", "Every Layers setup question is answered.");
+      }
     }
   }
 

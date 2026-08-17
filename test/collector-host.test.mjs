@@ -220,8 +220,8 @@ test("a missing platform package is not reported as an integrity failure", () =>
   );
   assert.equal(notInstalled.supportCode, "ONBOARD_COLLECTOR_NOT_INSTALLED");
   assert.match(notInstalled.message, /@layers\/onboarding-collector-linux-x64/u);
-  assert.match(notInstalled.message, /--omit=optional/u);
-  assert.match(notInstalled.message, /Reinstall/u);
+  assert.match(notInstalled.message, /omitted optional dependencies/u);
+  assert.match(notInstalled.message, /Re-run with --include=optional/u);
 
   // Anything else resolving badly is still an integrity failure.
   const other = collectorResolutionError(
@@ -231,14 +231,21 @@ test("a missing platform package is not reported as an integrity failure", () =>
   assert.equal(other.supportCode, "ONBOARD_COLLECTOR_INTEGRITY");
 
   // A REMEDY IS A PROMISE. Only faults a command actually fixes get one.
-  assert.match(
+  assert.equal(
     notInstalled.remedyCommand,
-    /^npm_config_include=optional npx --yes @layers\/mcp-server@1\.3\.1 onboard$/u,
+    "npx --yes --include=optional @layers/mcp-server@1.3.1 onboard",
   );
   // IT MUST NOT WRITE TO THE USER'S REPO. This launcher writes only inside its
-  // own mkdtemp; a remedy that edits package.json and the lockfile breaks that,
-  // and does not repair the npx-cached invocation that actually failed.
+  // own mkdtemp; a remedy that edits package.json and the lockfile breaks that.
   assert.equal(/npm install/u.test(notInstalled.remedyCommand), false);
+  // AND IT MUST RUN ON WINDOWS. `VAR=value cmd` is POSIX shell syntax that
+  // cmd.exe and PowerShell do not understand; `--include=optional` is a plain
+  // npm flag, which is why it replaced the env-var form.
+  assert.equal(/^\w+=/u.test(notInstalled.remedyCommand), false);
+  // The message has to say what the command does and what to do when a stale
+  // npx cache means the flag alone is not enough.
+  assert.match(notInstalled.message, /optional dependencies/u);
+  assert.match(notInstalled.message, /npm cache clean --force/u);
   assert.equal(
     other.remedyCommand,
     undefined,
@@ -247,8 +254,15 @@ test("a missing platform package is not reported as an integrity failure", () =>
 
   // The real resolver does produce MODULE_NOT_FOUND for a package that is not
   // installed, so the discriminator above is the one that actually fires.
+  //
+  // NOT a real platform package: which of the six is installed depends on the
+  // machine, and naming `linux-x64` passed on a darwin laptop while failing on
+  // a linux-x64 CI runner where that package is exactly the one present.
   assert.throws(
-    () => require.resolve("@layers/onboarding-collector-linux-x64/package.json"),
+    () =>
+      require.resolve(
+        "@layers/onboarding-collector-nosucharch/package.json",
+      ),
     (error) => error.code === "MODULE_NOT_FOUND",
   );
 });

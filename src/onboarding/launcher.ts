@@ -832,7 +832,14 @@ export async function waitForPreviewAndClaim(
   let latestPreviewUrl: string | undefined;
   let claimSession: SourceClaimSession | undefined;
   let claimLinksMinted = 0;
-  let lastHeartbeatAtMs = 0;
+  /**
+   * Seeded at the wait's start, not at zero.
+   *
+   * From zero the first elapsed check is `Date.now() - 0`, which clears any
+   * interval, so the very first pending exchange announced "still waiting for
+   * the human" before anybody had been given a link to be slow about.
+   */
+  let lastHeartbeatAtMs = Date.now();
   let handoffStarted = false;
   /** When the CURRENT attempt was minted, for age checks the clock can trust. */
   let attemptMintedAtMs: number | undefined;
@@ -852,13 +859,20 @@ export async function waitForPreviewAndClaim(
   /** Why the last leg was retired, so the replacement can say what happened. */
   let retiredBecause: string | undefined;
   /**
-   * Whether the leg that was just retired had ever answered.
+   * Whether the CURRENT leg's browser URL has actually reached the agent.
    *
-   * Only a leg that was live is worth telling the human about: "discard the
-   * earlier link" is an instruction, and an instruction about a link they were
-   * never able to use is noise wearing an instruction's clothes.
+   * THE RIGHT QUESTION IS "WAS IT SHOWN", NOT "WAS IT LIVE". Gating the refresh
+   * announcement on the leg having completed an exchange looked equivalent, and
+   * is not: the URL is published on the progress event immediately after the
+   * mint, one full poll BEFORE the first exchange can mark the leg live. A leg
+   * retired in that window had already been handed to the agent — and possibly
+   * on to the human — so replacing it silently is precisely the case the
+   * announcement exists for. The suppression was only ever meant for links
+   * nobody had seen.
    */
-  let retiredLegWasLive = false;
+  let attemptUrlEmitted = false;
+  /** Whether the leg that was just retired had reached the agent. */
+  let retiredLegWasEmitted = false;
   /**
    * Why the wait is stopping, when it stops for a reason other than the clock.
    * Prose, so the terminal status can say the true thing rather than one
@@ -917,7 +931,8 @@ export async function waitForPreviewAndClaim(
     attemptDeadline = undefined;
     attemptMintedAtMs = undefined;
     retiredBecause = cause;
-    retiredLegWasLive = attemptEverLive;
+    retiredLegWasEmitted = attemptUrlEmitted;
+    attemptUrlEmitted = false;
     // A leg nobody could have used is the server's failure, not the human's.
     deadLegs = attemptEverLive ? 0 : deadLegs + 1;
     attemptEverLive = false;
@@ -1175,7 +1190,7 @@ export async function waitForPreviewAndClaim(
         if (
           claimLinksMinted > 1 &&
           retiredBecause !== undefined &&
-          retiredLegWasLive
+          retiredLegWasEmitted
         ) {
           emitEvent({
             type: "status",
@@ -1184,7 +1199,7 @@ export async function waitForPreviewAndClaim(
           });
         }
         retiredBecause = undefined;
-        retiredLegWasLive = false;
+        retiredLegWasEmitted = false;
       }
 
       if (progress.state === "claimed" && !claimSession) {
@@ -1210,6 +1225,9 @@ export async function waitForPreviewAndClaim(
       if (fingerprint !== previous) {
         emitEvent({ type: "progress", progress: safeProgress });
         previous = fingerprint;
+        // The moment a browser URL leaves this process it is the agent's to
+        // relay, so replacing it later owes them an announcement.
+        if (safeClaimUrl !== null) attemptUrlEmitted = true;
       }
       // Once a private claim attempt exists, publish its safe browser URL
       // before any deadline path can dispose the process-only session.

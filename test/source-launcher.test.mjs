@@ -2505,14 +2505,15 @@ test("a server refusing every claim link stops early and blames the server", asy
     false,
     "a link nobody could open must not be reported as one nobody opened",
   );
-  // And a link that was never live is not announced as "refreshed".
-  assert.equal(
-    events.some(
-      (event) =>
-        event.type === "status" && event.stage === "claim_link_refreshed",
-    ),
-    false,
+  // AND THE REPLACEMENT IS ANNOUNCED. The first URL reached the agent on a
+  // progress event before any exchange could mark the leg live, so the agent
+  // may already have handed it to the human; swapping it silently is the
+  // failure the announcement exists for.
+  const refreshed = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_link_refreshed",
   );
+  assert.equal(refreshed.length, 1, "the replaced link was announced");
+  assert.match(refreshed[0].message, /no longer usable/u);
   const terminal = events.filter((event) => event.type === "complete");
   assert.equal(terminal.length, 1);
   assert.equal(terminal[0].state, "awaiting_claim");
@@ -3507,6 +3508,54 @@ test("a server that never releases the previous claim link stops on its own", as
   const terminal = events.filter((event) => event.type === "complete");
   assert.equal(terminal.length, 1);
   assert.equal(terminal[0].state, "awaiting_claim");
+});
+
+test("the awaiting_claim heartbeat does not fire on the first exchange", async () => {
+  // `lastHeartbeatAtMs` started at 0, so `Date.now() - 0` cleared any interval
+  // and the first pending exchange announced "still waiting for the human"
+  // before anyone had been given a link to be slow about.
+  const reservationExpiresAt = new Date(Date.now() + 6_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      return Response.json(CLAIM_ATTEMPT_RESPONSE, { status: 202 });
+    }
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "heartbeat suppression",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  // The whole wait here is seconds; the heartbeat interval is five minutes.
+  assert.equal(
+    events.some(
+      (event) => event.type === "status" && event.stage === "awaiting_claim",
+    ),
+    false,
+    "a wait shorter than the heartbeat interval must stay quiet",
+  );
 });
 
 test("a terminal failure names the trial, the last state, and the server's code", async () => {

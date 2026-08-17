@@ -718,9 +718,15 @@ test("a refusal that empties the walk settles skipped, never complete", async ()
   // The refused answer was the last outstanding question, so `remaining` is now
   // empty. Settling `complete` there would report a walk as finished on an
   // answer the server explicitly would not take.
+  let reads = 0;
   const harness = runnerHarness({
     input: scriptedInput(["answer goal installs"]),
-    readWalk: async () => walkResponse([GOAL_QUESTION]),
+    readWalk: async () => {
+      reads += 1;
+      // The opening read offers the question; the post-empty re-read confirms
+      // the server has nothing further to ask.
+      return walkResponse(reads === 1 ? [GOAL_QUESTION] : []);
+    },
     submitAnswer: async () =>
       walkResponse([], [], [
         {
@@ -733,6 +739,9 @@ test("a refusal that empties the walk settles skipped, never complete", async ()
   });
   await harness.runner.run();
 
+  // THE RE-READ STILL RAN. Settling straight from the refusal skipped it, so
+  // questions that become applicable once analysis lands were never asked.
+  assert.equal(reads, 2, "the refusal did not bypass the post-empty re-read");
   const settlement = settlementOf(harness.events);
   assert.equal(settlement.state, "skipped");
   assert.equal(settlement.complete, false);
@@ -743,6 +752,52 @@ test("a refusal that empties the walk settles skipped, never complete", async ()
     ),
     false,
   );
+});
+
+test("a refusal that empties the walk still gets the post-empty re-read", async () => {
+  // The refusal emptied `remaining`, and the questions that become applicable
+  // once the analysis lands appear only on the re-read. Settling on the refusal
+  // silently cost the person the rest of their walk.
+  const late = { ...GOAL_QUESTION, field: "goal" };
+  let reads = 0;
+  let writes = 0;
+  const harness = runnerHarness({
+    input: scriptedInput([
+      "answer triedChannels social",
+      "answer goal installs",
+    ]),
+    readWalk: async () => {
+      reads += 1;
+      // The late question exists only by the time the re-read happens.
+      return walkResponse(reads === 1 ? [MULTI_QUESTION] : [late]);
+    },
+    submitAnswer: async () => {
+      writes += 1;
+      if (writes === 1) {
+        return walkResponse([], [], [
+          {
+            field: "triedChannels",
+            reason: "option_not_offered",
+            message: "That channel is not on the list.",
+            options: MULTI_QUESTION.options,
+          },
+        ]);
+      }
+      return walkResponse([], ["goal"]);
+    },
+  });
+  await harness.runner.run();
+
+  assert.equal(reads, 2, "the re-read ran despite the refusal");
+  assert.deepEqual(
+    turnsIn(harness.events).map((turn) => turn.question.field),
+    ["triedChannels", "goal"],
+    "the newly applicable question was still asked",
+  );
+  // The refusal was never resolved, so the walk cannot claim completion.
+  const settlement = settlementOf(harness.events);
+  assert.equal(settlement.state, "skipped");
+  assert.equal(settlement.reason, "refused");
 });
 
 test("a required multi-select does not advertise the empty pick", () => {
