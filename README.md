@@ -17,12 +17,45 @@ npx --yes @layers/mcp-server@latest onboard
 
 The command checks server compatibility before reading the workspace, runs the
 checksum-verified native collector locally, shows the exact bounded source-data
-proposal, and waits for explicit approval before sending evidence. It then
-surfaces the preview and attempt-bound browser claim URL and returns the safe
-post-claim workspace projection to the same process when the browser claim
-finishes within its bounded window. Reservation, transport, PKCE verifier,
-post-claim capability, full evidence-envelope, and transient excerpt values
-never enter terminal output; the bounded consent projection does.
+proposal, and waits for explicit approval before sending evidence. While the
+preview builds it asks the same setup questions the Layers web onboarding asks,
+one at a time, each carrying its exact title, its offered options, and the exact
+command that answers it. It then surfaces the preview and attempt-bound browser
+claim URL and returns the safe post-claim workspace projection to the same
+process when the browser claim finishes within its bounded window. Reservation,
+transport, PKCE verifier, post-claim capability, full evidence-envelope, and
+transient excerpt values never enter terminal output; the bounded consent
+projection does.
+
+### Setup questions and the claim link
+
+Once evidence is approved and on its way, the command reads the outstanding
+setup questions and emits `input_required: answer_intake` one question at a
+time. Each turn carries the canonical `question` (title, optional subtitle,
+whether it takes one option or several, whether it takes free text, and the
+offered `options` as `value`/`label` pairs) and the `commands` that answer it:
+
+```
+answer <field> <value>                 pick one offered option
+answer <field> <value>,<value>         pick several (multi-select questions)
+answer <field>                         pick none (multi-select questions)
+answer goal other <your own words>     the one arm that takes free text
+```
+
+Send exactly one advertised command per turn; the next question arrives once the
+answer is recorded. A line that names an option the question does not offer
+re-asks the same question rather than guessing.
+
+**The claim link waits for both the preview and the questions.** Whichever
+finishes second releases it, so the browser claim is never offered while setup
+questions are still outstanding. Progress is reported on `intake` events, whose
+`complete` flag is the explicit signal that the walk is done — the same way
+`previewReady` reports the preview. `state` is one of `asking`, `complete`,
+`not_required` (there were no questions), or `skipped`. **`skipped` means the
+gate failed open**: the question service was unreachable, refused repeatedly, or
+the questions were left unanswered past their bounded window. A broken question
+service costs a person their questions, never their workspace. The terminal
+`complete` event carries the same summary on its `intake` field.
 
 ### Claude Code process control
 
@@ -74,6 +107,14 @@ those do not give Claude a controllable task handle.
    command. If `resume_inspection` appears, send only its advertised `resume`
    or `cancel` command; a resumed inspection requires a new proposal and new
    approval. Keep the task alive until a terminal `complete` or `error` event.
+
+4. At `input_required: answer_intake`, relay one question per turn while the
+   launcher keeps building in the background: show its exact `title`, its
+   `subtitle` when present, and its offered `options`, take an offered option or
+   the human's own words, and send the exact advertised answer command before
+   asking the next. Never show a setup question while a consent proposal is
+   displayed or awaiting approval. Withhold the claim link until the launcher
+   reports the questions complete and the preview ready.
 
 For ordinary public callers, a server that has not opened source admission stops
 the command before local inspection. An operator-only environment token can

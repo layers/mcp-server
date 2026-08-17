@@ -10,7 +10,7 @@ Run with Node's built-in test runner (no test-framework dependency):
 npm test
 ```
 
-`pretest` builds first, then `node --test test/*.test.mjs` runs twelve suites.
+`pretest` builds first, then `node --test test/*.test.mjs` runs thirteen suites.
 The protocol-facing suites spawn the built server and drive it over stdio; the
 contract/onboarding suites also point it at a throwaway `127.0.0.1` mock. The
 bridge suite injects mock MCP clients and transports, so **no API key and no
@@ -57,11 +57,20 @@ outbound network are needed**. This is what CI runs.
   upload, attempt-bound PKCE exchange, safe post-claim read, idempotent replay,
   abort handling, and secret non-disclosure.
 - **[`source-launcher.test.mjs`](source-launcher.test.mjs)** — the one-shot
-  workspace inspection, exact consent approval, upload, preview, browser claim,
-  and same-process post-claim terminal projection; generation-expiry resume keeps
-  one reservation but requires fresh inspection and exact consent, rejects stale
-  commands across epochs, submits no evidence before approval, and preserves
-  fail-closed reservation/collector support-code terminal events.
+  workspace inspection, exact consent approval, upload, the pre-claim setup
+  questions, preview, browser claim, and same-process post-claim terminal
+  projection; generation-expiry resume keeps one reservation but requires fresh
+  inspection and exact consent, rejects stale commands across epochs, submits no
+  evidence before approval, and preserves fail-closed reservation/collector
+  support-code terminal events. An empty question walk leaves the claim handoff
+  unchanged; a two-question walk holds it until the last answer lands.
+- **[`source-intake.test.mjs`](source-intake.test.mjs)** — the pre-claim setup
+  walk: answer parsing against the offered options, the exact advertised answer
+  commands, one question at a time with an explicit completion signal, a server
+  refusal that re-asks with its options, the refusal cap, an unreachable
+  question service, an unanswered walk, the consent exclusivity guard, and the
+  capability-only transport with its bounded refusal reason. Every path settles
+  the claim gate.
 
 The tests assert literal counts (52 / 25 / 27) on purpose — adding or removing a
 tool fails the suite until the count is updated deliberately.

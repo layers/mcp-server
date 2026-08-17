@@ -35,6 +35,11 @@ import {
   OnboardingEvidenceEnvelopeSchema,
 } from "@layers/onboarding-contracts";
 
+import {
+  IntakeAnswersRequestSchema,
+  IntakeAnswersResponseSchema,
+  ONBOARD_AGENT_INTAKE_ANSWERS_ROUTE_PATH,
+} from "../dist/onboarding/intake-contract.js";
 import { waitForPreviewAndClaim } from "../dist/onboarding/launcher.js";
 import { rememberReservation } from "../dist/onboarding/session.js";
 import { SERVER } from "./helpers.mjs";
@@ -175,6 +180,35 @@ const POSTCLAIM_RESPONSE = OnboardAgentPostclaimResponseSchema.parse({
   updatedAt: UPDATED_AT,
 });
 
+/**
+ * A two-question walk shaped like the canonical set: one optional multi-select
+ * baseline question, then the single-select `goal` question whose `other` arm is
+ * the one place free text has a home.
+ */
+const INTAKE_WALK_QUESTIONS = [
+  {
+    field: "triedChannels",
+    group: "baseline",
+    select: "multiple",
+    title: "Have you tried any of these growth strategies?",
+    options: [
+      { value: "social", label: "Posted on social" },
+      { value: "ads", label: "Ran paid ads" },
+    ],
+  },
+  {
+    field: "goal",
+    group: "direction",
+    select: "single",
+    title: "What are you trying to grow?",
+    subtitle: "Pick the one that matters most right now.",
+    options: [
+      { value: "installs", label: "More installs" },
+      { value: "other", label: "Something else" },
+    ],
+  },
+];
+
 function respondJson(response, status, body, headers = {}) {
   response.writeHead(status, {
     ...headers,
@@ -196,12 +230,15 @@ function requestsAt(requests, pathname) {
 
 async function createMockApi(
   temporaryRoot,
-  { startResponse = START_RESPONSE } = {},
+  { startResponse = START_RESPONSE, intakeQuestions = [] } = {},
 ) {
   const requests = [];
   const unexpectedRequests = [];
   let exchangeCount = 0;
   let claimAttemptCount = 0;
+  // The mock keeps the walk the way the route does: answers accumulate and the
+  // remaining list is recomputed on every read AND every write.
+  const intakeAnswers = new Map();
 
   const evidencePath = ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.evidence.replace(
     ":trialHandle",
@@ -223,6 +260,29 @@ async function createMockApi(
     ":trialHandle",
     TRIAL_HANDLE,
   );
+  const intakePath = ONBOARD_AGENT_INTAKE_ANSWERS_ROUTE_PATH.replace(
+    ":trialHandle",
+    TRIAL_HANDLE,
+  );
+
+  const intakeWalk = () => {
+    const remaining = intakeQuestions.filter(
+      (question) => !intakeAnswers.has(question.field),
+    );
+    return IntakeAnswersResponseSchema.parse({
+      protocolVersion: 1,
+      trialHandle: TRIAL_HANDLE,
+      complete: remaining.length === 0,
+      answersConverged: true,
+      answered: [...intakeAnswers.keys()],
+      intake: {
+        docks: remaining.length === 0
+          ? []
+          : [{ group: remaining[0].group, questions: remaining }],
+        remaining,
+      },
+    });
+  };
 
   const server = http.createServer((request, response) => {
     const chunks = [];
@@ -326,6 +386,47 @@ async function createMockApi(
       }
       if (request.method === "GET" && pathname === postclaimPath) {
         respondJson(response, 200, POSTCLAIM_RESPONSE);
+        return;
+      }
+      if (request.method === "GET" && pathname === intakePath) {
+        respondJson(response, 200, intakeWalk());
+        return;
+      }
+      if (request.method === "POST" && pathname === intakePath) {
+        const parsed = IntakeAnswersRequestSchema.safeParse(
+          JSON.parse(captured.body),
+        );
+        if (!parsed.success) {
+          respondJson(response, 400, {
+            error: "Invalid onboarding intake request.",
+            reason: "malformed answer envelope",
+          });
+          return;
+        }
+        for (const answer of parsed.data.answers) {
+          const question = intakeQuestions.find(
+            (candidate) => candidate.field === answer.field,
+          );
+          const offered = new Set(
+            (question?.options ?? []).map((option) => option.value),
+          );
+          const unknown = answer.optionValues.find(
+            (value) => !offered.has(value),
+          );
+          // The route's own refusal shape: a 400 whose `reason` names the pick
+          // it would not take, so the caller can re-ask with the options.
+          if (!question || unknown !== undefined) {
+            respondJson(response, 400, {
+              error: "Invalid onboarding intake request.",
+              reason: question
+                ? `Unknown option for ${answer.field}: ${unknown}`
+                : `Unknown intake question: ${answer.field}`,
+            });
+            return;
+          }
+          intakeAnswers.set(answer.field, answer.optionValues);
+        }
+        respondJson(response, 200, intakeWalk());
         return;
       }
 
@@ -548,7 +649,7 @@ async function writeExpiryDriver(temporaryRoot) {
     "",
     "try {",
     "  await runSourceOnboardCli(",
-    "    { baseUrl, launcherVersion: '1.2.3' },",
+    "    { baseUrl, launcherVersion: '1.3.0' },",
     "    { openCollector },",
     "  );",
     "} catch (error) {",
@@ -740,6 +841,23 @@ test(
       // its own preview/claim wait alive instead of relying on an open input pipe.
       await writeCommand(run, exactApproval, true);
 
+      // An empty walk settles the claim gate on the first read and asks nothing,
+      // so the handoff below is unchanged from the pre-intake flow.
+      const intakeEvent = await nextEvent(
+        run,
+        (event) => event.type === "intake",
+        "empty intake walk",
+      );
+      assert.deepEqual(intakeEvent, {
+        type: "intake",
+        message: "Layers had no setup questions outstanding.",
+        state: "not_required",
+        complete: true,
+        answered: 0,
+        remaining: 0,
+        answersConverged: true,
+      });
+
       const progressEvent = await nextEvent(
         run,
         (event) => event.type === "progress",
@@ -778,6 +896,13 @@ test(
         previewUrl: PREVIEW_URL,
         state: "claimed",
         postclaim: POSTCLAIM_RESPONSE,
+        intake: {
+          state: "not_required",
+          complete: true,
+          answered: 0,
+          remaining: 0,
+          answersConverged: true,
+        },
       });
       assert.deepEqual(await withTimeout(run.exit, "launcher exit"), {
         code: 0,
@@ -786,6 +911,21 @@ test(
 
       assert.deepEqual(api.unexpectedRequests, []);
       assert.equal(api.exchangeCount, 2);
+
+      const intakePath = ONBOARD_AGENT_INTAKE_ANSWERS_ROUTE_PATH.replace(
+        ":trialHandle",
+        TRIAL_HANDLE,
+      );
+      const intakeRequests = requestsAt(api.requests, intakePath);
+      assert.equal(intakeRequests.length, 1, "one walk read, no writes");
+      assert.equal(intakeRequests[0].method, "GET");
+      assert.equal(
+        requestHeader(
+          intakeRequests[0],
+          ONBOARD_AGENT_PUBLIC_HEADER_NAMES.reservationCapability,
+        ),
+        RESERVATION_CAPABILITY,
+      );
 
       const startRequest = requestsAt(
         api.requests,
@@ -1035,6 +1175,289 @@ test(
       ) {
         run.child.kill();
         await withTimeout(run.exit, "launcher cleanup", 5_000).catch(() => {});
+      }
+      await api?.close();
+      await rm(temporaryRoot, { recursive: true, force: true });
+    }
+  },
+);
+
+/** Walk the real collector to the exact approval command and send it. */
+async function approveThroughCollector(run, { close = false } = {}) {
+  await nextEvent(
+    run,
+    (event) => event.type === "inspection",
+    "initial source inspection",
+  );
+  await nextEvent(
+    run,
+    (event) =>
+      event.type === "input_required" && event.operation === "review_scope",
+    "scope review prompt",
+  );
+  await writeCommand(run, "prepare");
+  const proposal = await nextEvent(
+    run,
+    (event) => event.type === "consent_proposal",
+    "consent proposal",
+  );
+  const approvalPrompt = await nextEvent(
+    run,
+    (event) =>
+      event.type === "input_required" && event.operation === "approve_consent",
+    "exact consent approval prompt",
+  );
+  const exactApproval =
+    `approve ${proposal.displayEventId} ${proposal.canonicalProjectionSha256}`;
+  assert.equal(approvalPrompt.commands[0], exactApproval);
+  await writeCommand(run, exactApproval, close);
+  return proposal;
+}
+
+test(
+  "asks the canonical intake walk one question at a time and holds the claim link until the last answer",
+  { timeout: 90_000 },
+  async () => {
+    const temporaryRoot = await mkdtemp(
+      join(tmpdir(), "layers-source-intake-test-"),
+    );
+    let api;
+    let run;
+    try {
+      const workspace = await createSingleProductGitFixture(temporaryRoot);
+      api = await createMockApi(temporaryRoot, {
+        intakeQuestions: INTAKE_WALK_QUESTIONS,
+      });
+      run = spawnLauncher(workspace, api.baseUrl, temporaryRoot);
+
+      await approveThroughCollector(run);
+
+      const claimAttemptsPath =
+        ONBOARD_AGENT_PUBLIC_ROUTE_PATHS.claimAttempts.replace(
+          ":trialHandle",
+          TRIAL_HANDLE,
+        );
+      const intakePath = ONBOARD_AGENT_INTAKE_ANSWERS_ROUTE_PATH.replace(
+        ":trialHandle",
+        TRIAL_HANDLE,
+      );
+
+      const started = await nextEvent(
+        run,
+        (event) => event.type === "intake",
+        "intake walk start",
+      );
+      assert.deepEqual(started, {
+        type: "intake",
+        message:
+          "Answering Layers setup questions while the preview builds in the background.",
+        state: "asking",
+        complete: false,
+        answered: 0,
+        remaining: 2,
+        answersConverged: true,
+      });
+
+      // ONE QUESTION AT A TIME, in walk order, carrying the canonical title and
+      // the offered options verbatim.
+      const firstTurn = await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "answer_intake",
+        "first intake question",
+      );
+      assert.deepEqual(firstTurn, {
+        type: "input_required",
+        operation: "answer_intake",
+        question: {
+          field: "triedChannels",
+          title: "Have you tried any of these growth strategies?",
+          select: "multiple",
+          allowsFreeText: false,
+          options: [
+            { value: "social", label: "Posted on social" },
+            { value: "ads", label: "Ran paid ads" },
+          ],
+        },
+        answered: 0,
+        remaining: 2,
+        commands: [
+          "answer triedChannels social",
+          "answer triedChannels ads",
+          "answer triedChannels <value>,<value>",
+          "answer triedChannels",
+        ],
+      });
+
+      // The preview is ready from the first poll in this mock, so the claim
+      // handoff is being held by intake alone.
+      assert.equal(
+        requestsAt(api.requests, claimAttemptsPath).length,
+        0,
+        "no claim attempt may exist while questions are outstanding",
+      );
+      const heldProgress = parseOutputEvents(run.stdout).filter(
+        (event) => event.type === "progress",
+      );
+      for (const event of heldProgress) {
+        assert.equal(event.progress.claimReady, false);
+        assert.equal(event.progress.claimUrl, null);
+      }
+
+      await writeCommand(run, "answer triedChannels social");
+
+      const recorded = await nextEvent(
+        run,
+        (event) => event.type === "intake",
+        "first answer recorded",
+      );
+      assert.deepEqual(recorded, {
+        type: "intake",
+        message: "Answer recorded.",
+        state: "asking",
+        complete: false,
+        answered: 1,
+        remaining: 1,
+        answersConverged: true,
+      });
+
+      const secondTurn = await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "answer_intake",
+        "second intake question",
+      );
+      assert.deepEqual(secondTurn.question, {
+        field: "goal",
+        title: "What are you trying to grow?",
+        subtitle: "Pick the one that matters most right now.",
+        select: "single",
+        allowsFreeText: true,
+        options: [
+          { value: "installs", label: "More installs" },
+          { value: "other", label: "Something else" },
+        ],
+      });
+      assert.deepEqual(secondTurn.commands, [
+        "answer goal installs",
+        "answer goal other",
+        "answer goal other <your own words>",
+      ]);
+
+      // An answer line naming an option this question does not offer re-asks the
+      // same question and spends no request doing it.
+      const writesBeforeBadLine = requestsAt(api.requests, intakePath).filter(
+        (request) => request.method === "POST",
+      ).length;
+      await writeCommand(run, "answer goal bananas");
+      const reprompt = await nextEvent(
+        run,
+        (event) =>
+          event.type === "input_required" &&
+          event.operation === "answer_intake",
+        "re-prompt after an unusable answer line",
+      );
+      assert.deepEqual(reprompt, secondTurn);
+      assert.equal(
+        requestsAt(api.requests, intakePath).filter(
+          (request) => request.method === "POST",
+        ).length,
+        writesBeforeBadLine,
+      );
+
+      await writeCommand(run, "answer goal other selling more hats", true);
+
+      const completedIntake = await nextEvent(
+        run,
+        (event) => event.type === "intake" && event.state === "complete",
+        "intake completion",
+      );
+      assert.deepEqual(completedIntake, {
+        type: "intake",
+        message: "Every Layers setup question is answered.",
+        state: "complete",
+        complete: true,
+        answered: 2,
+        remaining: 0,
+        answersConverged: true,
+      });
+
+      // Only now may the attempt-bound claim URL appear.
+      const claimProgress = await nextEvent(
+        run,
+        (event) =>
+          event.type === "progress" && event.progress?.claimUrl !== null,
+        "claim handoff after the final answer",
+      );
+      assert.equal(claimProgress.progress.claimUrl, ATTEMPT_CLAIM_URL);
+
+      const completeEvent = await nextEvent(
+        run,
+        (event) => event.type === "complete",
+        "postclaim terminal result",
+      );
+      assert.deepEqual(completeEvent.intake, {
+        state: "complete",
+        complete: true,
+        answered: 2,
+        remaining: 0,
+        answersConverged: true,
+      });
+      assert.deepEqual(await withTimeout(run.exit, "launcher exit"), {
+        code: 0,
+        signal: null,
+      });
+      assert.deepEqual(api.unexpectedRequests, []);
+
+      const intakeWrites = requestsAt(api.requests, intakePath).filter(
+        (request) => request.method === "POST",
+      );
+      assert.equal(intakeWrites.length, 2, "one write per answered question");
+      assert.deepEqual(
+        intakeWrites.map((request) => JSON.parse(request.body)),
+        [
+          {
+            protocolVersion: 1,
+            answers: [{ field: "triedChannels", optionValues: ["social"] }],
+          },
+          {
+            protocolVersion: 1,
+            answers: [
+              {
+                field: "goal",
+                optionValues: ["other"],
+                text: "selling more hats",
+              },
+            ],
+          },
+        ],
+      );
+      for (const request of requestsAt(api.requests, intakePath)) {
+        assert.equal(
+          requestHeader(
+            request,
+            ONBOARD_AGENT_PUBLIC_HEADER_NAMES.reservationCapability,
+          ),
+          RESERVATION_CAPABILITY,
+        );
+      }
+      assert.equal(
+        `${run.stdout}\n${run.stderr}`.includes(RESERVATION_CAPABILITY),
+        false,
+        "intake must not disclose the reservation capability",
+      );
+    } finally {
+      run?.lines.close();
+      run?.child.stdin.destroy();
+      if (
+        run &&
+        run.child.exitCode === null &&
+        run.child.signalCode === null
+      ) {
+        run.child.kill();
+        await withTimeout(run.exit, "intake cleanup", 5_000).catch(() => {});
       }
       await api?.close();
       await rm(temporaryRoot, { recursive: true, force: true });
