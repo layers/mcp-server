@@ -2446,9 +2446,156 @@ test("late claim setup surfaces its safe URL before awaiting-claim completion", 
   );
 });
 
+/**
+ * A claim mock whose legs live a short, real term and are then swept, exactly
+ * as the server does at the 15-minute TTL.
+ *
+ * `exchangeResponder` decides what the exchange says while a leg is alive,
+ * which is the axis these tests vary: a leg the launcher can talk to, and a
+ * leg that is alive server-side but whose exchange the launcher cannot reach.
+ */
+function shortLivedLegMock({ legTtlMs, exchangeResponder }) {
+  const state = { attempts: 0, exchanges: 0, mintedAt: 0 };
+  const fetchImpl = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      state.attempts += 1;
+      state.mintedAt = Date.now();
+      return Response.json(
+        {
+          ...CLAIM_ATTEMPT_RESPONSE,
+          claimUrl: `${ATTEMPT_CLAIM_URL}&mint=${state.attempts}`,
+          expiresAt: new Date(state.mintedAt + legTtlMs).toISOString(),
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      state.exchanges += 1;
+      if (Date.now() >= state.mintedAt + legTtlMs) {
+        // Swept on schedule, which is what the server does at the TTL.
+        return Response.json({ error: "not found" }, { status: 404 });
+      }
+      return exchangeResponder(state);
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+  return { state, fetchImpl };
+}
+
+test(
+  "a leg that lives its full term is never counted as a dead leg",
+  { timeout: 180_000 },
+  async () => {
+    // TRIAL d960be37. Both legs ran their full 15-minute TTL with the human
+    // simply not clicking, and the launcher stopped at ~30 minutes claiming
+    // "Layers withdrew every claim link before it could be opened (2 in a
+    // row)" — wrong about the legs, and 23-and-a-half hours early.
+    const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    const { state, fetchImpl } = shortLivedLegMock({
+      legTtlMs: 1_000,
+      exchangeResponder: () =>
+        Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 }),
+    });
+    globalThis.fetch = fetchImpl;
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "full-term legs",
+        170_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    // RE-ARMS RUN TO THE MINT CAP, not to the dead-leg limit of two.
+    assert.equal(state.attempts, 8, "re-arming continued to the mint cap");
+    const stillOpen = events.filter(
+      (event) => event.type === "status" && event.stage === "claim_still_open",
+    );
+    assert.equal(stillOpen.length, 1);
+    assert.match(stillOpen[0].message, /re-minted 7 times without being opened/u);
+    assert.equal(
+      /withdrew every claim link/u.test(stillOpen[0].message),
+      false,
+      "a leg that lived its term must not be blamed on the server",
+    );
+  },
+);
+
+test(
+  "an unreachable exchange does not make a live leg look withdrawn",
+  { timeout: 180_000 },
+  async () => {
+    // THE MECHANISM BEHIND d960be37. `attemptEverLive` is set only by a parsed
+    // pending exchange, so an exchange endpoint that is retryably unavailable
+    // for a leg's whole lifetime left a perfectly live leg — the DB had it
+    // pending the entire time — looking like one that never answered. Whether
+    // the leg reached its own deadline is the fact that actually separates the
+    // two cases, and it is one this process observes directly.
+    const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    const { state, fetchImpl } = shortLivedLegMock({
+      legTtlMs: 1_000,
+      exchangeResponder: () =>
+        Response.json(
+          { error: "busy" },
+          { status: 503, headers: { "retry-after": "0" } },
+        ),
+    });
+    globalThis.fetch = fetchImpl;
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "unreachable exchange",
+        170_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.ok(state.exchanges >= 2, "the exchange was attempted");
+    assert.equal(state.attempts, 8, "re-arming continued to the mint cap");
+    const stillOpen = events.filter(
+      (event) => event.type === "status" && event.stage === "claim_still_open",
+    );
+    assert.equal(stillOpen.length, 1);
+    assert.equal(
+      /withdrew every claim link/u.test(stillOpen[0].message),
+      false,
+      "an unreachable exchange is not the server withdrawing the link",
+    );
+    assert.match(stillOpen[0].message, /re-minted 7 times without being opened/u);
+  },
+);
+
 test("a server refusing every claim link stops early and blames the server", async () => {
   // Re-arming exists so a slow human still gets a live link. A server that
   // refuses every leg must not turn that into an unbounded mint loop.
+  //
+  // STILL A DEAD LEG, and the contrast with the two tests above is the point:
+  // here every leg is withdrawn EARLY — swept before it reached its own
+  // deadline — which is the only thing `deadLegs` was ever meant to count.
   const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
   rememberLauncherReservation(reservationExpiresAt);
   const originalFetch = globalThis.fetch;

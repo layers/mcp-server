@@ -925,7 +925,10 @@ export async function waitForPreviewAndClaim(
    * timed out" and "the server withdrew your link" ask different things of the
    * person reading it.
    */
-  const retireAttempt = (cause: string): void => {
+  const retireAttempt = (
+    cause: string,
+    options: { expiredOnSchedule?: boolean } = {},
+  ): void => {
     claimSession?.dispose();
     claimSession = undefined;
     attemptDeadline = undefined;
@@ -933,8 +936,22 @@ export async function waitForPreviewAndClaim(
     retiredBecause = cause;
     retiredLegWasEmitted = attemptUrlEmitted;
     attemptUrlEmitted = false;
-    // A leg nobody could have used is the server's failure, not the human's.
-    deadLegs = attemptEverLive ? 0 : deadLegs + 1;
+    // A LEG THAT RAN ITS FULL TERM IS NOT A DEAD LEG, whatever else happened
+    // to it. `deadLegs` exists for links the server WITHDREW before anybody
+    // could use them; a link that lived its whole TTL and simply went
+    // unclicked is the ordinary case this wait is built to survive, and
+    // counting it as the server's failure is how a healthy 30-minute wait
+    // ended with "Layers withdrew every claim link" (trial d960be37).
+    //
+    // Liveness alone could not carry this, because `attemptEverLive` is set
+    // only by a parsed pending exchange: an exchange endpoint that is
+    // retryably unavailable for a leg's whole lifetime leaves a perfectly
+    // live leg looking like one that never answered. Whether the leg reached
+    // its own deadline is a fact this process observes directly, and it is
+    // the fact that actually distinguishes the two cases.
+    const withdrawnUnused =
+      options.expiredOnSchedule !== true && !attemptEverLive;
+    deadLegs = withdrawnUnused ? deadLegs + 1 : 0;
     attemptEverLive = false;
   };
   /**
@@ -1042,7 +1059,9 @@ export async function waitForPreviewAndClaim(
       // lazily expires the stale attempt when the next one is created, so a
       // fresh mint is all this takes.
       if (claimSession && attemptExpired() && progress.state !== "claimed") {
-        retireAttempt("it reached its expiry before anyone opened it");
+        retireAttempt("it reached its expiry before anyone opened it", {
+          expiredOnSchedule: true,
+        });
       }
 
       // BOTH conditions, or no claim attempt exists to surface. The attempt is
@@ -1255,7 +1274,9 @@ export async function waitForPreviewAndClaim(
           // Trusting only the clock leaves the skew case — the case this fix
           // exists for — still fatal.
           if (claimSession && attemptExpired()) {
-            retireAttempt("it reached its expiry before anyone opened it");
+            retireAttempt("it reached its expiry before anyone opened it", {
+              expiredOnSchedule: true,
+            });
             continue;
           }
           if (claimSession && exchangeGoneStatus(error)) {
