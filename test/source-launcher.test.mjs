@@ -2446,7 +2446,7 @@ test("late claim setup surfaces its safe URL before awaiting-claim completion", 
   );
 });
 
-test("re-arming is capped rather than unbounded", async () => {
+test("a server refusing every claim link stops early and blames the server", async () => {
   // Re-arming exists so a slow human still gets a live link. A server that
   // refuses every leg must not turn that into an unbounded mint loop.
   const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
@@ -2486,18 +2486,33 @@ test("re-arming is capped rather than unbounded", async () => {
         (event) => events.push(event),
       ),
       "capped re-arm",
-      60_000,
+      90_000,
     );
   } finally {
     globalThis.fetch = originalFetch;
   }
 
-  assert.equal(attempts, 8, "re-arming stopped at the cap");
+  // A leg that never completed one pending exchange was never usable by anybody,
+  // so this stops at the DEAD-LEG limit and blames the server, not the human.
+  assert.equal(attempts, 2, "a server refusing every leg stops early");
   const stillOpen = events.filter(
     (event) => event.type === "status" && event.stage === "claim_still_open",
   );
   assert.equal(stillOpen.length, 1);
-  assert.match(stillOpen[0].message, /re-minted 8 times without being opened/u);
+  assert.match(stillOpen[0].message, /withdrew every claim link/u);
+  assert.equal(
+    /without being opened/u.test(stillOpen[0].message),
+    false,
+    "a link nobody could open must not be reported as one nobody opened",
+  );
+  // And a link that was never live is not announced as "refreshed".
+  assert.equal(
+    events.some(
+      (event) =>
+        event.type === "status" && event.stage === "claim_link_refreshed",
+    ),
+    false,
+  );
   const terminal = events.filter((event) => event.type === "complete");
   assert.equal(terminal.length, 1);
   assert.equal(terminal[0].state, "awaiting_claim");
@@ -2862,7 +2877,13 @@ test("a non-retryable exchange failure on a dead leg re-arms instead of ending t
       if (attempts >= 2) {
         return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
       }
-      // 410 Gone: not retryable, and fatal in 1.3.0.
+      // The leg answers once (so it was demonstrably live), then the server
+      // sweeps it. A sweep believed only after the leg proved it existed is the
+      // narrowed signal: a 404 milliseconds after a mint is read-after-write
+      // lag, not a sweep.
+      if (exchanges === 1) {
+        return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+      }
       return Response.json({ error: "attempt expired" }, { status: 410 });
     }
     if (pathname.endsWith("/postclaim")) {
@@ -2934,6 +2955,9 @@ test("an exchange state this version does not know retires the leg", async () =>
         },
         { status: 200 },
       );
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
     }
     if (pathname.endsWith("/postclaim")) {
       return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
@@ -3160,16 +3184,192 @@ test("a progress projection with unknown fields and states does not brick the wa
   assert.equal(terminal.length, 1);
   assert.equal(terminal[0].state, "claimed");
 
-  // Unknown fields are RELAYED, not dropped: the agent reads grounded facts out
-  // of this event, including shapes this build has never heard of.
+  // TOLERANT TO READ, NOT TOLERANT TO ECHO. The unknown field must not fail the
+  // poll, and must not reach the transcript either.
   const progressEvents = events.filter((event) => event.type === "progress");
   assert.ok(progressEvents.length >= 1);
-  assert.deepEqual(progressEvents[0].progress.brandNewServerField, {
-    shape: "nobody here has seen",
-  });
+  for (const event of progressEvents) {
+    assert.equal(
+      "brandNewServerField" in event.progress,
+      false,
+      "an unreviewed server field must not be echoed to the agent",
+    );
+  }
+  // groundedPlayback ELEMENTS are the deliberate exception: the agent reads
+  // grounded facts out of them, so a future fact shape has to survive.
   assert.deepEqual(progressEvents[0].progress.groundedPlayback, [
     { fact: "layers_sdk_presence", value: "present", extra: "future" },
   ]);
+  // The fields the launcher does relay are still there.
+  assert.equal(typeof progressEvents[0].progress.stageLabel, "string");
+  assert.ok(Array.isArray(progressEvents[0].progress.completedMilestones));
+});
+
+test("a young 404 is retried on the same leg rather than believed as a sweep", async () => {
+  // READ-AFTER-WRITE LAG LOOKS EXACTLY LIKE A SWEEP. A 404 milliseconds after a
+  // mint is far more likely a lagging replica than the server withdrawing the
+  // attempt, so believing it would turn replica timing into a mint storm — and
+  // throwing on it would kill a perfectly good claim.
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let attempts = 0;
+  let exchanges = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      attempts += 1;
+      return Response.json(CLAIM_ATTEMPT_RESPONSE, { status: 202 });
+    }
+    if (pathname.endsWith("/exchange")) {
+      exchanges += 1;
+      // The lag clears on the second look.
+      if (exchanges === 1) {
+        return Response.json({ error: "not found" }, { status: 404 });
+      }
+      return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "young 404 retried",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(attempts, 1, "the leg was kept, not replaced");
+  assert.equal(exchanges, 2, "the same leg was asked again");
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal.length, 1);
+  assert.equal(terminal[0].state, "claimed");
+});
+
+test("a claim link that arrives already long expired stops with an honest reason", async () => {
+  // Under the skew tolerance this is two clocks disagreeing. Well over it, the
+  // server really is issuing dead links, and minting six more buys nothing but
+  // a worse diagnosis.
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let attempts = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      attempts += 1;
+      return Response.json(
+        { ...CLAIM_ATTEMPT_RESPONSE, expiresAt: "2000-01-01T00:00:00.000Z" },
+        { status: 202 },
+      );
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "born-dead claim link",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(attempts, 1, "one dead link is enough to conclude");
+  const stillOpen = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_still_open",
+  );
+  assert.equal(stillOpen.length, 1);
+  assert.match(stillOpen[0].message, /had already expired when it arrived/u);
+  assert.match(stillOpen[0].message, /more than clock differences explain/u);
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal[0].state, "awaiting_claim");
+});
+
+test("a 409 on claim setup waits for the old leg instead of ending the run", async () => {
+  // `claim-continuity.ts` answers 409 `active_attempt` while the previous
+  // attempt has not been swept — exactly what a local retire ahead of the
+  // server's clock produces. It is not retryable, and it used to kill the run.
+  const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+  rememberLauncherReservation(reservationExpiresAt);
+  const originalFetch = globalThis.fetch;
+  const events = [];
+  let setupCalls = 0;
+
+  globalThis.fetch = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      setupCalls += 1;
+      if (setupCalls === 1) {
+        return Response.json(
+          { error: "A claim attempt is already active for this trial." },
+          { status: 409 },
+        );
+      }
+      return Response.json(CLAIM_ATTEMPT_RESPONSE, { status: 202 });
+    }
+    if (pathname.endsWith("/exchange")) {
+      return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/postclaim")) {
+      return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+
+  try {
+    await withTimeout(
+      waitForPreviewAndClaim(
+        "https://api.layers.test",
+        new AbortController().signal,
+        reservationExpiresAt,
+        (event) => events.push(event),
+      ),
+      "409 on claim setup",
+      60_000,
+    );
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+
+  assert.equal(setupCalls, 2, "the setup was asked again after the 409");
+  const retrying = events.filter(
+    (event) => event.type === "status" && event.stage === "claim_setup_retrying",
+  );
+  assert.ok(retrying.length >= 1);
+  assert.match(retrying[0].message, /still holds the previous claim link open/u);
+  const terminal = events.filter((event) => event.type === "complete");
+  assert.equal(terminal[0].state, "claimed");
 });
 
 test("a terminal failure names the trial, the last state, and the server's code", async () => {

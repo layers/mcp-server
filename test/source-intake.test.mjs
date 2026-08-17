@@ -646,6 +646,74 @@ test("a refusal is shown only against the question it belongs to", async () => {
   );
 });
 
+test("a suppressed refusal is held until its own question comes back", async () => {
+  // The walk recomputes on every write, so a refused question can drop off the
+  // head and return later. Clearing the refusal the moment it was suppressed
+  // meant the person answered that question a second time with no idea why the
+  // first answer had not counted.
+  const answered = [];
+  let writes = 0;
+  // Answer-aware, like the route: a stub that re-serves answered questions
+  // makes the launcher's post-empty re-read look like new work.
+  const current = (rejected = []) =>
+    walkResponse(
+      [MULTI_QUESTION, GOAL_QUESTION].filter(
+        (question) => !answered.includes(question.field),
+      ),
+      [...answered],
+      rejected,
+    );
+  const harness = runnerHarness({
+    input: scriptedInput([
+      "answer triedChannels social",
+      "answer goal installs",
+      "answer triedChannels ads",
+    ]),
+    readWalk: async () => current(),
+    submitAnswer: async (answer) => {
+      writes += 1;
+      if (writes === 1) {
+        // triedChannels is refused and stays outstanding, but the walk hands
+        // back goal first — so the refusal cannot be shown on this turn.
+        return walkResponse([GOAL_QUESTION, MULTI_QUESTION], [], [
+          {
+            field: "triedChannels",
+            reason: "option_not_offered",
+            message: "That channel is not on the list.",
+            options: MULTI_QUESTION.options,
+          },
+        ]);
+      }
+      answered.push(answer.field);
+      return current();
+    },
+  });
+  await harness.runner.run();
+
+  const turns = turnsIn(harness.events);
+  const goalTurn = turns.find((turn) => turn.question.field === "goal");
+  assert.ok(goalTurn);
+  assert.equal(goalTurn.refusal, undefined, "not shown under the wrong question");
+
+  // The triedChannels turn that follows the goal turn is the one that must
+  // carry it.
+  const goalIndex = turns.indexOf(goalTurn);
+  const returning = turns
+    .slice(goalIndex + 1)
+    .find((turn) => turn.question.field === "triedChannels");
+  assert.ok(returning, "triedChannels came back around");
+  assert.deepEqual(
+    returning.refusal,
+    { field: "triedChannels", message: "That channel is not on the list." },
+    "the refusal survived until its own question was asked again",
+  );
+  // ...and is cleared once shown, so it cannot haunt a later turn.
+  const afterShown = turns.slice(turns.indexOf(returning) + 1);
+  for (const turn of afterShown) {
+    assert.equal(turn.refusal, undefined, "a shown refusal is not repeated");
+  }
+});
+
 test("a refusal that empties the walk settles skipped, never complete", async () => {
   // The refused answer was the last outstanding question, so `remaining` is now
   // empty. Settling `complete` there would report a walk as finished on an

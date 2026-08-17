@@ -64,13 +64,15 @@ const require = createRequire(import.meta.url);
  * `EXPECTED_BINARIES` entry leaves the launcher refusing artifacts it just
  * installed. `test/collector-host.test.mjs` is the gate: it re-derives all
  * eight from the installed packages.
+ *
+ * The 0.1.5 values below were measured from the published tarballs and
+ * cross-checked against each package's own `integrity.json` and against the
+ * contracts manifest the collectors were built from.
  */
 const COLLECTOR_PACKAGE_VERSION = "0.1.5";
 const CONTRACT_PACKAGE_NAME = "@layers/onboarding-contracts";
-// PENDING 0.1.5: measured from 0.1.4 and re-measured by `npm test` once the
-// 0.1.5 artifacts are installable.
 const CONTRACT_MANIFEST_SHA256 =
-  "5e58fd2e735e5fe396935e3967626af50935823abb04c3398a55168cb06cbb39";
+  "a8139e2110716f59a2d2f13719e3f0d0da11a65d36970531b2f306c7b3e89127";
 const COLLECTION_POLICY_SHA256 =
   "d35170d24c54f0dfad57cce99bfeaf69ca05d779c4e422a1fa5636680c2127b6";
 const JSON_METADATA_MAX_BYTES = 1024 * 1024;
@@ -89,38 +91,38 @@ const STAGE_PREFIX = "layers-onboarding-collector-";
 const SHA256_PATTERN = /^[0-9a-f]{64}$/;
 
 /**
- * PENDING 0.1.5. These are 0.1.4's measurements, kept until the 0.1.5 tarballs
- * exist to measure. Re-derive each pair from
- * `node_modules/@layers/onboarding-collector-<platform>-<arch>/integrity.json`
- * (`binaryBytes` / `binarySha256`) after `npm install`, and let
- * `test/collector-host.test.mjs` prove them.
+ * The exact bytes of each published 0.1.5 collector.
+ *
+ * Re-derive from the published tarballs (not just the locally installed one —
+ * only the current platform's package installs here) and cross-check each pair
+ * against that package's own `integrity.json` before changing them.
  */
 const EXPECTED_BINARIES: Readonly<
   Record<string, { readonly bytes: number; readonly sha256: string }>
 > = {
   "@layers/onboarding-collector-darwin-arm64": {
-    bytes: 5_736_546,
-    sha256: "33939b7aaa05012d048b9b14d8c929b1d9a458b45584fb52f17b8fa6b4b4f683",
+    bytes: 5_753_330,
+    sha256: "be8add935d55cc5c0aed6c198fd4aae8cff90e0bc9788d868686a066334e3d50",
   },
   "@layers/onboarding-collector-darwin-x64": {
-    bytes: 5_899_008,
-    sha256: "3380c2a54460da2d300699cda62a569be6a9b4eb5774e77c89a5ffe3297a7c20",
+    bytes: 5_907_456,
+    sha256: "1fb1ec90036966d8611552172538b3dc02663ac43a8d47fd51e1c82d3d895139",
   },
   "@layers/onboarding-collector-linux-arm64": {
-    bytes: 5_770_264,
-    sha256: "637076c72fa334bc5cd99e1f85a27857b4107b20890cbc37fb780dab33d675d8",
+    bytes: 5_771_488,
+    sha256: "e6a2d085e0b2c3cb3c33fb1e11302a09270bf2c3b35f01f9cfac85385df60b23",
   },
   "@layers/onboarding-collector-linux-x64": {
-    bytes: 5_951_212,
-    sha256: "dd6f241bed441fc53ff179b572e2c41bd42fcdb34782fc28f70f9548f78c4ea8",
+    bytes: 5_952_500,
+    sha256: "ed2bb914cdc6487ef752d2974e4cf826ed40b67d3075b3627b46a783d622e42d",
   },
   "@layers/onboarding-collector-win32-arm64": {
-    bytes: 5_969_408,
-    sha256: "d2b7510fa7b689e1d56addb66ddacaf5ea9c8c74f59a75a382e83205efa1c6be",
+    bytes: 5_974_016,
+    sha256: "d8511c7d08bfa6c6353fd16f8be03835bfaba91732d06ce168fae2d0f3d8be41",
   },
   "@layers/onboarding-collector-win32-x64": {
-    bytes: 6_259_712,
-    sha256: "5bd9f61c64fac262f381603b9795db10712657d7d219cbd6982fc8ceb4f2a49e",
+    bytes: 6_262_272,
+    sha256: "420d9e1030249a45438b2ee0715455cbff9ee319792c12f5b70a4e082d6a7fa7",
   },
 };
 
@@ -156,15 +158,46 @@ export type OnboardingCollectorSupportCode =
   | "ONBOARD_COLLECTOR_TIMEOUT"
   | "ONBOARD_COLLECTOR_FAILED";
 
+/**
+ * The command that actually resolves each fault, where one exists.
+ *
+ * A REMEDY IS A PROMISE. Handing back "re-run the onboard command" for every
+ * failure tells somebody on an unsupported CPU to run the thing that just told
+ * them their CPU is unsupported, and it tells somebody with a pruned optional
+ * dependency to re-run a command that will prune it again. Only codes with a
+ * real fix get one; the rest get none, and the caller says nothing rather than
+ * something untrue.
+ */
+const COLLECTOR_REMEDY_COMMANDS: Readonly<
+  Partial<Record<OnboardingCollectorSupportCode, string>>
+> = {
+  // The package was never installed, so install it. `npx` caches aggressively
+  // enough that a fresh cache is the reliable form.
+  ONBOARD_COLLECTOR_NOT_INSTALLED:
+    "npm install --include=optional @layers/mcp-server",
+  // A timeout is the one collector fault that a second run genuinely fixes.
+  ONBOARD_COLLECTOR_TIMEOUT: ONBOARDING_COLLECTOR_UPDATE_COMMAND,
+  // Nothing local fixes an unsupported platform, and nothing local fixes an
+  // integrity mismatch either — that one is deliberately not a "try again".
+};
+
 export class OnboardingCollectorHostError extends Error {
   readonly supportCode: OnboardingCollectorSupportCode;
+  /**
+   * Retained for callers that still read it, but no longer implies the command
+   * will help. `remedyCommand` is the one that does.
+   */
   readonly retryCommand: string;
+  /** The command that resolves THIS fault, when one exists. */
+  readonly remedyCommand?: string;
 
   constructor(supportCode: OnboardingCollectorSupportCode, message: string) {
     super(message);
     this.name = "OnboardingCollectorHostError";
     this.supportCode = supportCode;
     this.retryCommand = ONBOARDING_COLLECTOR_UPDATE_COMMAND;
+    const remedy = COLLECTOR_REMEDY_COMMANDS[supportCode];
+    if (remedy !== undefined) this.remedyCommand = remedy;
   }
 }
 
@@ -583,7 +616,13 @@ async function verifyContractArtifact(
   await verifyManifestInventory(manifest, contractDistRoot);
 }
 
-async function verifyCollectorInstallation(): Promise<VerifiedCollector> {
+async function verifyCollectorInstallation(
+  metadataOnly: false,
+): Promise<VerifiedCollector>;
+async function verifyCollectorInstallation(metadataOnly: true): Promise<null>;
+async function verifyCollectorInstallation(
+  metadataOnly = false,
+): Promise<VerifiedCollector | null> {
   const target = ONBOARDING_COLLECTOR_TARGETS.find(
     (candidate) =>
       candidate.platform === process.platform &&
@@ -656,6 +695,16 @@ async function verifyCollectorInstallation(): Promise<VerifiedCollector> {
       resolve(packageRoot, target.binaryPath),
       packageRoot,
     );
+    if (metadataOnly) {
+      // THE PRE-RESERVATION PASS STOPS HERE. It has already proved the package
+      // identity, the pinned version, the integrity manifest and the contract
+      // inventory — everything a wrong or pruned install gets caught by. What
+      // it deliberately skips is reading and hashing six megabytes of binary,
+      // because the open that follows a few seconds later has to do exactly
+      // that anyway and doing it twice per run buys no additional guarantee.
+      await verifyContractArtifact(integrity);
+      return null;
+    }
     const binary = await readRegularFile(binaryPath, expectedBinary.bytes);
     if (
       binary.byteLength !== expectedBinary.bytes ||
@@ -691,8 +740,7 @@ async function verifyCollectorInstallation(): Promise<VerifiedCollector> {
  * not hold a collector open.
  */
 export async function verifyOnboardingCollectorArtifacts(): Promise<void> {
-  const verified = await verifyCollectorInstallation();
-  verified.binary.fill(0);
+  await verifyCollectorInstallation(true);
 }
 
 async function stageCollector(
@@ -1711,7 +1759,7 @@ export async function openOnboardingCollector(
     options.deadlineAtMs ?? Number.POSITIVE_INFINITY,
   );
 
-  const verified = await verifyCollectorInstallation();
+  const verified = await verifyCollectorInstallation(false);
   let staged: StagedCollector | undefined;
   let listener: WindowsPrivateListener | undefined;
   let runtime: CollectorRuntime | undefined;

@@ -38,6 +38,10 @@ import {
   type IntakeSummary,
   type IntakeWalkGate,
 } from "./intake-walk.js";
+import {
+  emittedProgress,
+  type EmittedProgress,
+} from "./progress-contract.js";
 import { getReservation, redact } from "./session.js";
 import { startOnboarding } from "./tools.js";
 
@@ -87,13 +91,34 @@ const RETRY_AFTER_CEILING_MS = 300_000;
 const CLAIM_SETUP_ATTEMPT_LIMIT = 6;
 
 /**
- * How many times a claim link may be re-minted before the wait stops.
+ * How many claim links a wait may mint in total, including the first.
  *
  * Re-arming exists so a person who takes an hour still gets a live link. It is
  * not a licence to mint links forever: at some point the honest reading of
- * "nobody has clicked through eight links" is that nobody is coming.
+ * "nobody has opened any of these" is that nobody is coming. Eight mints is
+ * SEVEN re-mints, and the message says so.
  */
-const CLAIM_REARM_LIMIT = 8;
+const CLAIM_MINT_LIMIT = 8;
+
+/**
+ * How many links may be minted before concluding the SERVER is the problem.
+ *
+ * A leg that dies without ever completing one pending exchange was never usable
+ * by anybody, so burning the full budget on it produces a terminal message that
+ * blames a human who was never given a working link. Two is enough to tell a
+ * one-off from a pattern.
+ */
+const CLAIM_DEAD_LEG_LIMIT = 2;
+
+/**
+ * How far in the past a freshly minted attempt's expiry may sit before it is
+ * read as a real answer rather than as clock skew.
+ *
+ * Under this, treat it as the two machines disagreeing and use the local budget.
+ * Over it, the server is genuinely handing out dead links and saying so is more
+ * useful than re-minting seven more of them.
+ */
+const CLAIM_CLOCK_SKEW_TOLERANCE_MS = 60_000;
 
 /**
  * The server's own cap on one claim transport attempt.
@@ -161,7 +186,7 @@ type LauncherEvent =
     }
   | {
       type: "progress";
-      progress: Awaited<ReturnType<typeof readSourceProgress>>;
+      progress: EmittedProgress;
     }
   | {
       type: "complete";
@@ -796,6 +821,27 @@ export async function waitForPreviewAndClaim(
   let claimLinksMinted = 0;
   let lastHeartbeatAtMs = 0;
   let handoffStarted = false;
+  /** When the CURRENT attempt was minted, for age checks the clock can trust. */
+  let attemptMintedAtMs: number | undefined;
+  /**
+   * Whether the current leg has completed one pending exchange.
+   *
+   * A leg that never managed that was never usable by a person, so it must not
+   * be counted against them.
+   */
+  let attemptEverLive = false;
+  /** Consecutive legs that died without ever completing a pending exchange. */
+  let deadLegs = 0;
+  /** Why the last leg was retired, so the replacement can say what happened. */
+  let retiredBecause: string | undefined;
+  /**
+   * Whether the leg that was just retired had ever answered.
+   *
+   * Only a leg that was live is worth telling the human about: "discard the
+   * earlier link" is an instruction, and an instruction about a link they were
+   * never able to use is noise wearing an instruction's clothes.
+   */
+  let retiredLegWasLive = false;
   /**
    * Why the wait is stopping, when it stops for a reason other than the clock.
    * Prose, so the terminal status can say the true thing rather than one
@@ -844,15 +890,44 @@ export async function waitForPreviewAndClaim(
   /**
    * Retire the current attempt so the next pass mints a replacement.
    *
-   * Called both for an attempt that reached its expiry and for one the exchange
-   * can no longer talk to, because those are one fact arriving by two routes: a
-   * 404/409/410 on a swept attempt is the server saying what the clock implied.
+   * `cause` is carried into the replacement's announcement, because "your link
+   * timed out" and "the server withdrew your link" ask different things of the
+   * person reading it.
    */
-  const retireAttempt = (): void => {
+  const retireAttempt = (cause: string): void => {
     claimSession?.dispose();
     claimSession = undefined;
     attemptDeadline = undefined;
+    attemptMintedAtMs = undefined;
+    retiredBecause = cause;
+    retiredLegWasLive = attemptEverLive;
+    // A leg nobody could have used is the server's failure, not the human's.
+    deadLegs = attemptEverLive ? 0 : deadLegs + 1;
+    attemptEverLive = false;
   };
+  /**
+   * Whether a refused exchange means the server has swept this attempt.
+   *
+   * NARROWED, TWICE OVER. The exchange route answers 400 for a malformed
+   * request and 404 for an attempt it no longer holds — including one it swept
+   * for expiry — and nothing else; `apps/api/src/routes/onboard/agent/
+   * claim-continuity.ts` returns 409 only from the CREATE route, so treating a
+   * 409 here as "swept" was reasoning about a response this route cannot send.
+   * 410 is kept because it is the standard "gone" and costs nothing to honour.
+   *
+   * The AGE test is the second narrowing: a 404 milliseconds after a mint is
+   * more likely read-after-write lag than a sweep, and re-minting on it is how
+   * a lagging replica turns into a mint storm. One poll interval of age, or one
+   * completed pending exchange, is enough to believe the attempt really existed
+   * and really is gone.
+   */
+  const exchangeGoneStatus = (error: unknown): boolean =>
+    error instanceof SourceOnboardingError &&
+    (error.status === 404 || error.status === 410);
+  const sweepIsBelievable = (): boolean =>
+    attemptEverLive ||
+    (attemptMintedAtMs !== undefined &&
+      Date.now() - attemptMintedAtMs >= PROGRESS_POLL_MS);
   try {
     while (true) {
       if (signal.aborted) throw new Error("Onboarding interrupted");
@@ -862,8 +937,34 @@ export async function waitForPreviewAndClaim(
         progress = await readSourceProgress(baseUrl, signal);
       } catch (error) {
         if (error instanceof SourceOnboardingError && error.retryable) {
-          await delay(boundedRetryDelay(retryDelayMs(error)), signal);
+          // BEFORE THE HANDOFF THERE IS NO waitDeadline TO CLAMP AGAINST that
+          // means anything, and `boundedRetryDelay` can floor to 1ms once the
+          // budget is spent — which turns a retryable outage into a hot loop
+          // against a server already asking for room. Floor it at the poll
+          // cadence.
+          const requested = retryDelayMs(error);
+          const waitMs = handoffStarted
+            ? boundedRetryDelay(requested)
+            : Math.max(PROGRESS_POLL_MS, Math.min(requested, RETRY_AFTER_CEILING_MS));
+          await delay(waitMs, signal);
           if (finishAwaitingClaimIfExpired()) return;
+          // A wait that runs out before the preview is ready never reaches the
+          // claim handoff, so `finishAwaitingClaimIfExpired` cannot speak for
+          // it. Ending silently on a bare throw is how this looked like a crash.
+          if (!handoffStarted && Date.now() >= waitDeadline) {
+            emitEvent({
+              type: "error",
+              stage: "preflight",
+              code: "ONBOARD_PREVIEW_TIMEOUT",
+              retryable: true,
+              evidenceSubmitted: false,
+              message:
+                "Layers did not finish building the preview before this process ran out of time. The evidence was accepted and the trial is still on the server; nothing was lost by stopping here.",
+            });
+            throw new SourceOnboardingError(
+              "Layers preview did not become ready before the wait expired",
+            );
+          }
           continue;
         }
         throw error;
@@ -894,7 +995,7 @@ export async function waitForPreviewAndClaim(
       // lazily expires the stale attempt when the next one is created, so a
       // fresh mint is all this takes.
       if (claimSession && attemptExpired() && progress.state !== "claimed") {
-        retireAttempt();
+        retireAttempt("it reached its expiry before anyone opened it");
       }
 
       // BOTH conditions, or no claim attempt exists to surface. The attempt is
@@ -916,12 +1017,29 @@ export async function waitForPreviewAndClaim(
         // link is minted and published; the post-publish check below then ends
         // the wait immediately. Costing one request to avoid a dead end is the
         // trade this flow has always made.
-        if (claimLinksMinted >= CLAIM_REARM_LIMIT) {
-          // Eight unopened links is not a transport problem.
-          stopReason = `The claim link was re-minted ${CLAIM_REARM_LIMIT} times without being opened, so this process stopped re-minting it.`;
-          return finishAwaitingClaim() ? undefined : undefined;
+        if (deadLegs >= CLAIM_DEAD_LEG_LIMIT) {
+          // NOT THE HUMAN'S FAULT, so do not word it as though it were. Every
+          // link so far died before anyone could have used it.
+          stopReason = `Layers accepted the claim setup but withdrew every claim link before it could be opened (${deadLegs} in a row), so this process stopped asking for more.`;
+          finishAwaitingClaim();
+          return;
+        }
+        if (claimLinksMinted >= CLAIM_MINT_LIMIT) {
+          stopReason = `The claim link was re-minted ${CLAIM_MINT_LIMIT - 1} times without being opened, so this process stopped re-minting it.`;
+          finishAwaitingClaim();
+          return;
+        }
+        if (claimLinksMinted > 0) {
+          // BREATHE BETWEEN MINTS. The retire paths below `continue` straight
+          // back here, so without this a server refusing every leg burns the
+          // whole mint budget in a couple of seconds and reports a conclusion
+          // it has no evidence for.
+          await delay(boundedRetryDelay(PROGRESS_POLL_MS), signal);
+          if (signal.aborted) throw new Error("Onboarding interrupted");
+          if (finishAwaitingClaimIfExpired()) return;
         }
         let setupAttempts = 0;
+        try {
         claimSession = await createSourceClaimSession(
           baseUrl,
           signal,
@@ -944,6 +1062,29 @@ export async function waitForPreviewAndClaim(
             return Date.now() < waitDeadline;
           },
         );
+        } catch (error) {
+          // 409 ON CREATE MEANS THE OLD LEG IS STILL ALIVE SERVER-SIDE.
+          // `claim-continuity.ts` answers 409 `active_attempt` while the
+          // previous attempt has not been swept, which is exactly what a local
+          // retire ahead of the server's clock produces. It is not retryable
+          // and it used to kill the run; the honest response is to wait for the
+          // server to catch up and ask again.
+          if (
+            error instanceof SourceOnboardingError &&
+            error.status === 409 &&
+            Date.now() < waitDeadline
+          ) {
+            emitEvent({
+              type: "status",
+              stage: "claim_setup_retrying",
+              message:
+                "Layers still holds the previous claim link open; waiting for it to lapse before asking for a fresh one. Nothing is wrong and nothing needs restarting.",
+            });
+            await delay(boundedRetryDelay(PROGRESS_POLL_MS), signal);
+            continue;
+          }
+          throw error;
+        }
         // MINT-LOCAL TIME PLUS THE SERVER'S OWN TTL, floored against the
         // server's absolute timestamp. A machine whose clock runs behind the
         // server would otherwise read every fresh attempt as already expired
@@ -951,23 +1092,48 @@ export async function waitForPreviewAndClaim(
         // The local budget is the only one this process can actually measure.
         const mintedAtMs = Date.now();
         const attemptExpiresAt = Date.parse(claimSession.expiresAt);
+        // BORN DEAD, BEYOND ANY PLAUSIBLE SKEW. Under the tolerance this is two
+        // clocks disagreeing and the local budget is the right answer. Over it,
+        // the server really is issuing links that are already dead, and minting
+        // six more of them buys nothing but a worse diagnosis.
+        if (
+          Number.isFinite(attemptExpiresAt) &&
+          mintedAtMs - attemptExpiresAt > CLAIM_CLOCK_SKEW_TOLERANCE_MS &&
+          // NOT WHEN THE TRIAL IS ALREADY CLAIMED. Born-dead detection asks
+          // "can a person still open this link", which is a question about a
+          // link nobody needs once the claim has happened — this attempt exists
+          // only to redeem it and collect the post-claim projection.
+          progress.state !== "claimed"
+        ) {
+          claimLinksMinted += 1;
+          stopReason = `Layers issued a claim link that had already expired when it arrived (by ${Math.round((mintedAtMs - attemptExpiresAt) / 1000)}s), which is more than clock differences explain.`;
+          finishAwaitingClaim();
+          return;
+        }
         attemptDeadline = Number.isFinite(attemptExpiresAt)
           ? Math.min(
               mintedAtMs + CLAIM_ATTEMPT_TTL_MS,
               Math.max(attemptExpiresAt, mintedAtMs + PROGRESS_POLL_MS),
             )
           : mintedAtMs + CLAIM_ATTEMPT_TTL_MS;
+        attemptMintedAtMs = mintedAtMs;
         claimLinksMinted += 1;
-        // A REPLACED LINK MUST BE ANNOUNCED. The URL changes, so the agent's
-        // previously relayed link is now dead and re-sharing is not optional.
-        if (claimLinksMinted > 1) {
+        // A REPLACED LINK MUST BE ANNOUNCED — but only one that was ever live.
+        // Telling somebody to discard a link that never worked, when they were
+        // never given a working one, is noise dressed as an instruction.
+        if (
+          claimLinksMinted > 1 &&
+          retiredBecause !== undefined &&
+          retiredLegWasLive
+        ) {
           emitEvent({
             type: "status",
             stage: "claim_link_refreshed",
-            message:
-              "The previous browser claim link expired before it was opened. A fresh claim link rides on the next progress event; give the human that one and discard the earlier link.",
+            message: `The previous browser claim link is no longer usable: ${retiredBecause}. A fresh claim link rides on the next progress event; give the human that one and discard the earlier link.`,
           });
         }
+        retiredBecause = undefined;
+        retiredLegWasLive = false;
       }
 
       if (progress.state === "claimed" && !claimSession) {
@@ -981,11 +1147,14 @@ export async function waitForPreviewAndClaim(
       // this process's private PKCE transport capability.
       const safeClaimUrl =
         progress.claimReady && claimSession ? claimSession.claimUrl : null;
-      const safeProgress = {
-        ...progress,
+      // AN ALLOWLIST, NOT A SPREAD. The read above is deliberately loose so a
+      // new server field cannot fail a poll; echoing that same value would turn
+      // the tolerance into an unreviewed relay of arbitrary server content into
+      // an agent transcript.
+      const safeProgress = emittedProgress(progress, {
         claimReady: safeClaimUrl !== null,
         claimUrl: safeClaimUrl,
-      };
+      });
       const fingerprint = JSON.stringify(safeProgress);
       if (fingerprint !== previous) {
         emitEvent({ type: "progress", progress: safeProgress });
@@ -1012,19 +1181,28 @@ export async function waitForPreviewAndClaim(
             continue;
           }
           // A NON-RETRYABLE EXCHANGE FAILURE ON A DEAD LEG IS NOT A DEAD WAIT.
-          // Two ways to learn the leg is gone, and BOTH have to count: the
-          // local clock says so, or the server says so with a 404/409/410 on an
-          // attempt it already swept. Trusting only the clock is what leaves
-          // the skew case — the exact case this fix exists for — still fatal.
-          // Ending the run here is the same class of bug as ending it at the
-          // 15-minute cap: the transport leg failed, the claim did not.
-          const attemptGone =
-            error instanceof SourceOnboardingError &&
-            (error.status === 404 ||
-              error.status === 409 ||
-              error.status === 410);
-          if (claimSession && (attemptExpired() || attemptGone)) {
-            retireAttempt();
+          // Two ways to learn the leg is gone, and both count: the local clock
+          // says so, or the server says so on an attempt it already swept.
+          // Trusting only the clock leaves the skew case — the case this fix
+          // exists for — still fatal.
+          if (claimSession && attemptExpired()) {
+            retireAttempt("it reached its expiry before anyone opened it");
+            continue;
+          }
+          if (claimSession && exchangeGoneStatus(error)) {
+            if (sweepIsBelievable()) {
+              retireAttempt("Layers withdrew it before it was opened");
+              continue;
+            }
+            // TOO YOUNG TO BELIEVE, AND TOO YOUNG TO DIE FOR. The leg was
+            // minted moments ago and has never answered, so "gone" is more
+            // likely read-after-write lag than a sweep. Give it one poll
+            // interval and ask again: if it is genuinely swept the next pass
+            // says so with the age to back it up, and if it was lag the leg
+            // simply works. Throwing here would kill a claim over replica
+            // timing; re-minting here is how lag becomes a mint storm.
+            await delay(boundedRetryDelay(PROGRESS_POLL_MS), signal);
+            if (finishAwaitingClaimIfExpired()) return;
             continue;
           }
           throw error;
@@ -1045,6 +1223,10 @@ export async function waitForPreviewAndClaim(
         }
 
         if (exchange.state === "pending") {
+          // The leg answered. Whatever happens to it later, it existed and a
+          // person could have used it, so its death is not the server's fault.
+          attemptEverLive = true;
+          deadLegs = 0;
           const exchangeExpiresAt = Date.parse(exchange.expiresAt);
           if (Number.isFinite(exchangeExpiresAt)) {
             // The exchange's view of THIS attempt's expiry, which is the
@@ -1060,7 +1242,7 @@ export async function waitForPreviewAndClaim(
           // not success, and it is not `pending`, so its expiry is unreadable.
           // Retire the leg and mint a fresh one rather than ending a person's
           // claim over a word this build has never seen.
-          retireAttempt();
+          retireAttempt("Layers reported it in a state this version cannot use");
           continue;
         }
         if (finishAwaitingClaimIfExpired()) return;
@@ -1222,11 +1404,15 @@ async function withPreflightErrorEvent<T>(run: () => Promise<T>): Promise<T> {
       boundedRelayText(
         error instanceof Error ? error.message : String(error),
       ) ?? "Layers onboarding could not start.";
+    // ONLY WHERE IT IS TRUE. A remedy is a promise that running this fixes the
+    // thing; an unsupported platform has no such command, and offering the
+    // onboard command again to somebody whose CPU is unsupported is worse than
+    // offering nothing.
     const updateCommand =
       preflightError?.updateCommand ??
-      (collectorError === undefined
+      (collectorError?.remedyCommand === undefined
         ? undefined
-        : boundedRelayText(collectorError.retryCommand));
+        : boundedRelayText(collectorError.remedyCommand));
     emit({
       type: "error",
       stage: "preflight",

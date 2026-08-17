@@ -36,8 +36,16 @@ export const ProgressFailureSchema = z.object({
 });
 
 export const ProgressProjectionSchema = z.looseObject({
+  protocolVersion: z.number().optional(),
   trialHandle: z.string(),
   state: z.string(),
+  stageLabel: z.string().optional(),
+  completedMilestones: z.array(z.string()).optional(),
+  outstandingCorrections: z.array(z.unknown()).optional(),
+  publicSurfaceState: z.string().optional(),
+  publicSurfaceCandidates: z.array(z.unknown()).optional(),
+  publicPagesConfirmation: z.unknown().optional(),
+  updatedAt: z.string().optional(),
   previewReady: z.boolean(),
   previewUrl: z.string().nullish(),
   claimReady: z.boolean(),
@@ -59,3 +67,64 @@ export const ProgressProjectionSchema = z.looseObject({
 });
 
 export type ProgressProjection = z.infer<typeof ProgressProjectionSchema>;
+
+/**
+ * What a `progress` event is allowed to say.
+ *
+ * TOLERANT TO READ IS NOT TOLERANT TO ECHO. The loose parse above exists so a
+ * field added server-side cannot fail a poll mid-claim. Spreading that parsed
+ * value into the emitted event turned the same tolerance into a relay: every
+ * unknown key the server ever adds would land, unreviewed, in an LLM transcript
+ * the operator of this process never sees coming. Those are different
+ * decisions and they now have different code.
+ *
+ * The allowlist is the fields this launcher has actually reasoned about. A new
+ * server field reaches an agent only once somebody adds it here on purpose.
+ *
+ * `groundedPlayback` ELEMENTS are the deliberate exception: the agent reads
+ * `layers_sdk_presence` and `layers_sdk_platform` out of them, and a fact shape
+ * this build has not seen is exactly the thing that must survive. The array is
+ * relayed whole; the risk is bounded because the server authors these facts for
+ * the agent to read.
+ */
+export interface EmittedProgress {
+  readonly trialHandle: string;
+  readonly state: string;
+  readonly previewReady: boolean;
+  readonly previewUrl: string | null;
+  readonly claimReady: boolean;
+  readonly claimUrl: string | null;
+  readonly failure: unknown;
+  readonly [key: string]: unknown;
+}
+
+export function emittedProgress(
+  projection: ProgressProjection,
+  overrides: { claimReady: boolean; claimUrl: string | null },
+): EmittedProgress {
+  const emitted: Record<string, unknown> = {
+    trialHandle: projection.trialHandle,
+    state: projection.state,
+    previewReady: projection.previewReady,
+    previewUrl: projection.previewUrl ?? null,
+    claimReady: overrides.claimReady,
+    claimUrl: overrides.claimUrl,
+    failure: projection.failure ?? null,
+  };
+  const optional: ReadonlyArray<keyof ProgressProjection> = [
+    "protocolVersion",
+    "stageLabel",
+    "completedMilestones",
+    "outstandingCorrections",
+    "publicSurfaceState",
+    "publicSurfaceCandidates",
+    "publicPagesConfirmation",
+    "groundedPlayback",
+    "updatedAt",
+  ];
+  for (const key of optional) {
+    const value = projection[key];
+    if (value !== undefined) emitted[key] = value;
+  }
+  return emitted as unknown as EmittedProgress;
+}

@@ -50,10 +50,11 @@ hand somebody a launcher the server has not been told about yet, which fails wit
 "requires an update" for a version that is newer than the one being demanded. So
 the paste stays pinned and moves when the server's advertised version moves.
 
-Examples further down that are about mechanics rather than the paste itself —
-the FIFO recipe, the compatibility URL form — use `@latest`, because they
-illustrate a shape rather than hand somebody a command to run against a live
-cutover.
+The same pin applies to the Claude Code recipe below, which is the paste's own
+command with a FIFO wired to its stdin — a recipe that drifted to `@latest`
+would quietly contradict the sentence it implements. The legacy public-URL form
+further down stays on `@latest`: it predates the capability manifest and is not
+part of the pinned flow.
 
 The command checks server compatibility before reading the workspace, runs the
 checksum-verified native collector locally, shows the exact bounded source-data
@@ -151,7 +152,7 @@ those do not give Claude a controllable task handle.
 
    ```sh
    exec 3<>"/absolute/layers-onboard.ABC123/input"
-   npx --yes @layers/mcp-server@latest onboard <&3
+   npx --yes @layers/mcp-server@1.3.1 onboard <&3
    ```
 
    The shell command itself stays in the foreground of the background task.

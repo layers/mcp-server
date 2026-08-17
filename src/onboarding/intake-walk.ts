@@ -501,11 +501,18 @@ export function createIntakeWalkRunner(options: {
           // walk on every write, so the head of the list can change under a
           // pending refusal; showing it anyway would tell the person a fresh
           // question had rejected an answer they never gave to it.
-          ...(refusal === undefined || refusal.field !== question.field
-            ? {}
-            : { refusal }),
+          ...(refusal !== undefined && refusal.field === question.field
+            ? { refusal }
+            : {}),
         });
-        refusal = undefined;
+        // HELD, NOT DROPPED. Clearing it unconditionally meant a refusal that
+        // was suppressed because the walk had moved on was gone by the time its
+        // own question came back around — so the person answered it a second
+        // time with no idea why the first answer had not counted. It is cleared
+        // only once it has actually been shown against its own question.
+        if (refusal !== undefined && refusal.field === question.field) {
+          refusal = undefined;
+        }
 
         // A closed pipe is the same fact as an unanswered question: nobody is
         // going to answer this one, and the claim gate must not wait for them.
