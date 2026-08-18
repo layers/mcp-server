@@ -76,6 +76,33 @@ const CLAIM_WAIT_MS = 24 * 60 * 60_000;
 const CLAIM_HEARTBEAT_MS = 5 * 60_000;
 
 /**
+ * How often the claim EXCHANGE is polled, as distinct from progress.
+ *
+ * MUST STAY UNDER THE SERVER'S PER-ATTEMPT BUDGET ON
+ * `/claim-attempts/:attemptHandle/exchange`, which is rate limited per attempt
+ * and fails CLOSED. As of 2026-08-17 that budget is 12 requests/minute and 180
+ * per day; a raise to 30/minute and 600/day is in flight.
+ *
+ * THE OLD CADENCE SAT EXACTLY ON THE LIMIT. Polling the exchange once per
+ * `PROGRESS_POLL_MS` is 12 requests a minute against an rpm of 12, and 180
+ * requests across a 15-minute attempt against a daily cap of 180 — zero
+ * headroom on both, so a run 429ed persistently. Those 429s are retryable, so
+ * the wait quietly looped on them and never saw a pending exchange, which is
+ * how a healthy 30-minute wait ended up reporting that Layers had withdrawn
+ * every claim link (trial d960be37).
+ *
+ * 15 seconds is 4 requests a minute and 60 across a full attempt: a third of
+ * the current budget, a tenth of the daily one, and it stays comfortable if the
+ * server budget is ever tightened again rather than raised. The cost is up to
+ * one extra interval of latency between a person clicking and this process
+ * noticing, which is invisible next to the browser round trip they just made.
+ *
+ * Progress polling is deliberately NOT slowed: it is a different route with its
+ * own budget, and it drives the attempt-expiry and preview checks.
+ */
+const CLAIM_EXCHANGE_POLL_MS = 15_000;
+
+/**
  * The longest a server-requested backoff may actually hold this process.
  *
  * `Retry-After` was being clamped to 10 seconds, which is not honouring it —
@@ -856,6 +883,15 @@ export async function waitForPreviewAndClaim(
   let activeAttemptWaitSinceMs: number | undefined;
   /** Throttle for the claim-setup notice, so it cannot become a flood. */
   let lastSetupNoticeAtMs = 0;
+  /**
+   * When the current leg was last exchanged.
+   *
+   * Zero means "exchange on the next pass", which is what a freshly minted leg
+   * wants: the first exchange is what proves the leg live and what catches a
+   * person who clicks immediately, so it runs at once and the interval applies
+   * only to the polling that follows.
+   */
+  let lastExchangeAtMs = 0;
   /** Why the last leg was retired, so the replacement can say what happened. */
   let retiredBecause: string | undefined;
   /**
@@ -925,7 +961,56 @@ export async function waitForPreviewAndClaim(
    * timed out" and "the server withdrew your link" ask different things of the
    * person reading it.
    */
-  const retireAttempt = (cause: string): void => {
+  /**
+   * The terminal success, in one place.
+   *
+   * Two paths can now redeem a claim — the ordinary poll and the last-gasp
+   * exchange below — and a claimed workspace reported two slightly different
+   * ways is a bug waiting for whichever one gets edited alone.
+   */
+  const emitClaimed = (postclaim: OnboardAgentPostclaimResponse): void => {
+    if (!latestPreviewUrl) {
+      throw new Error("Claimed workspace is missing its preview URL");
+    }
+    emitEvent({
+      type: "complete",
+      previewUrl: latestPreviewUrl,
+      state: "claimed",
+      postclaim,
+      intake: intakeSummary(),
+    });
+  };
+  /**
+   * One last exchange before an expiring leg is let go.
+   *
+   * THE CADENCE OPENED A WINDOW THE OLD CODE DID NOT HAVE. Polling the exchange
+   * once per progress tick meant an expiring leg had been asked at most five
+   * seconds ago; at fifteen it can be three times that. A person who clicks in
+   * that gap authorizes the attempt server-side, and retiring on the clock
+   * would dispose the only transport session able to redeem it — the claim
+   * completes for them in the browser and this process throws the receipt away.
+   *
+   * So the clock never gets the last word: the leg is asked once more, outside
+   * the cadence gate, and only retired if that answer is not a claim. A failure
+   * here is not fatal — the leg is expiring regardless, and the wait re-arms.
+   */
+  const finalExchangeRedeemed = async (): Promise<boolean> => {
+    if (!claimSession) return false;
+    lastExchangeAtMs = Date.now();
+    try {
+      const exchange = await claimSession.exchange(signal);
+      if (exchange.state !== "claimed") return false;
+      emitClaimed(exchange.postclaim);
+      return true;
+    } catch {
+      // An expiring leg that cannot be reached is simply an expiring leg.
+      return false;
+    }
+  };
+  const retireAttempt = (
+    cause: string,
+    options: { expiredOnSchedule?: boolean } = {},
+  ): void => {
     claimSession?.dispose();
     claimSession = undefined;
     attemptDeadline = undefined;
@@ -933,8 +1018,23 @@ export async function waitForPreviewAndClaim(
     retiredBecause = cause;
     retiredLegWasEmitted = attemptUrlEmitted;
     attemptUrlEmitted = false;
-    // A leg nobody could have used is the server's failure, not the human's.
-    deadLegs = attemptEverLive ? 0 : deadLegs + 1;
+    lastExchangeAtMs = 0;
+    // A LEG THAT RAN ITS FULL TERM IS NOT A DEAD LEG, whatever else happened
+    // to it. `deadLegs` exists for links the server WITHDREW before anybody
+    // could use them; a link that lived its whole TTL and simply went
+    // unclicked is the ordinary case this wait is built to survive, and
+    // counting it as the server's failure is how a healthy 30-minute wait
+    // ended with "Layers withdrew every claim link" (trial d960be37).
+    //
+    // Liveness alone could not carry this, because `attemptEverLive` is set
+    // only by a parsed pending exchange: an exchange endpoint that is
+    // retryably unavailable for a leg's whole lifetime leaves a perfectly
+    // live leg looking like one that never answered. Whether the leg reached
+    // its own deadline is a fact this process observes directly, and it is
+    // the fact that actually distinguishes the two cases.
+    const withdrawnUnused =
+      options.expiredOnSchedule !== true && !attemptEverLive;
+    deadLegs = withdrawnUnused ? deadLegs + 1 : 0;
     attemptEverLive = false;
   };
   /**
@@ -1036,13 +1136,17 @@ export async function waitForPreviewAndClaim(
       }
       if (progress.previewUrl) latestPreviewUrl = progress.previewUrl;
 
-      // RETIRE AN EXPIRED TRANSPORT ATTEMPT, KEEP THE WAIT. The exchange below
-      // already had the last word on this attempt in the previous iteration, so
-      // reaching here with it expired means nobody clicked in time. The server
-      // lazily expires the stale attempt when the next one is created, so a
-      // fresh mint is all this takes.
+      // RETIRE AN EXPIRED TRANSPORT ATTEMPT, KEEP THE WAIT — but only after
+      // asking it one final time. The exchange runs on its own slower cadence,
+      // so "expired" here does NOT mean it was asked a moment ago, and a click
+      // that landed in the gap is a real claim this process would otherwise
+      // discard. The server lazily expires the stale attempt when the next one
+      // is created, so a fresh mint is all the retire itself takes.
       if (claimSession && attemptExpired() && progress.state !== "claimed") {
-        retireAttempt("it reached its expiry before anyone opened it");
+        if (await finalExchangeRedeemed()) return;
+        retireAttempt("it reached its expiry before anyone opened it", {
+          expiredOnSchedule: true,
+        });
       }
 
       // BOTH conditions, or no claim attempt exists to surface. The attempt is
@@ -1238,7 +1342,20 @@ export async function waitForPreviewAndClaim(
         return;
       }
 
-      if (claimSession) {
+      // PACED SEPARATELY FROM THE PROGRESS POLL. Running the exchange once per
+      // loop tied it to `PROGRESS_POLL_MS` and put it exactly on the server's
+      // per-attempt rate limit; it now runs on its own, slower interval while
+      // progress keeps its cadence.
+      if (
+        claimSession &&
+        // A trial the server already reports as claimed is redeemed at once
+        // rather than after the interval: the cadence exists to spare the rate
+        // limit while nothing is happening, not to delay the one event this
+        // whole wait is for.
+        (progress.state === "claimed" ||
+          Date.now() - lastExchangeAtMs >= CLAIM_EXCHANGE_POLL_MS)
+      ) {
+        lastExchangeAtMs = Date.now();
         let exchange: Awaited<ReturnType<SourceClaimSession["exchange"]>>;
         try {
           exchange = await claimSession.exchange(signal);
@@ -1255,7 +1372,9 @@ export async function waitForPreviewAndClaim(
           // Trusting only the clock leaves the skew case — the case this fix
           // exists for — still fatal.
           if (claimSession && attemptExpired()) {
-            retireAttempt("it reached its expiry before anyone opened it");
+            retireAttempt("it reached its expiry before anyone opened it", {
+              expiredOnSchedule: true,
+            });
             continue;
           }
           if (claimSession && exchangeGoneStatus(error)) {
@@ -1278,16 +1397,7 @@ export async function waitForPreviewAndClaim(
         }
 
         if (exchange.state === "claimed") {
-          if (!latestPreviewUrl) {
-            throw new Error("Claimed workspace is missing its preview URL");
-          }
-          emitEvent({
-            type: "complete",
-            previewUrl: latestPreviewUrl,
-            state: "claimed",
-            postclaim: exchange.postclaim,
-            intake: intakeSummary(),
-          });
+          emitClaimed(exchange.postclaim);
           return;
         }
 

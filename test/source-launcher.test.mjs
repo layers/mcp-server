@@ -1047,7 +1047,17 @@ test(
         TRIAL_HANDLE,
       );
       const progressRequests = requestsAt(api.requests, progressPath);
-      assert.equal(progressRequests.length, 2);
+      // NOT PINNED TO AN EXACT COUNT. Progress polls every PROGRESS_POLL_MS
+      // while the claim exchange runs on its own, slower interval, so how many
+      // progress reads land before the claim is a function of that gap and of
+      // how fast the runner gets through the collector — a timing coincidence,
+      // not an invariant. The range still catches a launcher that stopped
+      // polling or started hammering; what this block actually pins is the
+      // capability on every read, below.
+      assert.ok(
+        progressRequests.length >= 2 && progressRequests.length <= 12,
+        `unexpected progress poll count: ${progressRequests.length}`,
+      );
       for (const request of progressRequests) {
         const progressHeaders = OnboardAgentProgressHeadersSchema.parse({
           reservationCapability: requestHeader(
@@ -2446,9 +2456,328 @@ test("late claim setup surfaces its safe URL before awaiting-claim completion", 
   );
 });
 
+/**
+ * A claim mock whose legs live a short, real term and are then swept, exactly
+ * as the server does at the 15-minute TTL.
+ *
+ * `exchangeResponder` decides what the exchange says while a leg is alive,
+ * which is the axis these tests vary: a leg the launcher can talk to, and a
+ * leg that is alive server-side but whose exchange the launcher cannot reach.
+ */
+function shortLivedLegMock({ legTtlMs, exchangeResponder }) {
+  const state = { attempts: 0, exchanges: 0, mintedAt: 0 };
+  const fetchImpl = async (input) => {
+    const pathname = new URL(String(input)).pathname;
+    if (pathname.endsWith("/progress")) {
+      return Response.json(PROGRESS_RESPONSE, { status: 200 });
+    }
+    if (pathname.endsWith("/claim-attempts")) {
+      state.attempts += 1;
+      state.mintedAt = Date.now();
+      return Response.json(
+        {
+          ...CLAIM_ATTEMPT_RESPONSE,
+          claimUrl: `${ATTEMPT_CLAIM_URL}&mint=${state.attempts}`,
+          expiresAt: new Date(state.mintedAt + legTtlMs).toISOString(),
+        },
+        { status: 202 },
+      );
+    }
+    if (pathname.endsWith("/exchange")) {
+      state.exchanges += 1;
+      if (Date.now() >= state.mintedAt + legTtlMs) {
+        // Swept on schedule, which is what the server does at the TTL.
+        return Response.json({ error: "not found" }, { status: 404 });
+      }
+      return exchangeResponder(state);
+    }
+    throw new Error(`unexpected request: ${pathname}`);
+  };
+  return { state, fetchImpl };
+}
+
+test(
+  "a leg that lives its full term is never counted as a dead leg",
+  { timeout: 180_000 },
+  async () => {
+    // TRIAL d960be37. Both legs ran their full 15-minute TTL with the human
+    // simply not clicking, and the launcher stopped at ~30 minutes claiming
+    // "Layers withdrew every claim link before it could be opened (2 in a
+    // row)" — wrong about the legs, and 23-and-a-half hours early.
+    const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    const { state, fetchImpl } = shortLivedLegMock({
+      legTtlMs: 1_000,
+      exchangeResponder: () =>
+        Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 }),
+    });
+    globalThis.fetch = fetchImpl;
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "full-term legs",
+        170_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    // RE-ARMS RUN TO THE MINT CAP, not to the dead-leg limit of two.
+    assert.equal(state.attempts, 8, "re-arming continued to the mint cap");
+    const stillOpen = events.filter(
+      (event) => event.type === "status" && event.stage === "claim_still_open",
+    );
+    assert.equal(stillOpen.length, 1);
+    assert.match(stillOpen[0].message, /re-minted 7 times without being opened/u);
+    assert.equal(
+      /withdrew every claim link/u.test(stillOpen[0].message),
+      false,
+      "a leg that lived its term must not be blamed on the server",
+    );
+  },
+);
+
+test(
+  "an unreachable exchange does not make a live leg look withdrawn",
+  { timeout: 180_000 },
+  async () => {
+    // THE MECHANISM BEHIND d960be37. `attemptEverLive` is set only by a parsed
+    // pending exchange, so an exchange endpoint that is retryably unavailable
+    // for a leg's whole lifetime left a perfectly live leg — the DB had it
+    // pending the entire time — looking like one that never answered. Whether
+    // the leg reached its own deadline is the fact that actually separates the
+    // two cases, and it is one this process observes directly.
+    const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    const { state, fetchImpl } = shortLivedLegMock({
+      legTtlMs: 1_000,
+      exchangeResponder: () =>
+        Response.json(
+          { error: "busy" },
+          { status: 503, headers: { "retry-after": "0" } },
+        ),
+    });
+    globalThis.fetch = fetchImpl;
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "unreachable exchange",
+        170_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.ok(state.exchanges >= 2, "the exchange was attempted");
+    assert.equal(state.attempts, 8, "re-arming continued to the mint cap");
+    const stillOpen = events.filter(
+      (event) => event.type === "status" && event.stage === "claim_still_open",
+    );
+    assert.equal(stillOpen.length, 1);
+    assert.equal(
+      /withdrew every claim link/u.test(stillOpen[0].message),
+      false,
+      "an unreachable exchange is not the server withdrawing the link",
+    );
+    assert.match(stillOpen[0].message, /re-minted 7 times without being opened/u);
+  },
+);
+
+test(
+  "the claim exchange is polled far slower than progress",
+  { timeout: 120_000 },
+  async () => {
+    // THE OUTAGE THIS PREVENTS. The exchange route is rate limited PER ATTEMPT
+    // and fails closed: 12 requests/minute and 180/day as of 2026-08-17.
+    // Polling it once per progress tick is exactly 12/minute and exactly 180
+    // across a 15-minute attempt — zero headroom on both — so runs 429ed
+    // persistently. Those 429s are retryable, so the wait looped on them and
+    // never saw a pending exchange, which is how trial d960be37 reported that
+    // Layers had withdrawn every claim link.
+    //
+    // Pinning the RATE rather than the constant: a future edit that ties the
+    // exchange back to the progress cadence fails here, whatever it renames.
+    const reservationExpiresAt = new Date(Date.now() + 20_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    const exchangeAt = [];
+    const progressAt = [];
+
+    globalThis.fetch = async (input) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname.endsWith("/progress")) {
+        progressAt.push(Date.now());
+        return Response.json(PROGRESS_RESPONSE, { status: 200 });
+      }
+      if (pathname.endsWith("/claim-attempts")) {
+        return Response.json(CLAIM_ATTEMPT_RESPONSE, { status: 202 });
+      }
+      if (pathname.endsWith("/exchange")) {
+        exchangeAt.push(Date.now());
+        return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "exchange cadence",
+        110_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    assert.ok(
+      exchangeAt.length >= 2,
+      `expected repeated exchanges, saw ${exchangeAt.length}`,
+    );
+    // 15s nominal; 14s of slack absorbs a slow runner without admitting the
+    // 5s cadence that caused the outage.
+    const gap = exchangeAt[1] - exchangeAt[0];
+    assert.ok(
+      gap >= 14_000,
+      `exchange polled every ${gap}ms, which is inside the server's budget`,
+    );
+    // Four a minute against an rpm of 12, and 60 across a 15-minute attempt
+    // against a daily cap of 180.
+    assert.ok(60_000 / gap <= 5, "exchange rate must stay well under rpm 12");
+
+    // DECOUPLED, not merely slowed: progress keeps its own faster cadence,
+    // which is what drives attempt expiry and the preview checks.
+    assert.ok(
+      progressAt.length > exchangeAt.length,
+      `progress (${progressAt.length}) must poll more often than the exchange (${exchangeAt.length})`,
+    );
+  },
+);
+
+test(
+  "a click that lands after the last exchange is still redeemed at expiry",
+  { timeout: 120_000 },
+  async () => {
+    // THE WINDOW THE 15s CADENCE OPENED. An expiring leg used to have been
+    // asked at most one progress tick ago; now it can be three times that. A
+    // person clicking in the gap authorizes the attempt server-side, and
+    // retiring on the clock alone would dispose the only transport session
+    // able to redeem it — the claim succeeds in their browser and this process
+    // throws the receipt away.
+    const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    let attempts = 0;
+    let exchanges = 0;
+    let mintedAt = 0;
+    // Short enough to expire between exchanges, so the leg reaches its deadline
+    // with its last answer already behind it.
+    const legTtlMs = 6_000;
+    let clickedAt = 0;
+
+    globalThis.fetch = async (input) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname.endsWith("/progress")) {
+        // Progress never reports the claim, so nothing but the final exchange
+        // can rescue it.
+        return Response.json(PROGRESS_RESPONSE, { status: 200 });
+      }
+      if (pathname.endsWith("/claim-attempts")) {
+        attempts += 1;
+        mintedAt = Date.now();
+        // The human clicks late in this leg's life, after its last scheduled
+        // exchange and before its deadline.
+        clickedAt = mintedAt + legTtlMs - 1_000;
+        return Response.json(
+          {
+            ...CLAIM_ATTEMPT_RESPONSE,
+            expiresAt: new Date(mintedAt + legTtlMs).toISOString(),
+          },
+          { status: 202 },
+        );
+      }
+      if (pathname.endsWith("/exchange")) {
+        exchanges += 1;
+        if (Date.now() >= clickedAt) {
+          return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+        }
+        return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+      }
+      if (pathname.endsWith("/postclaim")) {
+        return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "last-gasp redemption",
+        110_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    // Redeemed on the leg that was clicked, not abandoned and re-minted.
+    assert.equal(attempts, 1, "the clicked leg was not thrown away");
+    const terminal = events.filter((event) => event.type === "complete");
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0].state, "claimed");
+    assert.deepEqual(terminal[0].postclaim, POSTCLAIM_RESPONSE);
+    // It really did come from the extra exchange at expiry, not a scheduled one.
+    assert.ok(
+      exchanges >= 2,
+      `expected a final exchange after the scheduled one, saw ${exchanges}`,
+    );
+    // And nothing told the human their link had lapsed.
+    assert.equal(
+      events.some(
+        (event) =>
+          event.type === "status" &&
+          (event.stage === "claim_link_refreshed" ||
+            event.stage === "claim_still_open"),
+      ),
+      false,
+      "a redeemed claim must not report the link as lapsed",
+    );
+  },
+);
+
 test("a server refusing every claim link stops early and blames the server", async () => {
   // Re-arming exists so a slow human still gets a live link. A server that
   // refuses every leg must not turn that into an unbounded mint loop.
+  //
+  // STILL A DEAD LEG, and the contrast with the two tests above is the point:
+  // here every leg is withdrawn EARLY — swept before it reached its own
+  // deadline — which is the only thing `deadLegs` was ever meant to count.
   const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
   rememberLauncherReservation(reservationExpiresAt);
   const originalFetch = globalThis.fetch;
