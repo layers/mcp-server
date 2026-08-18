@@ -2675,6 +2675,102 @@ test(
   },
 );
 
+test(
+  "a click that lands after the last exchange is still redeemed at expiry",
+  { timeout: 120_000 },
+  async () => {
+    // THE WINDOW THE 15s CADENCE OPENED. An expiring leg used to have been
+    // asked at most one progress tick ago; now it can be three times that. A
+    // person clicking in the gap authorizes the attempt server-side, and
+    // retiring on the clock alone would dispose the only transport session
+    // able to redeem it — the claim succeeds in their browser and this process
+    // throws the receipt away.
+    const reservationExpiresAt = new Date(Date.now() + 60 * 60_000).toISOString();
+    rememberLauncherReservation(reservationExpiresAt);
+    const originalFetch = globalThis.fetch;
+    const events = [];
+    let attempts = 0;
+    let exchanges = 0;
+    let mintedAt = 0;
+    // Short enough to expire between exchanges, so the leg reaches its deadline
+    // with its last answer already behind it.
+    const legTtlMs = 6_000;
+    let clickedAt = 0;
+
+    globalThis.fetch = async (input) => {
+      const pathname = new URL(String(input)).pathname;
+      if (pathname.endsWith("/progress")) {
+        // Progress never reports the claim, so nothing but the final exchange
+        // can rescue it.
+        return Response.json(PROGRESS_RESPONSE, { status: 200 });
+      }
+      if (pathname.endsWith("/claim-attempts")) {
+        attempts += 1;
+        mintedAt = Date.now();
+        // The human clicks late in this leg's life, after its last scheduled
+        // exchange and before its deadline.
+        clickedAt = mintedAt + legTtlMs - 1_000;
+        return Response.json(
+          {
+            ...CLAIM_ATTEMPT_RESPONSE,
+            expiresAt: new Date(mintedAt + legTtlMs).toISOString(),
+          },
+          { status: 202 },
+        );
+      }
+      if (pathname.endsWith("/exchange")) {
+        exchanges += 1;
+        if (Date.now() >= clickedAt) {
+          return Response.json(CLAIMED_EXCHANGE_RESPONSE, { status: 200 });
+        }
+        return Response.json(PENDING_EXCHANGE_RESPONSE, { status: 202 });
+      }
+      if (pathname.endsWith("/postclaim")) {
+        return Response.json(POSTCLAIM_RESPONSE, { status: 200 });
+      }
+      throw new Error(`unexpected request: ${pathname}`);
+    };
+
+    try {
+      await withTimeout(
+        waitForPreviewAndClaim(
+          "https://api.layers.test",
+          new AbortController().signal,
+          reservationExpiresAt,
+          (event) => events.push(event),
+        ),
+        "last-gasp redemption",
+        110_000,
+      );
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
+
+    // Redeemed on the leg that was clicked, not abandoned and re-minted.
+    assert.equal(attempts, 1, "the clicked leg was not thrown away");
+    const terminal = events.filter((event) => event.type === "complete");
+    assert.equal(terminal.length, 1);
+    assert.equal(terminal[0].state, "claimed");
+    assert.deepEqual(terminal[0].postclaim, POSTCLAIM_RESPONSE);
+    // It really did come from the extra exchange at expiry, not a scheduled one.
+    assert.ok(
+      exchanges >= 2,
+      `expected a final exchange after the scheduled one, saw ${exchanges}`,
+    );
+    // And nothing told the human their link had lapsed.
+    assert.equal(
+      events.some(
+        (event) =>
+          event.type === "status" &&
+          (event.stage === "claim_link_refreshed" ||
+            event.stage === "claim_still_open"),
+      ),
+      false,
+      "a redeemed claim must not report the link as lapsed",
+    );
+  },
+);
+
 test("a server refusing every claim link stops early and blames the server", async () => {
   // Re-arming exists so a slow human still gets a live link. A server that
   // refuses every leg must not turn that into an unbounded mint loop.

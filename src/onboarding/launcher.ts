@@ -961,6 +961,52 @@ export async function waitForPreviewAndClaim(
    * timed out" and "the server withdrew your link" ask different things of the
    * person reading it.
    */
+  /**
+   * The terminal success, in one place.
+   *
+   * Two paths can now redeem a claim — the ordinary poll and the last-gasp
+   * exchange below — and a claimed workspace reported two slightly different
+   * ways is a bug waiting for whichever one gets edited alone.
+   */
+  const emitClaimed = (postclaim: OnboardAgentPostclaimResponse): void => {
+    if (!latestPreviewUrl) {
+      throw new Error("Claimed workspace is missing its preview URL");
+    }
+    emitEvent({
+      type: "complete",
+      previewUrl: latestPreviewUrl,
+      state: "claimed",
+      postclaim,
+      intake: intakeSummary(),
+    });
+  };
+  /**
+   * One last exchange before an expiring leg is let go.
+   *
+   * THE CADENCE OPENED A WINDOW THE OLD CODE DID NOT HAVE. Polling the exchange
+   * once per progress tick meant an expiring leg had been asked at most five
+   * seconds ago; at fifteen it can be three times that. A person who clicks in
+   * that gap authorizes the attempt server-side, and retiring on the clock
+   * would dispose the only transport session able to redeem it — the claim
+   * completes for them in the browser and this process throws the receipt away.
+   *
+   * So the clock never gets the last word: the leg is asked once more, outside
+   * the cadence gate, and only retired if that answer is not a claim. A failure
+   * here is not fatal — the leg is expiring regardless, and the wait re-arms.
+   */
+  const finalExchangeRedeemed = async (): Promise<boolean> => {
+    if (!claimSession) return false;
+    lastExchangeAtMs = Date.now();
+    try {
+      const exchange = await claimSession.exchange(signal);
+      if (exchange.state !== "claimed") return false;
+      emitClaimed(exchange.postclaim);
+      return true;
+    } catch {
+      // An expiring leg that cannot be reached is simply an expiring leg.
+      return false;
+    }
+  };
   const retireAttempt = (
     cause: string,
     options: { expiredOnSchedule?: boolean } = {},
@@ -1090,12 +1136,14 @@ export async function waitForPreviewAndClaim(
       }
       if (progress.previewUrl) latestPreviewUrl = progress.previewUrl;
 
-      // RETIRE AN EXPIRED TRANSPORT ATTEMPT, KEEP THE WAIT. The exchange below
-      // already had the last word on this attempt in the previous iteration, so
-      // reaching here with it expired means nobody clicked in time. The server
-      // lazily expires the stale attempt when the next one is created, so a
-      // fresh mint is all this takes.
+      // RETIRE AN EXPIRED TRANSPORT ATTEMPT, KEEP THE WAIT — but only after
+      // asking it one final time. The exchange runs on its own slower cadence,
+      // so "expired" here does NOT mean it was asked a moment ago, and a click
+      // that landed in the gap is a real claim this process would otherwise
+      // discard. The server lazily expires the stale attempt when the next one
+      // is created, so a fresh mint is all the retire itself takes.
       if (claimSession && attemptExpired() && progress.state !== "claimed") {
+        if (await finalExchangeRedeemed()) return;
         retireAttempt("it reached its expiry before anyone opened it", {
           expiredOnSchedule: true,
         });
@@ -1300,7 +1348,12 @@ export async function waitForPreviewAndClaim(
       // progress keeps its cadence.
       if (
         claimSession &&
-        Date.now() - lastExchangeAtMs >= CLAIM_EXCHANGE_POLL_MS
+        // A trial the server already reports as claimed is redeemed at once
+        // rather than after the interval: the cadence exists to spare the rate
+        // limit while nothing is happening, not to delay the one event this
+        // whole wait is for.
+        (progress.state === "claimed" ||
+          Date.now() - lastExchangeAtMs >= CLAIM_EXCHANGE_POLL_MS)
       ) {
         lastExchangeAtMs = Date.now();
         let exchange: Awaited<ReturnType<SourceClaimSession["exchange"]>>;
@@ -1344,16 +1397,7 @@ export async function waitForPreviewAndClaim(
         }
 
         if (exchange.state === "claimed") {
-          if (!latestPreviewUrl) {
-            throw new Error("Claimed workspace is missing its preview URL");
-          }
-          emitEvent({
-            type: "complete",
-            previewUrl: latestPreviewUrl,
-            state: "claimed",
-            postclaim: exchange.postclaim,
-            intake: intakeSummary(),
-          });
+          emitClaimed(exchange.postclaim);
           return;
         }
 
