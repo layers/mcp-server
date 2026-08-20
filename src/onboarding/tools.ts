@@ -20,6 +20,7 @@ import {
   sanitizeClaimVerify,
   sanitizeOnboardingStatus,
 } from "./public-responses.js";
+import { registerSourceOnboardingTool } from "./source-flow.js";
 
 const POW_ATTEMPT_LIMIT = 2 ** 26;
 const ONBOARDING_PROTOCOL_VERSION = 1 as const;
@@ -47,6 +48,10 @@ interface UrlStartResponse {
 const evidenceStartResponseSchema = z
   .object({
     protocolVersion: z.literal(ONBOARDING_PROTOCOL_VERSION),
+    attemptId: z
+      .string()
+      .uuid()
+      .refine((value) => value === value.toLowerCase()),
     trialHandle: z.string().min(1),
     reservationCapability: z.string().min(1).max(512),
     expiresAt: z.string().datetime({ offset: true }),
@@ -63,6 +68,7 @@ export interface OnboardUrlStartResult {
 
 export interface OnboardEvidenceStartResult {
   protocolVersion: typeof ONBOARDING_PROTOCOL_VERSION;
+  attemptId: string;
   trialHandle: string;
   expiresAt: string;
   state: "awaiting_evidence";
@@ -308,6 +314,7 @@ export async function startOnboarding(
 
     rememberReservation({
       protocolVersion: body.protocolVersion,
+      attemptId: body.attemptId,
       trialHandle: body.trialHandle,
       reservationCapability: body.reservationCapability,
       expiresAt: body.expiresAt,
@@ -318,6 +325,7 @@ export async function startOnboarding(
     // consume it from memory; the host agent only needs the public state.
     return {
       protocolVersion: body.protocolVersion,
+      attemptId: body.attemptId,
       trialHandle: body.trialHandle,
       expiresAt: body.expiresAt,
       state: body.state,
@@ -505,6 +513,8 @@ export function registerOnboardingTools(server: McpServer, baseUrl: string): voi
     },
     async ({ url }) => runTool(() => startOnboarding(baseUrl, url)),
   );
+
+  registerSourceOnboardingTool(server, baseUrl, () => startOnboarding(baseUrl));
 
   server.registerTool(
     "get_onboarding_status",

@@ -52,6 +52,8 @@ export interface OnboardingSession {
  */
 export interface OnboardingReservation {
   protocolVersion: 1;
+  /** Database-generated root identity for this trial's cleanup proof. */
+  attemptId: string;
   trialHandle: string;
   reservationCapability: string;
   expiresAt: string;
